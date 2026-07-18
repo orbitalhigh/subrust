@@ -1,9 +1,9 @@
 [package]
 name = "subrust"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.74"
-description = "A tiny, dependency-free interpreter for a strict subset of Rust — every accepted program is valid Rust and behaves identically under rustc."
+description = "Subrust is a no_std, no alloc, self-hosted embeddable Subset-of-Rust interpreter."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/orbitalhigh/subrust"
 homepage = "https://github.com/orbitalhigh/subrust"
