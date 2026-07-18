@@ -1,0 +1,46 @@
+# main.P1pp — the real entry for the C-free P1pp sr0i (drop-in for sr0i.c). P1
+# entry gives argc@a0, argv@a1. Opens argv[1] (the program), reads it into
+# g_src, closes; the program's INPUT stays on stdin (fd 0) so getb works —
+# same interface as the C sr0i (`sr0i prog.rs < input`). Then lex→p_program→
+# e_run_main; exit code = g_trap. Heap adds wmem (2^20 words) + const values.
+
+%fn(p1_main, 32, {
+    %st(s0, sp, 0) %st(s1, sp, 8)
+    %mov(s1, a1)                             # argv
+    %li(a0, 0) %call(&sys_brk) %mov(s0, a0)  # base
+    %la(t0, &g_src)      %st(s0, t0, 0)
+    %li(t1, 65536)   %add(t1, s0, t1) %la(t0, &g_tok)      %st(t1, t0, 0)
+    %li(t1, 327680)  %add(t1, s0, t1) %la(t0, &g_node)     %st(t1, t0, 0)
+    %li(t1, 786432)  %add(t1, s0, t1) %la(t0, &g_fn)       %st(t1, t0, 0)
+    %li(t1, 819200)  %add(t1, s0, t1) %la(t0, &g_fnptok)   %st(t1, t0, 0)
+    %li(t1, 851968)  %add(t1, s0, t1) %la(t0, &g_const)    %st(t1, t0, 0)
+    %li(t1, 868352)  %add(t1, s0, t1) %la(t0, &g_loctok)   %st(t1, t0, 0)
+    %li(t1, 901120)  %add(t1, s0, t1) %la(t0, &g_locval)   %st(t1, t0, 0)
+    %li(t1, 933888)  %add(t1, s0, t1) %la(t0, &g_argstk)   %st(t1, t0, 0)
+    %li(t1, 966656)  %add(t1, s0, t1) %la(t0, &g_wmem)     %st(t1, t0, 0)
+    %li(t1, 9355264) %add(t1, s0, t1) %la(t0, &g_constval) %st(t1, t0, 0)
+    %li(t1, 9363456) %add(a0, s0, t1) %call(&sys_brk)      # reserve
+    # open argv[1] (O_RDONLY)
+    %ld(a0, s1, 8) %li(a1, 0) %li(a2, 0) %call(&sys_open)
+    %mov(s1, a0)                             # fd
+    %li(s0, 0)                               # srcn
+:.rd
+    %li(t1, 65536) %sub(a2, t1, s0) %beqz(a2, &.rdd)
+    %la(t0, &g_src) %ld(a1, t0, 0) %add(a1, a1, s0)
+    %mov(a0, s1) %call(&sys_read)
+    %beqz(a0, &.rdd) %bltz(a0, &.rdd)
+    %add(s0, s0, a0) %b(&.rd)
+:.rdd
+    %mov(a0, s1) %call(&sys_close)
+    %la(t0, &g_srcn) %st(s0, t0, 0)
+    %call(&lex)
+    %call(&p_program)
+    %li(t1, 0) %la(t0, &g_trap)   %st(t1, t0, 0)
+    %li(t1, 0) %la(t0, &g_signal) %st(t1, t0, 0)
+    %li(t1, 0) %la(t0, &g_argsp)  %st(t1, t0, 0)
+    %call(&e_run_main)
+    %la(t0, &g_trap) %ld(a0, t0, 0)          # exit code = g_trap
+    %ld(s0, sp, 0) %ld(s1, sp, 8)
+})
+
+:ELF_end

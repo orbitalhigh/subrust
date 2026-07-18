@@ -1,0 +1,316 @@
+# lex.P1pp — SR-seed tokenizer in P1pp, a faithful port of sr0i.c's lex().
+# Component of a C-free sr0i. Verified vs lex-ref.rs.
+# STEP 1a: infrastructure + non-punctuation tokens (whitespace, `//` comments,
+# identifiers+keywords, decimal + 0x-hex integers with `_` and suffix skip).
+# Punctuation is stubbed (exit 3) and lands in step 1b.
+#
+# Token model: 4-word records [kind, ival, pos, len] at g_tok + k*32.
+# g_src/g_tok point into a sys_brk heap set up by lex-main's p1_main.
+
+# ---- globals + keyword strings --------------------------------------------
+:g_src    $(0)
+:g_srcn   $(0)
+:g_tok    $(0)
+:g_tokn   $(0)
+:kw_fn "fn"
+:kw_let "let"
+:kw_mut "mut"
+:kw_if "if"
+:kw_else "else"
+:kw_while "while"
+:kw_loop "loop"
+:kw_break "break"
+:kw_continue "continue"
+:kw_const "const"
+:kw_true "true"
+:kw_false "false"
+
+# ---- lbyte(i=a0) -> src[i] ------------------------------------------------
+%fn(lbyte, 0, {
+    %la(t0, &g_src) %ld(t0, t0, 0)
+    %add(t0, t0, a0)
+    %lb(a0, t0, 0)
+})
+
+# ---- lx_digit(c=a0) -> 0/1 ------------------------------------------------
+%fn(lx_digit, 0, {
+    %addi(t0, a0, -48)            # c - '0'
+    %li(t1, 10)
+    %li(a0, 1) %bltu(t0, t1, &.done)
+    %li(a0, 0)
+:.done
+})
+
+# ---- lx_alpha(c=a0) -> 0/1 : a-z, A-Z, _ ----------------------------------
+%fn(lx_alpha, 16, {
+    %st(s0, sp, 0)
+    %mov(s0, a0)                 # hold c in a saved reg
+    %li(t0, 95) %beq(s0, t0, &.yes)           # '_' first
+    %li(t1, 26)
+    %addi(t0, s0, -97) %bltu(t0, t1, &.yes)   # a-z
+    %addi(t0, s0, -65) %bltu(t0, t1, &.yes)   # A-Z
+    %li(a0, 0) %b(&.done)
+:.yes
+    %li(a0, 1)
+:.done
+    %ld(s0, sp, 0)
+})
+
+# ---- lx_alnum(c=a0) -> 0/1 ------------------------------------------------
+%fn(lx_alnum, 16, {
+    %st(s0, sp, 0)
+    %mov(s0, a0)
+    %call(&lx_alpha) %bnez(a0, &.yes)
+    %mov(a0, s0) %call(&lx_digit) %bnez(a0, &.yes)
+    %li(a0, 0) %b(&.done)
+:.yes
+    %li(a0, 1)
+:.done
+    %ld(s0, sp, 0)
+})
+
+# ---- slice_eq(pos=a0, len=a1, kwptr=a2, kwlen=a3) -> 0/1 ------------------
+%fn(slice_eq, 32, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16) %st(s3, sp, 24)
+    %mov(s0, a0) %mov(s1, a1) %mov(s2, a2)
+    %li(a0, 0)
+    %bne(s1, a3, &.ret)          # len != kwlen -> 0
+    %li(s3, 0)                   # i
+:.loop
+    %beq(s3, s1, &.yes)
+    %add(a0, s0, s3) %call(&lbyte) %mov(t2, a0)   # src[pos+i]
+    %add(t0, s2, s3) %lb(t1, t0, 0)               # kw[i]
+    %li(a0, 0)
+    %bne(t2, t1, &.ret)
+    %addi(s3, s3, 1)
+    %b(&.loop)
+:.yes
+    %li(a0, 1)
+:.ret
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16) %ld(s3, sp, 24)
+})
+
+# ---- kw_kind(pos=a0, len=a1) -> token kind --------------------------------
+%fn(kw_kind, 32, {
+    %st(s0, sp, 0) %st(s1, sp, 8)
+    %mov(s0, a0) %mov(s1, a1)
+    %mov(a0, s0) %mov(a1, s1) %la(a2, &kw_fn)       %li(a3, 2) %call(&slice_eq) %li(t0, 3)  %bnez(a0, &.ret)
+    %mov(a0, s0) %mov(a1, s1) %la(a2, &kw_let)      %li(a3, 3) %call(&slice_eq) %li(t0, 4)  %bnez(a0, &.ret)
+    %mov(a0, s0) %mov(a1, s1) %la(a2, &kw_mut)      %li(a3, 3) %call(&slice_eq) %li(t0, 5)  %bnez(a0, &.ret)
+    %mov(a0, s0) %mov(a1, s1) %la(a2, &kw_if)       %li(a3, 2) %call(&slice_eq) %li(t0, 6)  %bnez(a0, &.ret)
+    %mov(a0, s0) %mov(a1, s1) %la(a2, &kw_else)     %li(a3, 4) %call(&slice_eq) %li(t0, 7)  %bnez(a0, &.ret)
+    %mov(a0, s0) %mov(a1, s1) %la(a2, &kw_while)    %li(a3, 5) %call(&slice_eq) %li(t0, 8)  %bnez(a0, &.ret)
+    %mov(a0, s0) %mov(a1, s1) %la(a2, &kw_loop)     %li(a3, 4) %call(&slice_eq) %li(t0, 9)  %bnez(a0, &.ret)
+    %mov(a0, s0) %mov(a1, s1) %la(a2, &kw_break)    %li(a3, 5) %call(&slice_eq) %li(t0, 10) %bnez(a0, &.ret)
+    %mov(a0, s0) %mov(a1, s1) %la(a2, &kw_continue) %li(a3, 8) %call(&slice_eq) %li(t0, 11) %bnez(a0, &.ret)
+    %mov(a0, s0) %mov(a1, s1) %la(a2, &kw_const)    %li(a3, 5) %call(&slice_eq) %li(t0, 52) %bnez(a0, &.ret)
+    %mov(a0, s0) %mov(a1, s1) %la(a2, &kw_true)     %li(a3, 4) %call(&slice_eq) %li(t0, 12) %bnez(a0, &.ret)
+    %mov(a0, s0) %mov(a1, s1) %la(a2, &kw_false)    %li(a3, 5) %call(&slice_eq) %li(t0, 13) %bnez(a0, &.ret)
+    %li(t0, 1)                                       # T_IDENT
+:.ret
+    %mov(a0, t0)
+    %ld(s0, sp, 0) %ld(s1, sp, 8)
+})
+
+# ---- push_tok(kind=a0, ival=a1, pos=a2, len=a3) ---------------------------
+%fn(push_tok, 0, {
+    %la(t0, &g_tokn) %ld(t1, t0, 0)     # tokn
+    %la(t2, &g_tok)  %ld(t2, t2, 0)     # base
+    %shli(t0, t1, 5)                    # tokn*32
+    %add(t2, t2, t0)
+    %st(a0, t2, 0) %st(a1, t2, 8) %st(a2, t2, 16) %st(a3, t2, 24)
+    %addi(t1, t1, 1)
+    %la(t0, &g_tokn) %st(t1, t0, 0)
+})
+
+# ---- lex() : tokenize g_src[0..g_srcn) into the token array ---------------
+# s0=i  s1=src_n  s2=start  s3=c/v (repurposed per branch)
+%fn(lex, 64, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16) %st(s3, sp, 24)
+    %li(t0, 0) %la(t1, &g_tokn) %st(t0, t1, 0)      # tokn = 0
+    %la(t0, &g_srcn) %ld(s1, t0, 0)                 # src_n
+    %li(s0, 0)                                      # i
+:.loop
+    %bltu(s0, s1, &.body)
+    %b(&.eof)
+:.body
+    %mov(a0, s0) %call(&lbyte) %mov(s3, a0)         # c = src[i]
+    %li(t0, 32) %beq(s3, t0, &.ws)
+    %li(t0, 9)  %beq(s3, t0, &.ws)
+    %li(t0, 13) %beq(s3, t0, &.ws)
+    %li(t0, 10) %beq(s3, t0, &.ws)
+    # line comment: c=='/' && i+1<src_n && src[i+1]=='/'
+    %li(t0, 47) %bne(s3, t0, &.not_cmt)
+    %addi(t0, s0, 1) %bltu(t0, s1, &.cmt_c1) %b(&.not_cmt)
+:.cmt_c1
+    %addi(a0, s0, 1) %call(&lbyte) %li(t0, 47) %bne(a0, t0, &.not_cmt)
+:.cmt_skip
+    %bltu(s0, s1, &.cmt_chk) %b(&.loop)
+:.cmt_chk
+    %mov(a0, s0) %call(&lbyte) %li(t0, 10) %beq(a0, t0, &.loop)
+    %addi(s0, s0, 1) %b(&.cmt_skip)
+:.ws
+    %addi(s0, s0, 1) %b(&.loop)
+:.not_cmt
+    %mov(a0, s3) %call(&lx_alpha) %bnez(a0, &.ident)
+    %mov(a0, s3) %call(&lx_digit) %bnez(a0, &.number)
+    %b(&.punct)
+
+# identifiers / keywords
+:.ident
+    %mov(s2, s0)                                    # start
+:.ident_lp
+    %bltu(s0, s1, &.ident_chk) %b(&.ident_done)
+:.ident_chk
+    %mov(a0, s0) %call(&lbyte) %call(&lx_alnum) %beqz(a0, &.ident_done)
+    %addi(s0, s0, 1) %b(&.ident_lp)
+:.ident_done
+    %mov(a0, s2) %sub(a1, s0, s2) %call(&kw_kind)   # a0 = kind
+    %li(a1, 0) %mov(a2, s2) %sub(a3, s0, s2) %call(&push_tok)
+    %b(&.loop)
+
+# integers (decimal / 0x hex), s3 = v
+:.number
+    %mov(s2, s0)                                    # start
+    %li(s3, 0)                                      # v = 0
+    %mov(a0, s0) %call(&lbyte) %li(t0, 48) %bne(a0, t0, &.dec)   # src[i]!='0'
+    %addi(t0, s0, 1) %bltu(t0, s1, &.hex_q) %b(&.dec)
+:.hex_q
+    %addi(a0, s0, 1) %call(&lbyte) %li(t0, 120) %bne(a0, t0, &.dec)   # src[i+1]!='x'
+    %addi(s0, s0, 2)                                # skip 0x
+:.hex_lp
+    %bltu(s0, s1, &.hex_chk) %b(&.num_suffix)
+:.hex_chk
+    %mov(a0, s0) %call(&lbyte) %mov(t2, a0)         # h
+    %mov(a0, t2) %call(&lx_digit) %bnez(a0, &.hex_dig)
+    %addi(t0, t2, -97) %li(t1, 6) %bltu(t0, t1, &.hex_lc)   # a-f
+    %addi(t0, t2, -65) %li(t1, 6) %bltu(t0, t1, &.hex_uc)   # A-F
+    %li(t0, 95) %beq(t2, t0, &.hex_us)              # '_'
+    %b(&.num_suffix)
+:.hex_dig
+    %shli(s3, s3, 4) %addi(t0, t2, -48) %add(s3, s3, t0) %addi(s0, s0, 1) %b(&.hex_lp)
+:.hex_lc
+    %shli(s3, s3, 4) %addi(t0, t2, -87) %add(s3, s3, t0) %addi(s0, s0, 1) %b(&.hex_lp)
+:.hex_uc
+    %shli(s3, s3, 4) %addi(t0, t2, -55) %add(s3, s3, t0) %addi(s0, s0, 1) %b(&.hex_lp)
+:.hex_us
+    %addi(s0, s0, 1) %b(&.hex_lp)
+:.dec
+:.dec_lp
+    %bltu(s0, s1, &.dec_chk) %b(&.num_suffix)
+:.dec_chk
+    %mov(a0, s0) %call(&lbyte) %mov(t2, a0)
+    %li(t0, 95) %beq(t2, t0, &.dec_us)              # '_'
+    %mov(a0, t2) %call(&lx_digit) %beqz(a0, &.num_suffix)
+    %li(t0, 10) %mul(s3, s3, t0) %addi(t1, t2, -48) %add(s3, s3, t1)
+    %addi(s0, s0, 1) %b(&.dec_lp)
+:.dec_us
+    %addi(s0, s0, 1) %b(&.dec_lp)
+:.num_suffix
+    %bltu(s0, s1, &.suf_chk) %b(&.num_done)
+:.suf_chk
+    %mov(a0, s0) %call(&lbyte) %call(&lx_alnum) %beqz(a0, &.num_done)
+    %addi(s0, s0, 1) %b(&.num_suffix)
+:.num_done
+    %li(a0, 2) %mov(a1, s3) %mov(a2, s2) %sub(a3, s0, s2) %call(&push_tok)
+    %b(&.loop)
+
+# punctuation: match sr0i.c lex() exactly, longest first. c=s3, c1=s2, pos=i.
+:.punct
+    %li(s2, 0)                                          # c1 = 0
+    %addi(t0, s0, 1) %bltu(t0, s1, &.punct_c1) %b(&.pk1)
+:.punct_c1
+    %addi(a0, s0, 1) %call(&lbyte) %mov(s2, a0)         # c1 = src[i+1]
+:.pk1
+    %li(t0, 45) %bne(s3, t0, &.pk2) %li(t0, 62) %bne(s2, t0, &.pk2) %li(a0, 21) %li(s2, 2) %b(&.p_emit)   # ->
+:.pk2
+    %li(t0, 61) %bne(s3, t0, &.pk3) %li(t0, 61) %bne(s2, t0, &.pk3) %li(a0, 36) %li(s2, 2) %b(&.p_emit)   # ==
+:.pk3
+    %li(t0, 33) %bne(s3, t0, &.pk4) %li(t0, 61) %bne(s2, t0, &.pk4) %li(a0, 37) %li(s2, 2) %b(&.p_emit)   # !=
+:.pk4
+    %li(t0, 60) %bne(s3, t0, &.pk5) %li(t0, 61) %bne(s2, t0, &.pk5) %li(a0, 39) %li(s2, 2) %b(&.p_emit)   # <=
+:.pk5
+    %li(t0, 62) %bne(s3, t0, &.pk6) %li(t0, 61) %bne(s2, t0, &.pk6) %li(a0, 41) %li(s2, 2) %b(&.p_emit)   # >=
+:.pk6
+    %li(t0, 60) %bne(s3, t0, &.pk7) %li(t0, 60) %bne(s2, t0, &.pk7)   # <<
+    %addi(t0, s0, 2) %bltu(t0, s1, &.pk6c) %b(&.pk6s)
+:.pk6c
+    %addi(a0, s0, 2) %call(&lbyte) %li(t0, 61) %bne(a0, t0, &.pk6s) %li(a0, 50) %li(s2, 3) %b(&.p_emit)   # <<=
+:.pk6s
+    %li(a0, 33) %li(s2, 2) %b(&.p_emit)                 # <<
+:.pk7
+    %li(t0, 62) %bne(s3, t0, &.pk8) %li(t0, 62) %bne(s2, t0, &.pk8)   # >>
+    %addi(t0, s0, 2) %bltu(t0, s1, &.pk7c) %b(&.pk7s)
+:.pk7c
+    %addi(a0, s0, 2) %call(&lbyte) %li(t0, 61) %bne(a0, t0, &.pk7s) %li(a0, 51) %li(s2, 3) %b(&.p_emit)   # >>=
+:.pk7s
+    %li(a0, 34) %li(s2, 2) %b(&.p_emit)                 # >>
+:.pk8
+    %li(t0, 38) %bne(s3, t0, &.pk9) %li(t0, 38) %bne(s2, t0, &.pk9) %li(a0, 29) %li(s2, 2) %b(&.p_emit)   # &&
+:.pk9
+    %li(t0, 124) %bne(s3, t0, &.pk10) %li(t0, 124) %bne(s2, t0, &.pk10) %li(a0, 31) %li(s2, 2) %b(&.p_emit) # ||
+:.pk10
+    %li(t0, 43) %bne(s3, t0, &.pk11) %li(t0, 61) %bne(s2, t0, &.pk11) %li(a0, 42) %li(s2, 2) %b(&.p_emit)  # +=
+:.pk11
+    %li(t0, 45) %bne(s3, t0, &.pk12) %li(t0, 61) %bne(s2, t0, &.pk12) %li(a0, 43) %li(s2, 2) %b(&.p_emit)  # -=
+:.pk12
+    %li(t0, 42) %bne(s3, t0, &.pk13) %li(t0, 61) %bne(s2, t0, &.pk13) %li(a0, 44) %li(s2, 2) %b(&.p_emit)  # *=
+:.pk13
+    %li(t0, 47) %bne(s3, t0, &.pk14) %li(t0, 61) %bne(s2, t0, &.pk14) %li(a0, 45) %li(s2, 2) %b(&.p_emit)  # /=
+:.pk14
+    %li(t0, 37) %bne(s3, t0, &.pk15) %li(t0, 61) %bne(s2, t0, &.pk15) %li(a0, 46) %li(s2, 2) %b(&.p_emit)  # %=
+:.pk15
+    %li(t0, 38) %bne(s3, t0, &.pk16) %li(t0, 61) %bne(s2, t0, &.pk16) %li(a0, 47) %li(s2, 2) %b(&.p_emit)  # &=
+:.pk16
+    %li(t0, 124) %bne(s3, t0, &.pk17) %li(t0, 61) %bne(s2, t0, &.pk17) %li(a0, 48) %li(s2, 2) %b(&.p_emit) # |=
+:.pk17
+    %li(t0, 94) %bne(s3, t0, &.pk18) %li(t0, 61) %bne(s2, t0, &.pk18) %li(a0, 49) %li(s2, 2) %b(&.p_emit)  # ^=
+:.pk18
+    %li(t0, 40) %bne(s3, t0, &.pk19) %li(a0, 14) %li(s2, 1) %b(&.p_emit)   # (
+:.pk19
+    %li(t0, 41) %bne(s3, t0, &.pk20) %li(a0, 15) %li(s2, 1) %b(&.p_emit)   # )
+:.pk20
+    %li(t0, 123) %bne(s3, t0, &.pk21) %li(a0, 16) %li(s2, 1) %b(&.p_emit)  # {
+:.pk21
+    %li(t0, 125) %bne(s3, t0, &.pk22) %li(a0, 17) %li(s2, 1) %b(&.p_emit)  # }
+:.pk22
+    %li(t0, 44) %bne(s3, t0, &.pk23) %li(a0, 18) %li(s2, 1) %b(&.p_emit)   # ,
+:.pk23
+    %li(t0, 59) %bne(s3, t0, &.pk24) %li(a0, 19) %li(s2, 1) %b(&.p_emit)   # ;
+:.pk24
+    %li(t0, 58) %bne(s3, t0, &.pk25) %li(a0, 20) %li(s2, 1) %b(&.p_emit)   # :
+:.pk25
+    %li(t0, 61) %bne(s3, t0, &.pk26) %li(a0, 22) %li(s2, 1) %b(&.p_emit)   # =
+:.pk26
+    %li(t0, 43) %bne(s3, t0, &.pk27) %li(a0, 23) %li(s2, 1) %b(&.p_emit)   # +
+:.pk27
+    %li(t0, 45) %bne(s3, t0, &.pk28) %li(a0, 24) %li(s2, 1) %b(&.p_emit)   # -
+:.pk28
+    %li(t0, 42) %bne(s3, t0, &.pk29) %li(a0, 25) %li(s2, 1) %b(&.p_emit)   # *
+:.pk29
+    %li(t0, 47) %bne(s3, t0, &.pk30) %li(a0, 26) %li(s2, 1) %b(&.p_emit)   # /
+:.pk30
+    %li(t0, 37) %bne(s3, t0, &.pk31) %li(a0, 27) %li(s2, 1) %b(&.p_emit)   # %
+:.pk31
+    %li(t0, 38) %bne(s3, t0, &.pk32) %li(a0, 28) %li(s2, 1) %b(&.p_emit)   # &
+:.pk32
+    %li(t0, 124) %bne(s3, t0, &.pk33) %li(a0, 30) %li(s2, 1) %b(&.p_emit)  # |
+:.pk33
+    %li(t0, 94) %bne(s3, t0, &.pk34) %li(a0, 32) %li(s2, 1) %b(&.p_emit)   # ^
+:.pk34
+    %li(t0, 60) %bne(s3, t0, &.pk35) %li(a0, 38) %li(s2, 1) %b(&.p_emit)   # <
+:.pk35
+    %li(t0, 62) %bne(s3, t0, &.pk36) %li(a0, 40) %li(s2, 1) %b(&.p_emit)   # >
+:.pk36
+    %li(t0, 33) %bne(s3, t0, &.pkbad) %li(a0, 35) %li(s2, 1) %b(&.p_emit)  # !
+:.pkbad
+    %li(a0, 4) %call(&sys_exit)                          # unexpected character
+:.p_emit
+    %li(a1, 0) %mov(a2, s0) %mov(a3, s2) %call(&push_tok)   # push(kind, 0, i, len)
+    %add(s0, s0, s2)                                     # i += len
+    %b(&.loop)
+
+:.eof
+    %li(a0, 0) %li(a1, 0) %mov(a2, s1) %li(a3, 0) %call(&push_tok)   # T_EOF
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16) %ld(s3, sp, 24)
+})

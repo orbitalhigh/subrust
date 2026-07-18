@@ -1,0 +1,22 @@
+# Build products of the bootstrap chain — regenerate via the B0 replay
+# (REPLAY.md) and kaem/build-sr0i.sh. Vendored SOURCES are tracked; only the
+# compiled outputs are ignored. The per-arch bin/ and artifact/ build dirs are
+# also covered by stage0-posix's own upstream .gitignore files.
+vendor/stage0-posix/AMD64/bin/
+vendor/stage0-posix/AArch64/bin/
+vendor/stage0-posix/riscv64/bin/
+vendor/stage0-posix/x86/bin/
+sr0i/sr0i
+fasm/f_amd64
+*.o
+p1/arith-core.elf
+vendor/boot2/**/*.o
+*.img
+
+# The vendored bootstrap SEED images are trust-root sources, not the emit *.img
+# build outputs the `*.img` rule targets — keep them tracked.
+!vendor/stage0-posix/bootstrap-seeds/**/*.img
+
+# The AMD64 seed recipe (kaem.amd64) writes into ./AMD64/bin/ and ./AMD64/artifact/
+# WITHOUT creating them; git can't store an empty dir, so a force-added .gitkeep in
+# each keeps them present in a fresh clone (their contents stay ignored above).

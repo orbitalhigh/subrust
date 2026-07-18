@@ -1,0 +1,8 @@
+subrust's own code is dual-licensed MIT OR Apache-2.0 (see LICENSE-*).
+
+subrust-boot/vendor/ contains third-party bootstrap toolchains, vendored so the
+"rebuild from a 229-byte seed" story is reproducible offline. Each keeps its own
+upstream license (the stage0-posix / M2-Planet / mescc-tools chain is GPL-family)
+- see the license files inside each vendored directory. They are build tools for
+the optional seed rebuild and are not part of the published crate (which excludes
+subrust-boot/vendor/).

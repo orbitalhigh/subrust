@@ -1,0 +1,3616 @@
+## hex2pp.P1 -- P1 implementation of the hex2++ assembler/linker.
+##
+## Mirrors hex2pp/hex2pp.c. See docs/HEX2pp.md for the full spec; brief:
+##
+##   Input is scanned once. Label definitions are recorded into a table
+##   on the fly; label references emit zero placeholders and append a
+##   fixup record. After the scan, fixups are resolved against the
+##   completed label table and patched into the output buffer.
+##
+##   Active syntax:
+##     digits in current byte mode    -> raw bytes (HEX or BINARY)
+##     :NAME                          -> label definition
+##     SIGIL NAME [- OTHER]           -> label reference (! @ $ ~ % &)
+##     .align N [PATTERN]             -> pad to N-byte boundary
+##     .fill N B                      -> N copies of byte B
+##     .scope / .endscope             -> nestable local-label scope
+##     .ptrsize N                     -> width of '%' and '&' (4 or 8)
+##     # ... / ; ...                  -> line comment
+##
+##   Multi-byte reference values are emitted little-endian by default.
+##
+## Invocation: hex2pp [-B ADDR] [-E|-e] [-b] [-N] IN OUT
+##
+## P1 ABI: a0..a3 arg/return, t0..t2 caller-saved temps. Non-leaf
+## functions use enter_0 / eret. Entry is the portable p1_main
+## (a0=argc, a1=argv); the backend-owned :_start stub captures argc/argv
+## from the native entry state and sys_exits p1_main's return value.
+##
+## chmod note: the seed P1 mnemonic table only exposes openat/read/write/
+## exit. We encode the desired final mode (0750 or 0640) directly in
+## openat's mode argument at file-creation time, achieving the same
+## resulting file permissions as the C reference's fopen+chmod.
+
+## --- Caps ------------------------------------------------------------------
+## Mirrors hex2pp.c constants. Stored as 8-byte little-endian.
+DEFINE H2_INPUT_CAP 0000000100000000
+DEFINE H2_OUTPUT_CAP 0000000800000000
+DEFINE H2_TEXT_CAP 0000800000000000
+DEFINE H2_LABEL_CAP 0000100000000000
+DEFINE H2_TOKEN_CAP 0010000000000000
+DEFINE H2_SCOPE_CAP 2000000000000000
+DEFINE H2_FIXUP_CAP 0000100000000000
+DEFINE H2_SCOPE_HISTORY_CAP 0000400000000000
+
+## openat / mode constants (Linux generic).
+DEFINE H2_O_WRONLY_CREAT_TRUNC 4102000000000000
+DEFINE H2_O_RDONLY 0000000000000000
+DEFINE H2_MODE_0750 E801000000000000
+DEFINE H2_MODE_0640 A001000000000000
+DEFINE H2_AT_FDCWD 9CFFFFFFFFFFFFFF
+
+DEFINE ZERO8 '0000000000000000'
+DEFINE ZERO4 '00000000'
+
+## --- BSS layout (offsets from ELF_end) -------------------------------------
+## Each "_ptr" is a one-word slot in the executable's static data; p1_main's
+## bss_init_loop initializes each to ELF_end + OFF_*. Arenas live past
+## ELF_end (covered by the segment's memsz; the loader zero-initializes).
+##
+## Region sizes (matching the C caps):
+##   scope_stack       32 *  8 =     256 B
+##   line_scratch              =    64 B
+##   name_buf                  =  4096 B   (used by read_directive_name)
+##   label_buf                 =  4096 B   (unused since single-pass refactor)
+##   other_buf                 =  4096 B   (unused since single-pass refactor)
+##   pat_buf                   =  4096 B
+##   ev_bytes                  =     8 B
+##   df_byte                   =     8 B
+##   input_buf                 =  16 MiB
+##   output_buf                = 128 MiB
+##   text_buf                  =   8 MiB
+##   labels                    =  32 MiB    (1<<20 * 32 B)
+##   fixups                    =  96 MiB    (1<<20 * 96 B)
+##   scope_history             =  32 MiB    (1<<22 *  8 B)
+##
+## Compact cumulative offsets in 8-byte little-endian hex.
+DEFINE H2_OFF_scope_stack    0000000000000000
+DEFINE H2_OFF_line_scratch   0001000000000000
+DEFINE H2_OFF_name_buf       4001000000000000
+DEFINE H2_OFF_label_buf      4011000000000000
+DEFINE H2_OFF_other_buf      4021000000000000
+DEFINE H2_OFF_pat_buf        4031000000000000
+DEFINE H2_OFF_ev_bytes       4041000000000000
+DEFINE H2_OFF_df_byte        5041000000000000
+## input_buf:        0x00004200 + 16 MiB
+## output_buf:       0x01004200 + 128 MiB
+## text_buf:         0x09004200 + 8 MiB
+## labels:           0x09804200 + 32 MiB
+## fixups:           0x0B804200 + 96 MiB
+## scope_history:    0x11804200 + 32 MiB (end at ~313 MiB; ELF p_memsz is 512 MiB).
+DEFINE H2_OFF_input_buf      0042000000000000
+DEFINE H2_OFF_output_buf     0042000100000000
+DEFINE H2_OFF_text_buf       0042000900000000
+DEFINE H2_OFF_labels         0042800900000000
+DEFINE H2_OFF_fixups         0042800B00000000
+DEFINE H2_OFF_scope_history  0042801100000000
+
+## --- p1_main: argv parse -> load input -> two passes -> write -> exit ------
+
+:p1_main
+    enter_0
+
+    # Save argc / argv before anything clobbers them.
+    la_a2 &saved_argc
+    st_a0,a2,0
+    la_a2 &saved_argv
+    st_a1,a2,0
+
+    # Init BSS pointer slots from ELF_end via table walk.
+    la_t0 &ELF_end
+    la_t1 &bss_init_tbl
+    la_t2 &bss_init_tbl_end
+:bss_init_loop
+    la_br &bss_init_done
+    beq_t1,t2
+    ld_a2,t1,0
+    ld_a3,t1,8
+    add_a3,a3,t0
+    st_a3,a2,0
+    addi_t1,t1,16
+    la_br &bss_init_loop
+    b
+:bss_init_done
+
+    # Default ptrsize = 4.
+    li_t0 %4 %0
+    la_a2 &ptrsize
+    st_t0,a2,0
+
+    # ---- Argv loop --------------------------------------------------------
+    # i = 1
+    li_t0 %1 %0
+    la_a2 &arg_idx
+    st_t0,a2,0
+:arg_loop
+    la_a0 &arg_idx
+    ld_t0,a0,0
+    la_a1 &saved_argc
+    ld_t1,a1,0
+    la_br &arg_done
+    beq_t0,t1
+    la_br &arg_done
+    blt_t1,t0
+
+    # arg_ptr = argv[i]
+    la_a0 &saved_argv
+    ld_a1,a0,0
+    shli_t2,t0,3
+    add_a1,a1,t2
+    ld_a0,a1,0
+    la_a2 &arg_ptr
+    st_a0,a2,0
+
+    # Match against known short flags.
+    la_a1 &opt_B
+    li_a2 %2 %0
+    la_br &str_eq
+    call
+    la_br &arg_is_B
+    bnez_a0
+
+    la_a0 &arg_ptr
+    ld_a0,a0,0
+    la_a1 &opt_E
+    li_a2 %2 %0
+    la_br &str_eq
+    call
+    la_br &arg_is_big
+    bnez_a0
+
+    la_a0 &arg_ptr
+    ld_a0,a0,0
+    la_a1 &opt_e
+    li_a2 %2 %0
+    la_br &str_eq
+    call
+    la_br &arg_is_little
+    bnez_a0
+
+    la_a0 &arg_ptr
+    ld_a0,a0,0
+    la_a1 &opt_b
+    li_a2 %2 %0
+    la_br &str_eq
+    call
+    la_br &arg_is_binary
+    bnez_a0
+
+    la_a0 &arg_ptr
+    ld_a0,a0,0
+    la_a1 &opt_N
+    li_a2 %2 %0
+    la_br &str_eq
+    call
+    la_br &arg_is_nonexec
+    bnez_a0
+
+    # Unrecognised. If first byte is '-' (and string len > 1), error.
+    la_a0 &arg_ptr
+    ld_a0,a0,0
+    lb_t0,a0,0
+    li_t1 %45 %0
+    la_br &arg_is_positional
+    bne_t0,t1
+    lb_t0,a0,1
+    la_br &arg_is_positional
+    beqz_t0
+    la_br &err_unknown_arg
+    b
+
+:arg_is_positional
+    # First positional = input path; second = output path; third = error.
+    la_a0 &input_path
+    ld_t0,a0,0
+    la_br &arg_pos_set_out
+    bnez_t0
+    la_a1 &arg_ptr
+    ld_t0,a1,0
+    st_t0,a0,0
+    la_br &arg_loop_next
+    b
+:arg_pos_set_out
+    la_a0 &output_path
+    ld_t0,a0,0
+    la_br &err_extra_positional
+    bnez_t0
+    la_a1 &arg_ptr
+    ld_t0,a1,0
+    st_t0,a0,0
+    la_br &arg_loop_next
+    b
+
+:arg_is_B
+    # -B requires a value in the next argv slot.
+    la_a0 &arg_idx
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_a1 &saved_argc
+    ld_t1,a1,0
+    la_br &err_missing_value
+    beq_t0,t1
+    la_br &err_missing_value
+    blt_t1,t0
+    la_a0 &saved_argv
+    ld_a1,a0,0
+    shli_t2,t0,3
+    add_a1,a1,t2
+    ld_a0,a1,0
+    la_br &parse_long
+    call
+    la_a1 &base_address
+    st_a0,a1,0
+    la_br &arg_loop_next
+    b
+
+:arg_is_big
+    li_t0 %1 %0
+    la_a1 &big_endian
+    st_t0,a1,0
+    la_br &arg_loop_next
+    b
+
+:arg_is_little
+    li_t0 %0 %0
+    la_a1 &big_endian
+    st_t0,a1,0
+    la_br &arg_loop_next
+    b
+
+:arg_is_binary
+    li_t0 %1 %0
+    la_a1 &byte_mode
+    st_t0,a1,0
+    la_br &arg_loop_next
+    b
+
+:arg_is_nonexec
+    li_t0 %1 %0
+    la_a1 &non_executable
+    st_t0,a1,0
+    la_br &arg_loop_next
+    b
+
+:arg_loop_next
+    la_a0 &arg_idx
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &arg_loop
+    b
+
+:arg_done
+    la_a0 &input_path
+    ld_t0,a0,0
+    la_br &err_missing_positional
+    beqz_t0
+    la_a0 &output_path
+    ld_t0,a0,0
+    la_br &err_missing_positional
+    beqz_t0
+
+    # ---- Load input file -------------------------------------------------
+    la_br &load_input
+    call
+
+    # ---- Single scan: builds labels + fixup list -------------------------
+    li_t0 %0 %0
+    la_a0 &ip
+    st_t0,a0,0
+    la_a0 &output_used
+    st_t0,a0,0
+    la_a0 &scope_depth
+    st_t0,a0,0
+    la_a0 &scope_seq
+    st_t0,a0,0
+    la_a0 &ptrsize_used
+    st_t0,a0,0
+    li_t0 %4 %0
+    la_a0 &ptrsize
+    st_t0,a0,0
+    la_br &process_input
+    call
+    la_a0 &scope_depth
+    ld_t0,a0,0
+    la_br &err_scope_unclosed
+    bnez_t0
+
+    # ---- Resolve fixups --------------------------------------------------
+    la_br &patch_fixups
+    call
+
+    # Clear cur_path so any post-fixup error reports without file:line.
+    li_t0 %0 %0
+    la_a0 &cur_path
+    st_t0,a0,0
+
+    la_br &write_output
+    call
+
+    li_a0 %0 %0
+    eret
+
+## --- Input loader ----------------------------------------------------------
+## load_input(): openat(input_path), read into input_buf until EOF.
+:load_input
+    enter_0
+    # fd = openat(AT_FDCWD, input_path, O_RDONLY, 0)
+    li_a0 sys_openat
+    li_a1 H2_AT_FDCWD
+    la_a2 &input_path
+    ld_a2,a2,0
+    li_a3 H2_O_RDONLY
+    li_t0 %0 %0
+    syscall
+    la_br &err_open_input
+    bltz_a0
+    la_a1 &input_fd
+    st_a0,a1,0
+
+:li_read_loop
+    la_a0 &input_len
+    ld_t0,a0,0
+    li_t1 H2_INPUT_CAP
+    la_br &err_input_too_big
+    beq_t0,t1
+    la_br &err_input_too_big
+    blt_t1,t0
+
+    # n = read(fd, input_buf + input_len, INPUT_CAP - input_len)
+    la_a0 &input_fd
+    ld_a1,a0,0
+    la_a2 &input_buf_ptr
+    ld_a2,a2,0
+    add_a2,a2,t0
+    sub_a3,t1,t0
+    li_a0 sys_read
+    syscall
+    la_br &li_eof
+    beqz_a0
+    la_br &err_read
+    bltz_a0
+
+    la_a1 &input_len
+    ld_t0,a1,0
+    add_t0,t0,a0
+    st_t0,a1,0
+    la_br &li_read_loop
+    b
+
+:li_eof
+    eret
+
+## --- Process input: scan one pass over input_buf ---------------------------
+:process_input
+    enter_0
+    # cur_path = input_path; cur_line = 1
+    la_a0 &input_path
+    ld_t0,a0,0
+    la_a1 &cur_path
+    st_t0,a1,0
+    li_t0 %1 %0
+    la_a1 &cur_line
+    st_t0,a1,0
+
+    # scan_pos = input_buf; scan_end = input_buf + input_len
+    la_a0 &input_buf_ptr
+    ld_t0,a0,0
+    la_a1 &scan_pos
+    st_t0,a1,0
+    la_a0 &input_len
+    ld_t1,a0,0
+    add_t0,t0,t1
+    la_a1 &scan_end
+    st_t0,a1,0
+
+:scan_loop
+    la_br &skip_ws_and_comments
+    call
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &scan_done
+    beq_t0,t1
+    la_br &scan_done
+    blt_t1,t0
+    lb_a0,t0,0
+
+    li_t1 %58 %0
+    la_br &handle_label_def
+    beq_a0,t1
+    li_t1 %46 %0
+    la_br &handle_directive
+    beq_a0,t1
+    li_t1 %33 %0
+    la_br &handle_ref
+    beq_a0,t1
+    li_t1 %64 %0
+    la_br &handle_ref
+    beq_a0,t1
+    li_t1 %36 %0
+    la_br &handle_ref
+    beq_a0,t1
+    li_t1 %126 %0
+    la_br &handle_ref
+    beq_a0,t1
+    li_t1 %37 %0
+    la_br &handle_ref
+    beq_a0,t1
+    li_t1 %38 %0
+    la_br &handle_ref
+    beq_a0,t1
+    la_br &is_byte_digit
+    call
+    la_br &handle_byte_stream
+    bnez_a0
+    la_br &err_unexpected_char
+    b
+
+:handle_label_def
+    # consume ':'
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    # scan_name -> length in a0, pointer in sn_start (no copy).
+    la_br &scan_name
+    call
+    la_a1 &name_len
+    st_a0,a1,0
+    # dotted = (name[0] == '.') AND scope_depth > 0
+    la_a0 &sn_start
+    ld_a0,a0,0
+    lb_t0,a0,0
+    li_t1 %46 %0
+    la_br &handle_label_global
+    bne_t0,t1
+    la_a0 &scope_depth
+    ld_t0,a0,0
+    la_br &handle_label_global
+    beqz_t0
+    # scope_id = scope_stack[scope_depth-1]
+    addi_t0,t0,neg1
+    la_a1 &scope_stack_ptr
+    ld_a1,a1,0
+    shli_t2,t0,3
+    add_a1,a1,t2
+    ld_t0,a1,0
+    la_a2 &name_scope
+    st_t0,a2,0
+    la_br &handle_label_dispatch
+    b
+:handle_label_global
+    li_t0 %0 %0
+    la_a2 &name_scope
+    st_t0,a2,0
+:handle_label_dispatch
+    la_a0 &sn_start
+    ld_a0,a0,0
+    la_a1 &name_len
+    ld_a1,a1,0
+    la_a2 &name_scope
+    ld_a2,a2,0
+    la_br &define_label
+    call
+    la_br &scan_loop
+    b
+
+:handle_directive
+    # consume '.'
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_a0 &name_buf_ptr
+    ld_a0,a0,0
+    li_a1 H2_TOKEN_CAP
+    la_br &read_directive_name
+    call
+    la_a1 &name_len
+    st_a0,a1,0
+
+    # Dispatch by length, then memcmp.
+    la_a0 &name_len
+    ld_t0,a0,0
+    li_t1 %5 %0
+    la_br &dir_check_4
+    bne_t0,t1
+    # Could be "align" or "scope".
+    la_a0 &name_buf_ptr
+    ld_a0,a0,0
+    la_a1 &kw_align
+    li_a2 %5 %0
+    la_br &mem_eq
+    call
+    la_br &dir_call_align
+    bnez_a0
+    la_a0 &name_buf_ptr
+    ld_a0,a0,0
+    la_a1 &kw_scope
+    li_a2 %5 %0
+    la_br &mem_eq
+    call
+    la_br &dir_call_scope
+    bnez_a0
+    la_br &err_unknown_directive
+    b
+:dir_check_4
+    li_t1 %4 %0
+    la_br &dir_check_8
+    bne_t0,t1
+    la_a0 &name_buf_ptr
+    ld_a0,a0,0
+    la_a1 &kw_fill
+    li_a2 %4 %0
+    la_br &mem_eq
+    call
+    la_br &dir_call_fill
+    bnez_a0
+    la_br &err_unknown_directive
+    b
+:dir_check_8
+    li_t1 %8 %0
+    la_br &dir_check_7
+    bne_t0,t1
+    la_a0 &name_buf_ptr
+    ld_a0,a0,0
+    la_a1 &kw_endscope
+    li_a2 %8 %0
+    la_br &mem_eq
+    call
+    la_br &dir_call_endscope
+    bnez_a0
+    la_br &err_unknown_directive
+    b
+:dir_check_7
+    li_t1 %7 %0
+    la_br &err_unknown_directive
+    bne_t0,t1
+    la_a0 &name_buf_ptr
+    ld_a0,a0,0
+    la_a1 &kw_ptrsize
+    li_a2 %7 %0
+    la_br &mem_eq
+    call
+    la_br &dir_call_ptrsize
+    bnez_a0
+    la_br &err_unknown_directive
+    b
+
+:dir_call_align
+    la_br &do_align
+    call
+    la_br &scan_loop
+    b
+:dir_call_fill
+    la_br &do_fill
+    call
+    la_br &scan_loop
+    b
+:dir_call_scope
+    la_br &do_scope_open
+    call
+    la_br &scan_loop
+    b
+:dir_call_endscope
+    la_br &do_scope_close
+    call
+    la_br &scan_loop
+    b
+:dir_call_ptrsize
+    la_br &do_ptrsize
+    call
+    la_br &scan_loop
+    b
+
+:handle_ref
+    # a0 holds the sigil byte; advance past it then process_reference.
+    la_a1 &cur_sigil
+    st_a0,a1,0
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &process_reference
+    call
+    la_br &scan_loop
+    b
+
+:handle_byte_stream
+    la_br &parse_byte_stream
+    call
+    la_br &scan_loop
+    b
+
+:scan_done
+    eret
+
+## --- Lex helpers -----------------------------------------------------------
+
+## skip_ws_and_comments(): advance scan_pos past whitespace and #/; comments.
+## Updates cur_line on '\n'.
+:skip_ws_and_comments
+    enter_0
+:swc_loop
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &swc_done
+    beq_t0,t1
+    la_br &swc_done
+    blt_t1,t0
+    lb_a0,t0,0
+    la_br &is_space_any
+    call
+    la_br &swc_after_ws_check
+    beqz_a0
+    # whitespace: bump cur_line on '\n', advance scan_pos.
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    lb_a0,t0,0
+    li_t1 %10 %0
+    la_br &swc_advance
+    bne_a0,t1
+    la_a1 &cur_line
+    ld_t2,a1,0
+    addi_t2,t2,1
+    st_t2,a1,0
+:swc_advance
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &swc_loop
+    b
+:swc_after_ws_check
+    # is_space_any clobbered a0; re-read the byte at scan_pos.
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    lb_a0,t0,0
+    li_t1 %35 %0
+    la_br &swc_consume_comment
+    beq_a0,t1
+    li_t1 %59 %0
+    la_br &swc_consume_comment
+    beq_a0,t1
+    la_br &swc_done
+    b
+:swc_consume_comment
+:swc_cc_loop
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &swc_loop
+    beq_t0,t1
+    la_br &swc_loop
+    blt_t1,t0
+    lb_a0,t0,0
+    li_t1 %10 %0
+    la_br &swc_loop
+    beq_a0,t1
+    addi_t0,t0,1
+    la_a1 &scan_pos
+    st_t0,a1,0
+    la_br &swc_cc_loop
+    b
+:swc_done
+    eret
+
+## skip_inline_ws(): like skip_ws_and_comments but does NOT cross '\n'.
+:skip_inline_ws
+    enter_0
+:siw_loop
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &siw_done
+    beq_t0,t1
+    la_br &siw_done
+    blt_t1,t0
+    lb_a0,t0,0
+    li_t1 %32 %0
+    la_br &siw_advance
+    beq_a0,t1
+    li_t1 %9 %0
+    la_br &siw_advance
+    beq_a0,t1
+    li_t1 %13 %0
+    la_br &siw_advance
+    beq_a0,t1
+    li_t1 %12 %0
+    la_br &siw_advance
+    beq_a0,t1
+    li_t1 %11 %0
+    la_br &siw_advance
+    beq_a0,t1
+    li_t1 %35 %0
+    la_br &siw_consume_comment
+    beq_a0,t1
+    li_t1 %59 %0
+    la_br &siw_consume_comment
+    beq_a0,t1
+    la_br &siw_done
+    b
+:siw_advance
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &siw_loop
+    b
+:siw_consume_comment
+:siw_cc_loop
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &siw_done
+    beq_t0,t1
+    la_br &siw_done
+    blt_t1,t0
+    lb_a0,t0,0
+    li_t1 %10 %0
+    la_br &siw_done
+    beq_a0,t1
+    addi_t0,t0,1
+    la_a1 &scan_pos
+    st_t0,a1,0
+    la_br &siw_cc_loop
+    b
+:siw_done
+    eret
+
+## is_space_any(a0=c) -> a0=0/1. Whitespace = ' ' \t \n \r \f \v.
+:is_space_any
+    li_t0 %32 %0
+    la_br &isa_yes
+    beq_a0,t0
+    li_t0 %9 %0
+    la_br &isa_yes
+    beq_a0,t0
+    li_t0 %10 %0
+    la_br &isa_yes
+    beq_a0,t0
+    li_t0 %13 %0
+    la_br &isa_yes
+    beq_a0,t0
+    li_t0 %12 %0
+    la_br &isa_yes
+    beq_a0,t0
+    li_t0 %11 %0
+    la_br &isa_yes
+    beq_a0,t0
+    li_a0 %0 %0
+    ret
+:isa_yes
+    li_a0 %1 %0
+    ret
+
+## is_name_terminator(a0=c) -> a0=0/1. Terminators: ws, '-', '>', '#', ';'.
+## Spills c into a BSS slot since is_space_any clobbers a0.
+:is_name_terminator
+    enter_0
+    la_a1 &nt_c
+    st_a0,a1,0
+    la_br &is_space_any
+    call
+    la_br &nt_yes
+    bnez_a0
+    la_a0 &nt_c
+    ld_a0,a0,0
+    li_t0 %45 %0
+    la_br &nt_yes
+    beq_a0,t0
+    li_t0 %62 %0
+    la_br &nt_yes
+    beq_a0,t0
+    li_t0 %35 %0
+    la_br &nt_yes
+    beq_a0,t0
+    li_t0 %59 %0
+    la_br &nt_yes
+    beq_a0,t0
+    li_a0 %0 %0
+    eret
+:nt_yes
+    li_a0 %1 %0
+    eret
+
+## is_byte_digit(a0=c) -> a0=0/1. Mode-aware (HEX vs BINARY).
+:is_byte_digit
+    la_a1 &byte_mode
+    ld_t0,a1,0
+    la_br &ibd_bin
+    bnez_t0
+    # HEX: 0-9, a-f, A-F
+    li_t1 %48 %0
+    la_br &ibd_no
+    blt_a0,t1
+    li_t1 %57 %0
+    la_br &ibd_yes
+    blt_a0,t1
+    la_br &ibd_yes
+    beq_a0,t1
+    li_t1 %65 %0
+    la_br &ibd_no
+    blt_a0,t1
+    li_t1 %70 %0
+    la_br &ibd_yes
+    blt_a0,t1
+    la_br &ibd_yes
+    beq_a0,t1
+    li_t1 %97 %0
+    la_br &ibd_no
+    blt_a0,t1
+    li_t1 %102 %0
+    la_br &ibd_yes
+    blt_a0,t1
+    la_br &ibd_yes
+    beq_a0,t1
+    la_br &ibd_no
+    b
+:ibd_bin
+    li_t1 %48 %0
+    la_br &ibd_yes
+    beq_a0,t1
+    li_t1 %49 %0
+    la_br &ibd_yes
+    beq_a0,t1
+    la_br &ibd_no
+    b
+:ibd_yes
+    li_a0 %1 %0
+    ret
+:ibd_no
+    li_a0 %0 %0
+    ret
+
+## byte_digit_value(a0=c) -> a0=value (0..15). Caller guarantees c is a
+## valid digit for the current byte mode.
+:byte_digit_value
+    li_t0 %57 %0
+    la_br &bdv_alpha
+    blt_t0,a0
+    li_t1 %48 %0
+    sub_a0,a0,t1
+    ret
+:bdv_alpha
+    li_t0 %96 %0
+    la_br &bdv_lower
+    blt_t0,a0
+    li_t1 %55 %0
+    sub_a0,a0,t1
+    ret
+:bdv_lower
+    li_t1 %87 %0
+    sub_a0,a0,t1
+    ret
+
+## byte_digit_count() -> a0. 2 for HEX, 8 for BINARY.
+:byte_digit_count
+    la_a0 &byte_mode
+    ld_t0,a0,0
+    la_br &bdc_bin
+    bnez_t0
+    li_a0 %2 %0
+    ret
+:bdc_bin
+    li_a0 %8 %0
+    ret
+
+## scan_name() -> a0=length, sn_start=pointer into input buffer at name start.
+## Advances scan_pos past the name. Fatal on empty.
+:scan_name
+    enter_0
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &sn_start
+    st_t0,a1,0
+:sn_loop
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &sn_done
+    beq_t0,t1
+    la_br &sn_done
+    blt_t1,t0
+    lb_a0,t0,0
+    la_br &is_name_terminator
+    call
+    la_br &sn_done
+    bnez_a0
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &sn_loop
+    b
+:sn_done
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &sn_start
+    ld_t1,a1,0
+    sub_a0,t0,t1
+    la_br &err_empty_name
+    beqz_a0
+    eret
+
+## read_name(a0=out_buf, a1=max) -> a0=length. Reads scan_pos into out_buf
+## until is_name_terminator or scan_end. Fatal on overflow / empty.
+## (Kept for reference; superseded by scan_name in single-pass refactor.)
+:read_name
+    enter_0
+    la_a2 &rn_out
+    st_a0,a2,0
+    la_a2 &rn_max
+    st_a1,a2,0
+    li_t0 %0 %0
+    la_a2 &rn_n
+    st_t0,a2,0
+:rn_loop
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &rn_done
+    beq_t0,t1
+    la_br &rn_done
+    blt_t1,t0
+    lb_a0,t0,0
+    la_br &is_name_terminator
+    call
+    la_br &rn_done
+    bnez_a0
+    la_a1 &rn_n
+    ld_t0,a1,0
+    la_a0 &rn_max
+    ld_t1,a0,0
+    la_br &err_name_too_long
+    beq_t0,t1
+    # store char
+    la_a0 &scan_pos
+    ld_a0,a0,0
+    lb_a3,a0,0
+    la_a1 &rn_out
+    ld_a1,a1,0
+    add_a1,a1,t0
+    sb_a3,a1,0
+    addi_t0,t0,1
+    la_a1 &rn_n
+    st_t0,a1,0
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &rn_loop
+    b
+:rn_done
+    la_a1 &rn_n
+    ld_a0,a1,0
+    la_br &err_empty_name
+    beqz_a0
+    eret
+
+## read_directive_name(a0=out_buf, a1=max) -> a0=length. Like read_name but
+## terminates on first non-alpha byte.
+:read_directive_name
+    enter_0
+    la_a2 &rn_out
+    st_a0,a2,0
+    la_a2 &rn_max
+    st_a1,a2,0
+    li_t0 %0 %0
+    la_a2 &rn_n
+    st_t0,a2,0
+:rdn_loop
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &rdn_done
+    beq_t0,t1
+    la_br &rdn_done
+    blt_t1,t0
+    lb_a0,t0,0
+    # accept [A-Za-z]
+    li_t1 %65 %0
+    la_br &rdn_check_lower
+    blt_a0,t1
+    li_t1 %90 %0
+    la_br &rdn_consume
+    blt_a0,t1
+    la_br &rdn_consume
+    beq_a0,t1
+:rdn_check_lower
+    li_t1 %97 %0
+    la_br &rdn_done
+    blt_a0,t1
+    li_t1 %122 %0
+    la_br &rdn_consume
+    blt_a0,t1
+    la_br &rdn_consume
+    beq_a0,t1
+    la_br &rdn_done
+    b
+:rdn_consume
+    la_a1 &rn_n
+    ld_t0,a1,0
+    la_a2 &rn_max
+    ld_t1,a2,0
+    la_br &err_name_too_long
+    beq_t0,t1
+    la_a2 &rn_out
+    ld_a2,a2,0
+    add_a2,a2,t0
+    sb_a0,a2,0
+    addi_t0,t0,1
+    la_a1 &rn_n
+    st_t0,a1,0
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &rdn_loop
+    b
+:rdn_done
+    la_a1 &rn_n
+    ld_a0,a1,0
+    la_br &err_empty_directive
+    beqz_a0
+    eret
+
+## read_decimal() -> a0=value. Fatal on no digits.
+:read_decimal
+    enter_0
+    li_t0 %0 %0
+    la_a0 &rd_val
+    st_t0,a0,0
+    la_a0 &rd_saw
+    st_t0,a0,0
+:rd_loop
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &rd_done
+    beq_t0,t1
+    la_br &rd_done
+    blt_t1,t0
+    lb_a0,t0,0
+    li_t1 %48 %0
+    la_br &rd_done
+    blt_a0,t1
+    li_t1 %57 %0
+    la_br &rd_done
+    blt_t1,a0
+    # acc = acc * 10 + (c - '0')
+    la_a1 &rd_val
+    ld_a2,a1,0
+    li_t1 %10 %0
+    mul_a2,a2,t1
+    li_t1 %48 %0
+    sub_a0,a0,t1
+    add_a2,a2,a0
+    st_a2,a1,0
+    li_t0 %1 %0
+    la_a1 &rd_saw
+    st_t0,a1,0
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &rd_loop
+    b
+:rd_done
+    la_a1 &rd_saw
+    ld_t0,a1,0
+    la_br &err_expected_decimal
+    beqz_t0
+    la_a1 &rd_val
+    ld_a0,a1,0
+    eret
+
+## --- Byte stream / single byte literal -------------------------------------
+
+## parse_byte_stream(): consume free-flowing digits (intermixed with ws and
+## #/; comments) and emit_byte them. Stops at first non-digit non-ws
+## non-comment byte.
+:parse_byte_stream
+    enter_0
+    li_t0 %0 %0
+    la_a0 &pbs_acc
+    st_t0,a0,0
+    la_a0 &pbs_have
+    st_t0,a0,0
+:pbs_loop
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &pbs_done
+    beq_t0,t1
+    la_br &pbs_done
+    blt_t1,t0
+    lb_a0,t0,0
+    la_br &is_space_any
+    call
+    la_br &pbs_consume_ws
+    bnez_a0
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    lb_a0,t0,0
+    li_t1 %35 %0
+    la_br &pbs_consume_comment
+    beq_a0,t1
+    li_t1 %59 %0
+    la_br &pbs_consume_comment
+    beq_a0,t1
+    la_br &is_byte_digit
+    call
+    la_br &pbs_done
+    beqz_a0
+    # consume one digit
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    lb_a0,t0,0
+    addi_t0,t0,1
+    la_a1 &scan_pos
+    st_t0,a1,0
+    la_a1 &pbs_c
+    st_a0,a1,0
+    # acc = (acc << shift) | digit
+    la_a1 &byte_mode
+    ld_t1,a1,0
+    la_br &pbs_bin
+    bnez_t1
+    # HEX: shift 4 + digit_value
+    la_a1 &pbs_acc
+    ld_t0,a1,0
+    shli_a3,t0,4
+    la_a1 &pbs_c
+    ld_a0,a1,0
+    la_br &byte_digit_value
+    call
+    add_a3,a3,a0
+    la_a1 &pbs_acc
+    st_a3,a1,0
+    la_br &pbs_bump
+    b
+:pbs_bin
+    la_a1 &pbs_acc
+    ld_t0,a1,0
+    shli_a3,t0,1
+    la_a1 &pbs_c
+    ld_a0,a1,0
+    li_t1 %48 %0
+    sub_a0,a0,t1
+    add_a3,a3,a0
+    la_a1 &pbs_acc
+    st_a3,a1,0
+:pbs_bump
+    la_a0 &pbs_have
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &byte_digit_count
+    call
+    la_a1 &pbs_have
+    ld_t0,a1,0
+    la_br &pbs_loop
+    bne_t0,a0
+    # full byte: emit
+    la_a1 &pbs_acc
+    ld_a0,a1,0
+    andi_a0,a0,255
+    la_br &emit_byte
+    call
+    li_t0 %0 %0
+    la_a0 &pbs_acc
+    st_t0,a0,0
+    la_a0 &pbs_have
+    st_t0,a0,0
+    la_br &pbs_loop
+    b
+:pbs_consume_ws
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    lb_a0,t0,0
+    li_t1 %10 %0
+    la_br &pbs_ws_advance
+    bne_a0,t1
+    la_a1 &cur_line
+    ld_t2,a1,0
+    addi_t2,t2,1
+    st_t2,a1,0
+:pbs_ws_advance
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &pbs_loop
+    b
+:pbs_consume_comment
+:pbs_cc_loop
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &pbs_loop
+    beq_t0,t1
+    la_br &pbs_loop
+    blt_t1,t0
+    lb_a0,t0,0
+    li_t1 %10 %0
+    la_br &pbs_loop
+    beq_a0,t1
+    addi_t0,t0,1
+    la_a1 &scan_pos
+    st_t0,a1,0
+    la_br &pbs_cc_loop
+    b
+:pbs_done
+    la_a0 &pbs_have
+    ld_t0,a0,0
+    la_br &err_byte_stream_short
+    bnez_t0
+    eret
+
+## parse_one_byte(a0=out_addr): read a single byte literal (exactly
+## byte_digit_count contiguous digits, no internal whitespace).
+:parse_one_byte
+    enter_0
+    la_a1 &p1b_out
+    st_a0,a1,0
+    li_t0 %0 %0
+    la_a1 &p1b_acc
+    st_t0,a1,0
+    la_a1 &p1b_have
+    st_t0,a1,0
+:p1b_loop
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &p1b_done
+    beq_t0,t1
+    la_br &p1b_done
+    blt_t1,t0
+    lb_a0,t0,0
+    la_br &is_byte_digit
+    call
+    la_br &p1b_done
+    beqz_a0
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    lb_a0,t0,0
+    addi_t0,t0,1
+    la_a1 &scan_pos
+    st_t0,a1,0
+    la_a1 &p1b_c
+    st_a0,a1,0
+    la_a1 &byte_mode
+    ld_t1,a1,0
+    la_br &p1b_bin
+    bnez_t1
+    la_a1 &p1b_acc
+    ld_t0,a1,0
+    shli_a3,t0,4
+    la_a1 &p1b_c
+    ld_a0,a1,0
+    la_br &byte_digit_value
+    call
+    add_a3,a3,a0
+    la_a1 &p1b_acc
+    st_a3,a1,0
+    la_br &p1b_bump
+    b
+:p1b_bin
+    la_a1 &p1b_acc
+    ld_t0,a1,0
+    shli_a3,t0,1
+    la_a1 &p1b_c
+    ld_a0,a1,0
+    li_t1 %48 %0
+    sub_a0,a0,t1
+    add_a3,a3,a0
+    la_a1 &p1b_acc
+    st_a3,a1,0
+:p1b_bump
+    la_a0 &p1b_have
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &byte_digit_count
+    call
+    la_a1 &p1b_have
+    ld_t0,a1,0
+    la_br &p1b_loop
+    bne_t0,a0
+    # got full byte: write to *out_addr and return
+    la_a1 &p1b_acc
+    ld_a0,a1,0
+    andi_a0,a0,255
+    la_a1 &p1b_out
+    ld_a1,a1,0
+    sb_a0,a1,0
+    eret
+:p1b_done
+    la_a0 &p1b_have
+    ld_t0,a0,0
+    la_br &err_byte_lit_bad
+    bnez_t0
+    la_br &err_byte_lit_bad
+    b
+
+## --- Label table -----------------------------------------------------------
+
+## intern(a0=src, a1=len) -> a0=offset into text_buf. Copies bytes plus a
+## NUL terminator.
+:intern
+    enter_0
+    la_a2 &intern_src
+    st_a0,a2,0
+    la_a2 &intern_len
+    st_a1,a2,0
+    la_a2 &text_used
+    ld_a3,a2,0
+    la_a2 &intern_orig
+    st_a3,a2,0
+    # if (text_used + len + 1 > TEXT_CAP) fatal
+    add_a2,a3,a1
+    addi_a2,a2,1
+    li_t0 H2_TEXT_CAP
+    la_br &err_text_overflow
+    blt_t0,a2
+    # dst = text_buf + text_used
+    la_a0 &text_buf_ptr
+    ld_a0,a0,0
+    add_a0,a0,a3
+    la_a2 &intern_dst
+    st_a0,a2,0
+    li_t0 %0 %0
+    la_a1 &intern_i
+    st_t0,a1,0
+:intern_copy_loop
+    la_a0 &intern_i
+    ld_t0,a0,0
+    la_a1 &intern_len
+    ld_t1,a1,0
+    la_br &intern_copy_done
+    beq_t0,t1
+    la_a0 &intern_src
+    ld_a0,a0,0
+    add_a0,a0,t0
+    lb_a0,a0,0
+    la_a2 &intern_dst
+    ld_a2,a2,0
+    add_a2,a2,t0
+    sb_a0,a2,0
+    addi_t0,t0,1
+    la_a1 &intern_i
+    st_t0,a1,0
+    la_br &intern_copy_loop
+    b
+:intern_copy_done
+    # NUL terminator
+    la_a2 &intern_dst
+    ld_a2,a2,0
+    la_a1 &intern_len
+    ld_t0,a1,0
+    add_a2,a2,t0
+    li_t1 %0 %0
+    sb_t1,a2,0
+    # text_used += len + 1
+    la_a2 &text_used
+    ld_a3,a2,0
+    la_a1 &intern_len
+    ld_a1,a1,0
+    add_a3,a3,a1
+    addi_a3,a3,1
+    st_a3,a2,0
+    la_a0 &intern_orig
+    ld_a0,a0,0
+    eret
+
+## label_addr(a0=index) -> a0 = &labels[index]. Each label is 32 B.
+:label_addr
+    li_t0 %32 %0
+    mul_a0,a0,t0
+    la_a1 &labels_ptr
+    ld_a1,a1,0
+    add_a0,a0,a1
+    ret
+
+## name_eq(a0=label_ptr, a1=src, a2=len) -> a0=0/1.
+:name_eq
+    enter_0
+    la_a3 &ne_label
+    st_a0,a3,0
+    la_a3 &ne_src
+    st_a1,a3,0
+    la_a3 &ne_len
+    st_a2,a3,0
+    # if (label->name_len != len) return 0
+    ld_t0,a0,8
+    la_br &ne_no
+    bne_t0,a2
+    # bytes equal?
+    la_a0 &ne_label
+    ld_a0,a0,0
+    ld_a3,a0,0
+    la_a0 &text_buf_ptr
+    ld_a0,a0,0
+    add_a0,a0,a3
+    la_a1 &ne_src
+    ld_a1,a1,0
+    la_a2 &ne_len
+    ld_a2,a2,0
+    la_br &mem_eq
+    call
+    eret
+:ne_no
+    li_a0 %0 %0
+    eret
+
+## define_label(a0=src, a1=len, a2=scope_id). First definition wins.
+:define_label
+    enter_0
+    la_a3 &dl_src
+    st_a0,a3,0
+    la_a3 &dl_len
+    st_a1,a3,0
+    la_a3 &dl_scope
+    st_a2,a3,0
+    la_a0 &label_count
+    ld_t0,a0,0
+    li_t1 H2_LABEL_CAP
+    la_br &err_too_many_labels
+    beq_t0,t1
+    la_br &err_too_many_labels
+    blt_t1,t0
+    # name_off = intern(src, len)
+    la_a0 &dl_src
+    ld_a0,a0,0
+    la_a1 &dl_len
+    ld_a1,a1,0
+    la_br &intern
+    call
+    la_a3 &dl_name_off
+    st_a0,a3,0
+    # &labels[label_count]
+    la_a0 &label_count
+    ld_a0,a0,0
+    la_br &label_addr
+    call
+    la_a3 &dl_label
+    st_a0,a3,0
+    # name_off
+    la_a1 &dl_name_off
+    ld_t0,a1,0
+    st_t0,a0,0
+    # name_len
+    la_a1 &dl_len
+    ld_t0,a1,0
+    st_t0,a0,8
+    # target_ip
+    la_a1 &ip
+    ld_t0,a1,0
+    st_t0,a0,16
+    # scope_id
+    la_a1 &dl_scope
+    ld_t0,a1,0
+    st_t0,a0,24
+    # label_count++
+    la_a0 &label_count
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    eret
+
+## lookup_label_in(a0=src, a1=len, a2=stack_ptr, a3=depth) -> a0=target_ip.
+:lookup_label_in
+    enter_0
+    la_t1 &ll_src
+    st_a0,t1,0
+    la_t1 &ll_len
+    st_a1,t1,0
+    la_t1 &ll_stack
+    st_a2,t1,0
+    la_t1 &ll_depth
+    st_a3,t1,0
+    # dotted? (first byte == '.' AND depth > 0)
+    lb_t0,a0,0
+    li_t1 %46 %0
+    la_br &ll_undotted
+    bne_t0,t1
+    la_br &ll_undotted
+    beqz_a3
+    addi_t0,a3,neg1
+    la_a1 &ll_d
+    st_t0,a1,0
+:ll_dot_outer
+    la_a0 &ll_d
+    ld_t0,a0,0
+    la_br &err_undefined_local
+    bltz_t0
+    la_a1 &ll_stack
+    ld_a1,a1,0
+    shli_t2,t0,3
+    add_a1,a1,t2
+    ld_t1,a1,0
+    la_a0 &ll_sid
+    st_t1,a0,0
+    li_t0 %0 %0
+    la_a0 &ll_i
+    st_t0,a0,0
+:ll_dot_inner
+    la_a0 &ll_i
+    ld_t0,a0,0
+    la_a1 &label_count
+    ld_t1,a1,0
+    la_br &ll_dot_next_d
+    beq_t0,t1
+    mov_a0,t0
+    la_br &label_addr
+    call
+    la_a3 &ll_label
+    st_a0,a3,0
+    ld_t0,a0,24
+    la_a1 &ll_sid
+    ld_t1,a1,0
+    la_br &ll_dot_inner_next
+    bne_t0,t1
+    la_a0 &ll_label
+    ld_a0,a0,0
+    la_a1 &ll_src
+    ld_a1,a1,0
+    la_a2 &ll_len
+    ld_a2,a2,0
+    la_br &name_eq
+    call
+    la_br &ll_dot_inner_next
+    beqz_a0
+    la_a0 &ll_label
+    ld_a0,a0,0
+    ld_a0,a0,16
+    eret
+:ll_dot_inner_next
+    la_a0 &ll_i
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &ll_dot_inner
+    b
+:ll_dot_next_d
+    la_a0 &ll_d
+    ld_t0,a0,0
+    addi_t0,t0,neg1
+    st_t0,a0,0
+    la_br &ll_dot_outer
+    b
+
+:ll_undotted
+    li_t0 %0 %0
+    la_a0 &ll_i
+    st_t0,a0,0
+:ll_undotted_loop
+    la_a0 &ll_i
+    ld_t0,a0,0
+    la_a1 &label_count
+    ld_t1,a1,0
+    la_br &err_undefined_label
+    beq_t0,t1
+    mov_a0,t0
+    la_br &label_addr
+    call
+    la_a3 &ll_label
+    st_a0,a3,0
+    ld_t0,a0,24
+    la_br &ll_undotted_next
+    bnez_t0
+    la_a0 &ll_label
+    ld_a0,a0,0
+    la_a1 &ll_src
+    ld_a1,a1,0
+    la_a2 &ll_len
+    ld_a2,a2,0
+    la_br &name_eq
+    call
+    la_br &ll_undotted_next
+    beqz_a0
+    la_a0 &ll_label
+    ld_a0,a0,0
+    ld_a0,a0,16
+    eret
+:ll_undotted_next
+    la_a0 &ll_i
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &ll_undotted_loop
+    b
+
+## --- Reference processor ---------------------------------------------------
+## process_reference(): cur_sigil already set; scan_pos already past sigil.
+## Captures label name span (and optional -OTHER), reserves placeholder bytes,
+## and appends a Fixup record. Resolution happens later in patch_fixups.
+:process_reference
+    enter_0
+    la_br &set_sigil_info
+    call
+    # require non-terminator (label name follows)
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &err_sigil_no_label
+    beq_t0,t1
+    la_br &err_sigil_no_label
+    blt_t1,t0
+    lb_a0,t0,0
+    la_br &is_name_terminator
+    call
+    la_br &err_sigil_no_label
+    bnez_a0
+    # scan_name -> length in a0, pointer in sn_start (no copy).
+    la_br &scan_name
+    call
+    la_a1 &pref_name_len
+    st_a0,a1,0
+    la_a0 &sn_start
+    ld_t0,a0,0
+    la_a1 &pref_name
+    st_t0,a1,0
+    # default: other = NULL, other_len = 0
+    li_t0 %0 %0
+    la_a1 &pref_other
+    st_t0,a1,0
+    la_a1 &pref_other_len
+    st_t0,a1,0
+    # optional '-' or '>' separator (tight, no whitespace)
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &pref_after_other
+    beq_t0,t1
+    la_br &pref_after_other
+    blt_t1,t0
+    lb_a0,t0,0
+    li_t1 %45 %0
+    la_br &pref_consume_sep
+    beq_a0,t1
+    li_t1 %62 %0
+    la_br &pref_consume_sep
+    beq_a0,t1
+    la_br &pref_after_other
+    b
+:pref_consume_sep
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &err_minus_no_label
+    beq_t0,t1
+    la_br &err_minus_no_label
+    blt_t1,t0
+    lb_a0,t0,0
+    la_br &is_name_terminator
+    call
+    la_br &err_minus_no_label
+    bnez_a0
+    la_br &scan_name
+    call
+    la_a1 &pref_other_len
+    st_a0,a1,0
+    la_a0 &sn_start
+    ld_t0,a0,0
+    la_a1 &pref_other
+    st_t0,a1,0
+:pref_after_other
+    # Reserve placeholder bytes; emit_zeros returns starting offset.
+    la_a0 &pr_width
+    ld_a0,a0,0
+    la_br &emit_zeros
+    call
+    la_a1 &rf_out_off
+    st_a0,a1,0
+    # ip_after = ip (already advanced by emit_zeros).
+    la_a0 &ip
+    ld_t0,a0,0
+    la_a1 &rf_ip_after
+    st_t0,a1,0
+    la_br &record_fixup
+    call
+    eret
+
+## record_fixup(): pref_name/pref_name_len/pref_other/pref_other_len already set
+## by caller. rf_out_off and rf_ip_after also set. Snapshots cur_sigil/cur_path/
+## cur_line and the current scope stack (if depth > 0).
+:record_fixup
+    enter_0
+    la_a0 &fixup_count
+    ld_t0,a0,0
+    li_t1 H2_FIXUP_CAP
+    la_br &err_too_many_fixups
+    beq_t0,t1
+    la_br &err_too_many_fixups
+    blt_t1,t0
+    # fp = fixups_ptr + count * 96
+    li_t1 %96 %0
+    mul_a1,t0,t1
+    la_a2 &fixups_ptr
+    ld_a2,a2,0
+    add_a1,a1,a2
+    la_a3 &rf_fp
+    st_a1,a3,0
+    # offset 0:  out_off
+    la_a0 &rf_out_off
+    ld_t0,a0,0
+    st_t0,a1,0
+    # offset 8:  ip_at_ref
+    la_a0 &rf_ip_after
+    ld_t0,a0,0
+    st_t0,a1,8
+    # offset 16: name
+    la_a0 &pref_name
+    ld_t0,a0,0
+    st_t0,a1,16
+    # offset 24: other (0 if none)
+    la_a0 &pref_other
+    ld_t0,a0,0
+    st_t0,a1,24
+    # offset 32: src_path = cur_path
+    la_a0 &cur_path
+    ld_t0,a0,0
+    st_t0,a1,32
+    # offset 40: name_len
+    la_a0 &pref_name_len
+    ld_t0,a0,0
+    st_t0,a1,40
+    # offset 48: other_len
+    la_a0 &pref_other_len
+    ld_t0,a0,0
+    st_t0,a1,48
+    # offset 56: scope_hist_off (filled below if depth > 0)
+    li_t0 %0 %0
+    st_t0,a1,56
+    # offset 64: scope_depth (snapshot)
+    la_a0 &scope_depth
+    ld_t0,a0,0
+    st_t0,a1,64
+    # offset 72: src_line = cur_line  (offset > 64: indirect via a3)
+    la_a0 &cur_line
+    ld_t0,a0,0
+    li_t1 %72 %0
+    add_a3,a1,t1
+    st_t0,a3,0
+    # offset 80: sigil
+    la_a0 &cur_sigil
+    ld_t0,a0,0
+    li_t1 %80 %0
+    add_a3,a1,t1
+    st_t0,a3,0
+    # If depth > 0, snapshot scope_stack into scope_history.
+    la_a0 &scope_depth
+    ld_t0,a0,0
+    la_br &rf_no_scope
+    beqz_t0
+    la_a1 &scope_history_used
+    ld_t1,a1,0
+    add_t2,t1,t0
+    li_a3 H2_SCOPE_HISTORY_CAP
+    la_br &err_scope_history_overflow
+    blt_a3,t2
+    # Set scope_hist_off (offset 56) on the fixup.
+    la_a0 &rf_fp
+    ld_a0,a0,0
+    st_t1,a0,56
+    li_t2 %0 %0
+    la_a0 &rf_i
+    st_t2,a0,0
+:rf_copy_loop
+    la_a0 &rf_i
+    ld_t0,a0,0
+    la_a1 &scope_depth
+    ld_t1,a1,0
+    la_br &rf_copy_done
+    beq_t0,t1
+    # src = scope_stack_ptr + i*8
+    la_a1 &scope_stack_ptr
+    ld_a1,a1,0
+    shli_t2,t0,3
+    add_a1,a1,t2
+    ld_a3,a1,0
+    # dst = scope_history_ptr + (scope_history_used + i)*8
+    la_a2 &scope_history_used
+    ld_a2,a2,0
+    add_a2,a2,t0
+    shli_a2,a2,3
+    la_a1 &scope_history_ptr
+    ld_a1,a1,0
+    add_a1,a1,a2
+    st_a3,a1,0
+    addi_t0,t0,1
+    la_a0 &rf_i
+    st_t0,a0,0
+    la_br &rf_copy_loop
+    b
+:rf_copy_done
+    la_a1 &scope_history_used
+    ld_t0,a1,0
+    la_a2 &scope_depth
+    ld_t1,a2,0
+    add_t0,t0,t1
+    st_t0,a1,0
+:rf_no_scope
+    la_a0 &fixup_count
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    eret
+
+## set_sigil_info(): reads cur_sigil; populates pr_width / pr_is_rel /
+## pr_lo / pr_hi / pr_range_check.
+:set_sigil_info
+    enter_0
+    la_a0 &cur_sigil
+    ld_a0,a0,0
+    li_t0 %33 %0
+    la_br &ssi_bang
+    beq_a0,t0
+    li_t0 %64 %0
+    la_br &ssi_at
+    beq_a0,t0
+    li_t0 %36 %0
+    la_br &ssi_dollar
+    beq_a0,t0
+    li_t0 %126 %0
+    la_br &ssi_tilde
+    beq_a0,t0
+    li_t0 %37 %0
+    la_br &ssi_pct
+    beq_a0,t0
+    li_t0 %38 %0
+    la_br &ssi_amp
+    beq_a0,t0
+    la_br &err_bad_sigil
+    b
+:ssi_bang
+    li_t0 %1 %0
+    la_a1 &pr_width
+    st_t0,a1,0
+    la_a1 &pr_is_rel
+    st_t0,a1,0
+    la_a1 &pr_range_check
+    st_t0,a1,0
+    li_t0 %128 %0
+    li_t1 %0 %0
+    sub_t0,t1,t0
+    la_a1 &pr_lo
+    st_t0,a1,0
+    li_t0 %127 %0
+    la_a1 &pr_hi
+    st_t0,a1,0
+    eret
+:ssi_at
+    li_t0 %2 %0
+    la_a1 &pr_width
+    st_t0,a1,0
+    li_t0 %1 %0
+    la_a1 &pr_is_rel
+    st_t0,a1,0
+    la_a1 &pr_range_check
+    st_t0,a1,0
+    # 32768 = 256 * 128
+    li_t0 %256 %0
+    li_t1 %128 %0
+    mul_t0,t0,t1
+    li_t1 %0 %0
+    sub_t1,t1,t0
+    la_a1 &pr_lo
+    st_t1,a1,0
+    addi_t0,t0,neg1
+    la_a1 &pr_hi
+    st_t0,a1,0
+    eret
+:ssi_dollar
+    li_t0 %2 %0
+    la_a1 &pr_width
+    st_t0,a1,0
+    li_t0 %0 %0
+    la_a1 &pr_is_rel
+    st_t0,a1,0
+    li_t0 %1 %0
+    la_a1 &pr_range_check
+    st_t0,a1,0
+    li_t0 %0 %0
+    la_a1 &pr_lo
+    st_t0,a1,0
+    # 65536 = 256 * 256
+    li_t0 %256 %0
+    mov_t1,t0
+    mul_t0,t0,t1
+    addi_t0,t0,neg1
+    la_a1 &pr_hi
+    st_t0,a1,0
+    eret
+:ssi_tilde
+    li_t0 %3 %0
+    la_a1 &pr_width
+    st_t0,a1,0
+    li_t0 %1 %0
+    la_a1 &pr_is_rel
+    st_t0,a1,0
+    la_a1 &pr_range_check
+    st_t0,a1,0
+    # 8388608 = 256 * 256 * 128
+    li_t0 %256 %0
+    mov_t1,t0
+    mul_t0,t0,t1
+    li_t1 %128 %0
+    mul_t0,t0,t1
+    li_t1 %0 %0
+    sub_t1,t1,t0
+    la_a1 &pr_lo
+    st_t1,a1,0
+    addi_t0,t0,neg1
+    la_a1 &pr_hi
+    st_t0,a1,0
+    eret
+:ssi_pct
+    la_a0 &ptrsize
+    ld_t0,a0,0
+    la_a1 &pr_width
+    st_t0,a1,0
+    li_t0 %1 %0
+    la_a1 &pr_is_rel
+    st_t0,a1,0
+    la_a1 &ptrsize_used
+    st_t0,a1,0
+    li_t0 %0 %0
+    la_a1 &pr_range_check
+    st_t0,a1,0
+    la_a1 &pr_lo
+    st_t0,a1,0
+    la_a1 &pr_hi
+    st_t0,a1,0
+    eret
+:ssi_amp
+    la_a0 &ptrsize
+    ld_t0,a0,0
+    la_a1 &pr_width
+    st_t0,a1,0
+    li_t0 %1 %0
+    la_a1 &ptrsize_used
+    st_t0,a1,0
+    li_t0 %0 %0
+    la_a1 &pr_is_rel
+    st_t0,a1,0
+    la_a1 &pr_range_check
+    st_t0,a1,0
+    la_a1 &pr_lo
+    st_t0,a1,0
+    la_a1 &pr_hi
+    st_t0,a1,0
+    eret
+
+## --- Directives ------------------------------------------------------------
+
+## do_align(): .align N [PATTERN]. N positive power of two; optional pattern.
+:do_align
+    enter_0
+    la_br &skip_inline_ws
+    call
+    la_br &read_decimal
+    call
+    la_a1 &da_n
+    st_a0,a1,0
+    la_br &err_align_n
+    beqz_a0
+    la_br &err_align_n
+    bltz_a0
+    # power-of-two: N & (N-1) == 0
+    la_a0 &da_n
+    ld_a3,a0,0
+    addi_a3,a3,neg1
+    la_a0 &da_n
+    ld_a2,a0,0
+    and_a3,a3,a2
+    la_br &err_align_n
+    bnez_a3
+    li_t0 %0 %0
+    la_a0 &da_has_pat
+    st_t0,a0,0
+    la_a0 &da_patlen
+    st_t0,a0,0
+    la_br &skip_inline_ws
+    call
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &da_compute
+    beq_t0,t1
+    la_br &da_compute
+    blt_t1,t0
+    lb_a0,t0,0
+    la_br &is_byte_digit
+    call
+    la_br &da_compute
+    beqz_a0
+    li_t0 %1 %0
+    la_a1 &da_has_pat
+    st_t0,a1,0
+:da_pat_loop
+    la_a0 &scan_pos
+    ld_t0,a0,0
+    la_a1 &scan_end
+    ld_t1,a1,0
+    la_br &da_compute
+    beq_t0,t1
+    la_br &da_compute
+    blt_t1,t0
+    lb_a0,t0,0
+    la_br &is_byte_digit
+    call
+    la_br &da_compute
+    beqz_a0
+    la_a0 &da_patlen
+    ld_t0,a0,0
+    li_t1 H2_TOKEN_CAP
+    la_br &err_pattern_too_large
+    beq_t0,t1
+    la_a0 &pat_buf_ptr
+    ld_a0,a0,0
+    add_a0,a0,t0
+    la_br &parse_one_byte
+    call
+    la_a0 &da_patlen
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &da_pat_loop
+    b
+:da_compute
+    # pad = (N - (ip mod N)) mod N
+    la_a0 &ip
+    ld_a0,a0,0
+    la_a1 &da_n
+    ld_a1,a1,0
+    rem_a2,a0,a1
+    li_t0 %0 %0
+    la_a3 &da_pad
+    st_t0,a3,0
+    la_br &da_emit
+    beqz_a2
+    sub_a3,a1,a2
+    la_a1 &da_pad
+    st_a3,a1,0
+:da_emit
+    la_a0 &da_pad
+    ld_t0,a0,0
+    la_br &da_emit_done
+    beqz_t0
+    # No-pattern fast path: emit_zeros(pad).
+    la_a1 &da_has_pat
+    ld_t1,a1,0
+    la_br &da_emit_pattern
+    bnez_t1
+    la_a0 &da_pad
+    ld_a0,a0,0
+    la_br &emit_zeros
+    call
+    la_br &da_emit_done
+    b
+:da_emit_pattern
+    li_t0 %0 %0
+    la_a0 &da_i
+    st_t0,a0,0
+:da_pattern_loop
+    la_a0 &da_i
+    ld_t0,a0,0
+    la_a1 &da_pad
+    ld_t1,a1,0
+    la_br &da_emit_done
+    beq_t0,t1
+    # b = pat[i % patlen]
+    la_a1 &da_patlen
+    ld_a1,a1,0
+    rem_a2,t0,a1
+    la_a0 &pat_buf_ptr
+    ld_a0,a0,0
+    add_a0,a0,a2
+    lb_a0,a0,0
+    la_br &emit_byte
+    call
+    la_a0 &da_i
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &da_pattern_loop
+    b
+:da_emit_done
+    eret
+
+## do_fill(): .fill N B.
+:do_fill
+    enter_0
+    la_br &skip_inline_ws
+    call
+    la_br &read_decimal
+    call
+    la_a1 &df_n
+    st_a0,a1,0
+    la_br &err_fill_n
+    bltz_a0
+    la_br &skip_inline_ws
+    call
+    la_a0 &df_byte_ptr
+    ld_a0,a0,0
+    la_br &parse_one_byte
+    call
+    la_a0 &df_n
+    ld_a0,a0,0
+    la_br &df_done
+    beqz_a0
+    la_a1 &df_byte_ptr
+    ld_a1,a1,0
+    lb_a1,a1,0
+    la_br &emit_fill
+    call
+:df_done
+    eret
+
+## do_scope_open(): scope_seq++; scope_stack[scope_depth++] = scope_seq.
+:do_scope_open
+    enter_0
+    la_a0 &scope_depth
+    ld_t0,a0,0
+    li_t1 H2_SCOPE_CAP
+    la_br &err_scope_overflow
+    beq_t0,t1
+    la_br &err_scope_overflow
+    blt_t1,t0
+    la_a0 &scope_seq
+    ld_t1,a0,0
+    addi_t1,t1,1
+    st_t1,a0,0
+    la_a1 &scope_stack_ptr
+    ld_a1,a1,0
+    shli_t2,t0,3
+    add_a1,a1,t2
+    st_t1,a1,0
+    addi_t0,t0,1
+    la_a0 &scope_depth
+    st_t0,a0,0
+    eret
+
+## do_scope_close(): scope_depth--.
+:do_scope_close
+    enter_0
+    la_a0 &scope_depth
+    ld_t0,a0,0
+    la_br &err_scope_underflow
+    beqz_t0
+    addi_t0,t0,neg1
+    st_t0,a0,0
+    eret
+
+## do_ptrsize(): .ptrsize N -- N must be 4 or 8.
+:do_ptrsize
+    enter_0
+    la_br &skip_inline_ws
+    call
+    la_br &read_decimal
+    call
+    la_a1 &dp_n
+    st_a0,a1,0
+    li_t0 %4 %0
+    la_br &dp_ok
+    beq_a0,t0
+    li_t0 %8 %0
+    la_br &dp_ok
+    beq_a0,t0
+    la_br &err_ptrsize_bad
+    b
+:dp_ok
+    la_a0 &ptrsize_used
+    ld_t0,a0,0
+    la_br &dp_set
+    beqz_t0
+    la_a0 &ptrsize
+    ld_t0,a0,0
+    la_a1 &dp_n
+    ld_t1,a1,0
+    la_br &err_ptrsize_conflict
+    bne_t0,t1
+    eret
+:dp_set
+    la_a0 &dp_n
+    ld_t0,a0,0
+    la_a1 &ptrsize
+    st_t0,a1,0
+    eret
+
+## --- Emit ------------------------------------------------------------------
+
+## emit_byte(a0=byte): write one byte to output_buf and bump ip.
+:emit_byte
+    la_a1 &output_used
+    ld_t0,a1,0
+    li_t1 H2_OUTPUT_CAP
+    la_br &err_output_overflow
+    beq_t0,t1
+    la_br &err_output_overflow
+    blt_t1,t0
+    la_a2 &output_buf_ptr
+    ld_a2,a2,0
+    add_a2,a2,t0
+    sb_a0,a2,0
+    addi_t0,t0,1
+    st_t0,a1,0
+    la_a0 &ip
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    ret
+
+## emit_zeros(a0=n) -> a0 = starting offset (output_used before the call).
+## Writes n zero bytes to output_buf and advances output_used + ip by n.
+:emit_zeros
+    enter_0
+    la_a3 &emz_n
+    st_a0,a3,0
+    # Capacity check: output_used + n must fit.
+    la_a1 &output_used
+    ld_t0,a1,0
+    add_t1,t0,a0
+    li_t2 H2_OUTPUT_CAP
+    la_br &err_output_overflow
+    blt_t2,t1
+    la_a2 &emz_off
+    st_t0,a2,0
+    la_a2 &output_buf_ptr
+    ld_a2,a2,0
+    add_a2,a2,t0
+    li_t1 %0 %0
+:emz_loop
+    la_a3 &emz_n
+    ld_t2,a3,0
+    la_br &emz_done
+    beq_t1,t2
+    add_a3,a2,t1
+    li_t0 %0 %0
+    sb_t0,a3,0
+    addi_t1,t1,1
+    la_br &emz_loop
+    b
+:emz_done
+    la_a3 &emz_n
+    ld_t0,a3,0
+    la_a1 &output_used
+    ld_t1,a1,0
+    add_t1,t1,t0
+    st_t1,a1,0
+    la_a1 &ip
+    ld_t1,a1,0
+    add_t1,t1,t0
+    st_t1,a1,0
+    la_a0 &emz_off
+    ld_a0,a0,0
+    eret
+
+## emit_fill(a0=n, a1=byte): write n copies of byte; advances output_used + ip.
+:emit_fill
+    enter_0
+    la_a3 &emf_n
+    st_a0,a3,0
+    la_a3 &emf_b
+    st_a1,a3,0
+    la_a2 &output_used
+    ld_t0,a2,0
+    add_t1,t0,a0
+    li_t2 H2_OUTPUT_CAP
+    la_br &err_output_overflow
+    blt_t2,t1
+    la_a2 &output_buf_ptr
+    ld_a2,a2,0
+    add_a2,a2,t0
+    li_t1 %0 %0
+:emf_loop
+    la_a3 &emf_n
+    ld_t2,a3,0
+    la_br &emf_done
+    beq_t1,t2
+    la_a3 &emf_b
+    ld_t0,a3,0
+    add_a3,a2,t1
+    sb_t0,a3,0
+    addi_t1,t1,1
+    la_br &emf_loop
+    b
+:emf_done
+    la_a3 &emf_n
+    ld_t0,a3,0
+    la_a1 &output_used
+    ld_t1,a1,0
+    add_t1,t1,t0
+    st_t1,a1,0
+    la_a1 &ip
+    ld_t1,a1,0
+    add_t1,t1,t0
+    st_t1,a1,0
+    eret
+
+## write_value(a0=out_off): patch a value into output_buf at out_off.
+## Caller pre-populates ev_value/ev_width/ev_lo/ev_hi/ev_range_check.
+:write_value
+    enter_0
+    la_t1 &ev_out_off
+    st_a0,t1,0
+
+    la_a0 &ev_range_check
+    ld_t0,a0,0
+    la_br &wv_no_range
+    beqz_t0
+    la_a0 &ev_value
+    ld_a0,a0,0
+    la_a1 &ev_lo
+    ld_a1,a1,0
+    la_br &err_ref_out_of_range
+    blt_a0,a1
+    la_a0 &ev_value
+    ld_a0,a0,0
+    la_a1 &ev_hi
+    ld_a1,a1,0
+    la_br &err_ref_out_of_range
+    blt_a1,a0
+:wv_no_range
+    la_a0 &ev_value
+    ld_a0,a0,0
+    la_a1 &ev_pack_v
+    st_a0,a1,0
+    li_t0 %0 %0
+    la_a0 &ev_i
+    st_t0,a0,0
+:wv_pack_loop
+    la_a0 &ev_i
+    ld_t0,a0,0
+    la_a1 &ev_width
+    ld_t1,a1,0
+    la_br &wv_emit_dispatch
+    beq_t0,t1
+    la_a1 &ev_pack_v
+    ld_a3,a1,0
+    andi_a3,a3,255
+    la_a2 &ev_bytes_ptr
+    ld_a2,a2,0
+    add_a2,a2,t0
+    sb_a3,a2,0
+    la_a1 &ev_pack_v
+    ld_t2,a1,0
+    shri_t2,t2,8
+    st_t2,a1,0
+    addi_t0,t0,1
+    la_a0 &ev_i
+    st_t0,a0,0
+    la_br &wv_pack_loop
+    b
+:wv_emit_dispatch
+    la_a0 &big_endian
+    ld_t0,a0,0
+    la_br &wv_emit_be
+    bnez_t0
+    li_t0 %0 %0
+    la_a0 &ev_i
+    st_t0,a0,0
+:wv_emit_le_loop
+    la_a0 &ev_i
+    ld_t0,a0,0
+    la_a1 &ev_width
+    ld_t1,a1,0
+    la_br &wv_done
+    beq_t0,t1
+    la_a2 &ev_bytes_ptr
+    ld_a2,a2,0
+    add_a2,a2,t0
+    lb_a0,a2,0
+    la_a3 &output_buf_ptr
+    ld_a3,a3,0
+    la_a2 &ev_out_off
+    ld_a2,a2,0
+    add_a3,a3,a2
+    add_a3,a3,t0
+    sb_a0,a3,0
+    addi_t0,t0,1
+    la_a0 &ev_i
+    st_t0,a0,0
+    la_br &wv_emit_le_loop
+    b
+:wv_emit_be
+    li_t0 %0 %0
+    la_a0 &ev_i
+    st_t0,a0,0
+:wv_emit_be_loop
+    la_a0 &ev_i
+    ld_t0,a0,0
+    la_a1 &ev_width
+    ld_t1,a1,0
+    la_br &wv_done
+    beq_t0,t1
+    # src_idx = (width - 1) - i
+    addi_t1,t1,neg1
+    sub_t2,t1,t0
+    la_a2 &ev_bytes_ptr
+    ld_a2,a2,0
+    add_a2,a2,t2
+    lb_a0,a2,0
+    la_a3 &output_buf_ptr
+    ld_a3,a3,0
+    la_a2 &ev_out_off
+    ld_a2,a2,0
+    add_a3,a3,a2
+    add_a3,a3,t0
+    sb_a0,a3,0
+    addi_t0,t0,1
+    la_a0 &ev_i
+    st_t0,a0,0
+    la_br &wv_emit_be_loop
+    b
+:wv_done
+    eret
+
+## --- Fixup resolution ------------------------------------------------------
+## patch_fixups(): walk fixups[0..fixup_count), resolve labels, write values
+## into output_buf. Per-fixup error reports use the snapshotted src_path /
+## src_line via the cur_path / cur_line globals.
+:patch_fixups
+    enter_0
+    li_t0 %0 %0
+    la_a0 &pf_i
+    st_t0,a0,0
+:pf_loop
+    la_a0 &pf_i
+    ld_t0,a0,0
+    la_a1 &fixup_count
+    ld_t1,a1,0
+    la_br &pf_done
+    beq_t0,t1
+    # fp = fixups + i*96
+    li_t1 %96 %0
+    mul_a1,t0,t1
+    la_a2 &fixups_ptr
+    ld_a2,a2,0
+    add_a1,a1,a2
+    la_a3 &pf_fp
+    st_a1,a3,0
+    # cur_path = fp[32]; cur_line = fp[72]; cur_sigil = fp[80]
+    ld_t0,a1,32
+    la_a2 &cur_path
+    st_t0,a2,0
+    li_t1 %72 %0
+    add_a3,a1,t1
+    ld_t0,a3,0
+    la_a2 &cur_line
+    st_t0,a2,0
+    li_t1 %80 %0
+    add_a3,a1,t1
+    ld_t0,a3,0
+    la_a2 &cur_sigil
+    st_t0,a2,0
+    # pr_width / pr_is_rel / pr_lo / pr_hi / pr_range_check
+    la_br &set_sigil_info
+    call
+    # Determine stack pointer for the lookup (NULL if depth == 0).
+    la_a0 &pf_fp
+    ld_a1,a0,0
+    ld_t0,a1,64
+    la_a2 &pf_depth
+    st_t0,a2,0
+    li_t1 %0 %0
+    la_a2 &pf_stack
+    st_t1,a2,0
+    la_br &pf_lookup_label
+    beqz_t0
+    # stack = scope_history_ptr + scope_hist_off * 8
+    ld_t1,a1,56
+    shli_t1,t1,3
+    la_a2 &scope_history_ptr
+    ld_a2,a2,0
+    add_a2,a2,t1
+    la_a3 &pf_stack
+    st_a2,a3,0
+:pf_lookup_label
+    la_a0 &pf_fp
+    ld_a1,a0,0
+    ld_a0,a1,16
+    ld_t0,a1,40
+    mov_a1,t0
+    la_a2 &pf_stack
+    ld_a2,a2,0
+    la_a3 &pf_depth
+    ld_a3,a3,0
+    la_br &lookup_label_in
+    call
+    la_a1 &pf_t_label
+    st_a0,a1,0
+    # If other != 0: value = t_label - t_other; emit.
+    la_a0 &pf_fp
+    ld_a1,a0,0
+    ld_t0,a1,24
+    la_br &pf_no_other
+    beqz_t0
+    mov_a0,t0
+    ld_t0,a1,48
+    mov_a1,t0
+    la_a2 &pf_stack
+    ld_a2,a2,0
+    la_a3 &pf_depth
+    ld_a3,a3,0
+    la_br &lookup_label_in
+    call
+    la_a1 &pf_t_label
+    ld_a1,a1,0
+    sub_a0,a1,a0
+    la_a1 &pf_value
+    st_a0,a1,0
+    la_br &pf_emit
+    b
+:pf_no_other
+    la_a0 &pr_is_rel
+    ld_t0,a0,0
+    la_br &pf_abs
+    beqz_t0
+    # rel: value = t_label - ip_at_ref
+    la_a0 &pf_fp
+    ld_a1,a0,0
+    ld_t1,a1,8
+    la_a0 &pf_t_label
+    ld_a0,a0,0
+    sub_a0,a0,t1
+    la_a1 &pf_value
+    st_a0,a1,0
+    la_br &pf_emit
+    b
+:pf_abs
+    la_a0 &pf_t_label
+    ld_a1,a0,0
+    la_a0 &base_address
+    ld_a0,a0,0
+    add_a1,a1,a0
+    la_a3 &pf_value
+    st_a1,a3,0
+:pf_emit
+    # Populate ev_* state, then write_value(out_off).
+    la_a0 &pf_value
+    ld_t0,a0,0
+    la_a1 &ev_value
+    st_t0,a1,0
+    la_a0 &pr_width
+    ld_t0,a0,0
+    la_a1 &ev_width
+    st_t0,a1,0
+    la_a0 &pr_lo
+    ld_t0,a0,0
+    la_a1 &ev_lo
+    st_t0,a1,0
+    la_a0 &pr_hi
+    ld_t0,a0,0
+    la_a1 &ev_hi
+    st_t0,a1,0
+    la_a0 &pr_range_check
+    ld_t0,a0,0
+    la_a1 &ev_range_check
+    st_t0,a1,0
+    la_a0 &pf_fp
+    ld_a1,a0,0
+    ld_a0,a1,0
+    la_br &write_value
+    call
+    # i++
+    la_a0 &pf_i
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &pf_loop
+    b
+:pf_done
+    eret
+
+## --- Output writer ---------------------------------------------------------
+:write_output
+    enter_0
+    la_a0 &output_path
+    ld_a2,a0,0
+    li_a0 sys_openat
+    li_a1 H2_AT_FDCWD
+    li_a3 H2_O_WRONLY_CREAT_TRUNC
+    la_t1 &non_executable
+    ld_t1,t1,0
+    la_br &wo_mode_nonexec
+    bnez_t1
+    li_t0 H2_MODE_0750
+    la_br &wo_after_mode
+    b
+:wo_mode_nonexec
+    li_t0 H2_MODE_0640
+:wo_after_mode
+    syscall
+    la_br &err_open_output
+    bltz_a0
+    la_a1 &output_fd
+    st_a0,a1,0
+    li_t0 %0 %0
+    la_a1 &output_written
+    st_t0,a1,0
+:wo_loop
+    la_a0 &output_written
+    ld_t0,a0,0
+    la_a1 &output_used
+    ld_t1,a1,0
+    la_br &wo_done
+    beq_t0,t1
+    la_a0 &output_fd
+    ld_a1,a0,0
+    la_a2 &output_buf_ptr
+    ld_a2,a2,0
+    add_a2,a2,t0
+    sub_a3,t1,t0
+    li_a0 sys_write
+    syscall
+    la_br &err_write
+    bltz_a0
+    la_br &err_write
+    beqz_a0
+    la_a1 &output_written
+    ld_t0,a1,0
+    add_t0,t0,a0
+    st_t0,a1,0
+    la_br &wo_loop
+    b
+:wo_done
+    eret
+
+## --- Misc helpers ----------------------------------------------------------
+
+## str_eq(a0=p, a1=q, a2=len) -> a0=0/1. len bytes equal AND p[len]==NUL.
+:str_eq
+    enter_0
+    la_t0 &se_p
+    st_a0,t0,0
+    la_t0 &se_q
+    st_a1,t0,0
+    la_t0 &se_len
+    st_a2,t0,0
+    li_t1 %0 %0
+:se_loop
+    la_a0 &se_len
+    ld_a1,a0,0
+    la_br &se_check_terminal
+    beq_t1,a1
+    la_a0 &se_p
+    ld_a0,a0,0
+    add_a0,a0,t1
+    lb_t0,a0,0
+    la_a2 &se_q
+    ld_a2,a2,0
+    add_a2,a2,t1
+    lb_t2,a2,0
+    la_br &se_no
+    bne_t0,t2
+    addi_t1,t1,1
+    la_br &se_loop
+    b
+:se_check_terminal
+    la_a0 &se_p
+    ld_a0,a0,0
+    add_a0,a0,t1
+    lb_t0,a0,0
+    la_br &se_no
+    bnez_t0
+    li_a0 %1 %0
+    eret
+:se_no
+    li_a0 %0 %0
+    eret
+
+## mem_eq(a0=p, a1=q, a2=len) -> a0=0/1.
+:mem_eq
+    enter_0
+    la_t0 &me_p
+    st_a0,t0,0
+    la_t0 &me_q
+    st_a1,t0,0
+    la_t0 &me_len
+    st_a2,t0,0
+    li_t1 %0 %0
+:me_loop
+    la_a0 &me_len
+    ld_a1,a0,0
+    la_br &me_yes
+    beq_t1,a1
+    la_a0 &me_p
+    ld_a0,a0,0
+    add_a0,a0,t1
+    lb_t0,a0,0
+    la_a2 &me_q
+    ld_a2,a2,0
+    add_a2,a2,t1
+    lb_t2,a2,0
+    la_br &me_no
+    bne_t0,t2
+    addi_t1,t1,1
+    la_br &me_loop
+    b
+:me_yes
+    li_a0 %1 %0
+    eret
+:me_no
+    li_a0 %0 %0
+    eret
+
+## parse_long(a0=cstr) -> a0=value. Decimal or 0x-prefixed hex i64.
+:parse_long
+    enter_0
+    la_t0 &pl_p
+    st_a0,t0,0
+    li_t0 %0 %0
+    la_a1 &pl_val
+    st_t0,a1,0
+    la_a1 &pl_neg
+    st_t0,a1,0
+    # 0x / 0X prefix?
+    la_a0 &pl_p
+    ld_a0,a0,0
+    lb_t0,a0,0
+    li_t1 %48 %0
+    la_br &pl_dec_init
+    bne_t0,t1
+    lb_t0,a0,1
+    li_t1 %120 %0
+    la_br &pl_hex_init
+    beq_t0,t1
+    li_t1 %88 %0
+    la_br &pl_hex_init
+    beq_t0,t1
+    la_br &pl_dec_init
+    b
+:pl_hex_init
+    la_a0 &pl_p
+    ld_t0,a0,0
+    addi_t0,t0,2
+    st_t0,a0,0
+:pl_hex_loop
+    la_a0 &pl_p
+    ld_t0,a0,0
+    lb_t0,t0,0
+    la_br &pl_finish
+    beqz_t0
+    # accept '0'..'9' / 'A'..'F' / 'a'..'f'; reject anything else
+    li_t1 %48 %0
+    la_br &err_bad_long
+    blt_t0,t1
+    li_t1 %57 %0
+    la_br &pl_hex_acc
+    blt_t0,t1
+    la_br &pl_hex_acc
+    beq_t0,t1
+    li_t1 %65 %0
+    la_br &err_bad_long
+    blt_t0,t1
+    li_t1 %70 %0
+    la_br &pl_hex_acc
+    blt_t0,t1
+    la_br &pl_hex_acc
+    beq_t0,t1
+    li_t1 %97 %0
+    la_br &err_bad_long
+    blt_t0,t1
+    li_t1 %102 %0
+    la_br &pl_hex_acc
+    blt_t0,t1
+    la_br &pl_hex_acc
+    beq_t0,t1
+    la_br &err_bad_long
+    b
+:pl_hex_acc
+    mov_a0,t0
+    la_br &byte_digit_value
+    call
+    la_a1 &pl_val
+    ld_t0,a1,0
+    shli_t0,t0,4
+    add_t0,t0,a0
+    st_t0,a1,0
+    la_a0 &pl_p
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &pl_hex_loop
+    b
+:pl_dec_init
+    la_a0 &pl_p
+    ld_a0,a0,0
+    lb_t0,a0,0
+    li_t1 %45 %0
+    la_br &pl_dec_loop
+    bne_t0,t1
+    li_t0 %1 %0
+    la_a1 &pl_neg
+    st_t0,a1,0
+    la_a0 &pl_p
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+:pl_dec_loop
+    la_a0 &pl_p
+    ld_t0,a0,0
+    lb_t0,t0,0
+    la_br &pl_finish
+    beqz_t0
+    li_t1 %48 %0
+    la_br &err_bad_long
+    blt_t0,t1
+    li_t1 %57 %0
+    la_br &err_bad_long
+    blt_t1,t0
+    li_t1 %48 %0
+    sub_t0,t0,t1
+    la_a1 &pl_val
+    ld_a2,a1,0
+    li_t1 %10 %0
+    mul_a2,a2,t1
+    add_a2,a2,t0
+    st_a2,a1,0
+    la_a0 &pl_p
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &pl_dec_loop
+    b
+:pl_finish
+    la_a1 &pl_neg
+    ld_t0,a1,0
+    la_br &pl_done
+    beqz_t0
+    la_a1 &pl_val
+    ld_a3,a1,0
+    li_t0 %0 %0
+    sub_a3,t0,a3
+    st_a3,a1,0
+:pl_done
+    la_a1 &pl_val
+    ld_a0,a1,0
+    eret
+
+## --- Errors ----------------------------------------------------------------
+
+## fatal(a0=msg_ptr): writes "<path>:<line>: hex2pp: <msg>\n" to stderr if
+## cur_path is set, else "hex2pp: <msg>\n", then exits 1.
+:fatal
+    la_a1 &fm_msg
+    st_a0,a1,0
+    la_a0 &cur_path
+    ld_t0,a0,0
+    la_br &fm_no_path
+    beqz_t0
+    # write path
+    mov_a0,t0
+    la_br &cstrlen
+    call
+    la_a3 &fm_tmp
+    st_a0,a3,0
+    la_a2 &cur_path
+    ld_a2,a2,0
+    la_a3 &fm_tmp
+    ld_a3,a3,0
+    li_a0 sys_write
+    li_a1 %2 %0
+    syscall
+    # ":"
+    li_a0 sys_write
+    li_a1 %2 %0
+    la_a2 &str_colon
+    li_a3 %1 %0
+    syscall
+    # decimal cur_line
+    la_a0 &cur_line
+    ld_a0,a0,0
+    la_br &write_decimal_stderr
+    call
+    # ": hex2pp: "
+    li_a0 sys_write
+    li_a1 %2 %0
+    la_a2 &str_colon_prog
+    li_a3 %10 %0
+    syscall
+    la_br &fm_emit_msg
+    b
+:fm_no_path
+    li_a0 sys_write
+    li_a1 %2 %0
+    la_a2 &str_prog
+    li_a3 %8 %0
+    syscall
+:fm_emit_msg
+    la_a0 &fm_msg
+    ld_a0,a0,0
+    la_br &cstrlen
+    call
+    la_a3 &fm_tmp
+    st_a0,a3,0
+    la_a2 &fm_msg
+    ld_a2,a2,0
+    la_a3 &fm_tmp
+    ld_a3,a3,0
+    li_a0 sys_write
+    li_a1 %2 %0
+    syscall
+    li_a0 sys_write
+    li_a1 %2 %0
+    la_a2 &str_newline
+    li_a3 %1 %0
+    syscall
+    li_a0 sys_exit
+    li_a1 %1 %0
+    syscall
+
+## cstrlen(a0=p) -> a0=length. Walks until NUL.
+:cstrlen
+    li_t0 %0 %0
+:cs_loop
+    add_t1,a0,t0
+    lb_t1,t1,0
+    la_br &cs_done
+    beqz_t1
+    addi_t0,t0,1
+    la_br &cs_loop
+    b
+:cs_done
+    mov_a0,t0
+    ret
+
+## write_decimal_stderr(a0=value): write decimal of unsigned i64 to stderr.
+:write_decimal_stderr
+    enter_0
+    la_a1 &wd_v
+    st_a0,a1,0
+    la_br &wd_nonzero
+    bnez_a0
+    li_a0 sys_write
+    li_a1 %2 %0
+    la_a2 &str_zero
+    li_a3 %1 %0
+    syscall
+    eret
+:wd_nonzero
+    li_t0 %63 %0
+    la_a1 &wd_pos
+    st_t0,a1,0
+:wd_loop
+    la_a0 &wd_v
+    ld_a0,a0,0
+    la_br &wd_emit
+    beqz_a0
+    li_t1 %10 %0
+    rem_a2,a0,t1
+    div_a0,a0,t1
+    la_a3 &wd_v
+    st_a0,a3,0
+    li_t1 %48 %0
+    add_a3,t1,a2
+    la_a0 &wd_pos
+    ld_t0,a0,0
+    la_a1 &line_scratch_ptr
+    ld_a1,a1,0
+    add_a1,a1,t0
+    sb_a3,a1,0
+    addi_t0,t0,neg1
+    la_a0 &wd_pos
+    st_t0,a0,0
+    la_br &wd_loop
+    b
+:wd_emit
+    la_a0 &wd_pos
+    ld_t0,a0,0
+    addi_t0,t0,1
+    la_a1 &line_scratch_ptr
+    ld_a1,a1,0
+    add_a1,a1,t0
+    mov_a2,a1
+    li_t1 %64 %0
+    sub_a3,t1,t0
+    li_a0 sys_write
+    li_a1 %2 %0
+    syscall
+    eret
+
+## --- Error stubs -----------------------------------------------------------
+:err_unknown_arg
+    la_a0 &msg_unknown_arg
+    la_br &fatal
+    b
+:err_extra_positional
+    la_a0 &msg_extra_positional
+    la_br &fatal
+    b
+:err_missing_positional
+    la_a0 &msg_missing_positional
+    la_br &fatal
+    b
+:err_missing_value
+    la_a0 &msg_missing_value
+    la_br &fatal
+    b
+:err_open_input
+    la_a0 &msg_open_input
+    la_br &fatal
+    b
+:err_read
+    la_a0 &msg_read
+    la_br &fatal
+    b
+:err_input_too_big
+    la_a0 &msg_input_too_big
+    la_br &fatal
+    b
+:err_open_output
+    la_a0 &msg_open_output
+    la_br &fatal
+    b
+:err_write
+    la_a0 &msg_write
+    la_br &fatal
+    b
+:err_text_overflow
+    la_a0 &msg_text_overflow
+    la_br &fatal
+    b
+:err_too_many_labels
+    la_a0 &msg_too_many_labels
+    la_br &fatal
+    b
+:err_duplicate_label
+    la_a0 &msg_duplicate_label
+    la_br &fatal
+    b
+:err_undefined_label
+    la_a0 &msg_undefined_label
+    la_br &fatal
+    b
+:err_undefined_local
+    la_a0 &msg_undefined_local
+    la_br &fatal
+    b
+:err_unexpected_char
+    la_a0 &msg_unexpected_char
+    la_br &fatal
+    b
+:err_unknown_directive
+    la_a0 &msg_unknown_directive
+    la_br &fatal
+    b
+:err_scope_overflow
+    la_a0 &msg_scope_overflow
+    la_br &fatal
+    b
+:err_scope_underflow
+    la_a0 &msg_scope_underflow
+    la_br &fatal
+    b
+:err_scope_unclosed
+    la_a0 &msg_scope_unclosed
+    la_br &fatal
+    b
+:err_align_n
+    la_a0 &msg_align_n
+    la_br &fatal
+    b
+:err_fill_n
+    la_a0 &msg_fill_n
+    la_br &fatal
+    b
+:err_pattern_too_large
+    la_a0 &msg_pattern_too_large
+    la_br &fatal
+    b
+:err_byte_lit_bad
+    la_a0 &msg_byte_lit_bad
+    la_br &fatal
+    b
+:err_byte_stream_short
+    la_a0 &msg_byte_stream_short
+    la_br &fatal
+    b
+:err_sigil_no_label
+    la_a0 &msg_sigil_no_label
+    la_br &fatal
+    b
+:err_minus_no_label
+    la_a0 &msg_minus_no_label
+    la_br &fatal
+    b
+:err_bad_sigil
+    la_a0 &msg_bad_sigil
+    la_br &fatal
+    b
+:err_ref_out_of_range
+    la_a0 &msg_ref_out_of_range
+    la_br &fatal
+    b
+:err_name_too_long
+    la_a0 &msg_name_too_long
+    la_br &fatal
+    b
+:err_empty_name
+    la_a0 &msg_empty_name
+    la_br &fatal
+    b
+:err_empty_directive
+    la_a0 &msg_empty_directive
+    la_br &fatal
+    b
+:err_expected_decimal
+    la_a0 &msg_expected_decimal
+    la_br &fatal
+    b
+:err_output_overflow
+    la_a0 &msg_output_overflow
+    la_br &fatal
+    b
+:err_bad_long
+    la_a0 &msg_bad_long
+    la_br &fatal
+    b
+:err_too_many_fixups
+    la_a0 &msg_too_many_fixups
+    la_br &fatal
+    b
+:err_scope_history_overflow
+    la_a0 &msg_scope_history_overflow
+    la_br &fatal
+    b
+:err_ptrsize_bad
+    la_a0 &msg_ptrsize_bad
+    la_br &fatal
+    b
+:err_ptrsize_conflict
+    la_a0 &msg_ptrsize_conflict
+    la_br &fatal
+    b
+
+## Sentinel: end of executable text.
+:_text_end
+
+## --- Rodata ----------------------------------------------------------------
+
+:opt_B "-B" '00'
+:opt_E "-E" '00'
+:opt_e "-e" '00'
+:opt_b "-b" '00'
+:opt_N "-N" '00'
+
+:kw_align "align"
+:kw_fill "fill"
+:kw_scope "scope"
+:kw_endscope "endscope"
+:kw_ptrsize "ptrsize"
+
+:str_colon ":"
+:str_colon_prog ": hex2pp: "
+:str_prog "hex2pp: "
+:str_newline "
+"
+:str_zero "0"
+
+:msg_unknown_arg "unknown argument" '00'
+:msg_extra_positional "extra positional argument" '00'
+:msg_missing_positional "missing IN or OUT positional argument" '00'
+:msg_missing_value "missing value for option" '00'
+:msg_open_input "failed to open input file" '00'
+:msg_read "failed to read input" '00'
+:msg_input_too_big "input too large" '00'
+:msg_open_output "failed to open output file" '00'
+:msg_write "failed to write output" '00'
+:msg_text_overflow "text pool overflow" '00'
+:msg_too_many_labels "too many labels" '00'
+:msg_duplicate_label "duplicate label" '00'
+:msg_undefined_label "undefined label" '00'
+:msg_undefined_local "undefined local label" '00'
+:msg_unexpected_char "unexpected character" '00'
+:msg_unknown_directive "unknown directive" '00'
+:msg_scope_overflow ".scope: depth overflow" '00'
+:msg_scope_underflow ".endscope: not in a scope" '00'
+:msg_scope_unclosed ".scope not closed at end of input" '00'
+:msg_align_n ".align: N must be a positive power of two" '00'
+:msg_fill_n ".fill: N must be non-negative" '00'
+:msg_pattern_too_large "pattern too large" '00'
+:msg_byte_lit_bad "byte literal: bad digit count" '00'
+:msg_byte_stream_short "byte stream: incomplete digits at end of run" '00'
+:msg_sigil_no_label "sigil not followed by label name" '00'
+:msg_minus_no_label "'-' must be followed by label name" '00'
+:msg_bad_sigil "internal: bad sigil" '00'
+:msg_ref_out_of_range "reference out of range" '00'
+:msg_name_too_long "name too long" '00'
+:msg_empty_name "expected label name" '00'
+:msg_empty_directive "expected directive name after '.'" '00'
+:msg_expected_decimal "expected decimal integer" '00'
+:msg_output_overflow "output overflow" '00'
+:msg_bad_long "invalid integer argument" '00'
+:msg_ptrsize_bad ".ptrsize: N must be 4 or 8" '00'
+:msg_ptrsize_conflict ".ptrsize conflicts with already-used width" '00'
+:msg_too_many_fixups "too many references" '00000000'
+:msg_scope_history_overflow "scope history overflow" '00'
+
+## BSS pointer-slot init table.
+:bss_init_tbl
+&scope_stack_ptr ZERO4 H2_OFF_scope_stack
+&name_buf_ptr ZERO4 H2_OFF_name_buf
+&label_buf_ptr ZERO4 H2_OFF_label_buf
+&other_buf_ptr ZERO4 H2_OFF_other_buf
+&pat_buf_ptr ZERO4 H2_OFF_pat_buf
+&line_scratch_ptr ZERO4 H2_OFF_line_scratch
+&ev_bytes_ptr ZERO4 H2_OFF_ev_bytes
+&df_byte_ptr ZERO4 H2_OFF_df_byte
+&input_buf_ptr ZERO4 H2_OFF_input_buf
+&output_buf_ptr ZERO4 H2_OFF_output_buf
+&text_buf_ptr ZERO4 H2_OFF_text_buf
+&labels_ptr ZERO4 H2_OFF_labels
+&fixups_ptr ZERO4 H2_OFF_fixups
+&scope_history_ptr ZERO4 H2_OFF_scope_history
+:bss_init_tbl_end
+
+## --- BSS scalars ----------------------------------------------------------
+
+:saved_argc
+ZERO8
+:saved_argv
+ZERO8
+:arg_idx
+ZERO8
+:arg_ptr
+ZERO8
+:input_path
+ZERO8
+:input_fd
+ZERO8
+:input_len
+ZERO8
+:output_path
+ZERO8
+:output_fd
+ZERO8
+:output_used
+ZERO8
+:output_written
+ZERO8
+:base_address
+ZERO8
+:byte_mode
+ZERO8
+:big_endian
+ZERO8
+:non_executable
+ZERO8
+:ptrsize
+ZERO8
+:ptrsize_used
+ZERO8
+
+:pass
+ZERO8
+:ip
+ZERO8
+:cur_path
+ZERO8
+:cur_line
+ZERO8
+:scan_pos
+ZERO8
+:scan_end
+ZERO8
+:text_used
+ZERO8
+:label_count
+ZERO8
+:fixup_count
+ZERO8
+:scope_history_used
+ZERO8
+:scope_depth
+ZERO8
+:scope_seq
+ZERO8
+
+## name read
+:name_len
+ZERO8
+:name_scope
+ZERO8
+:nt_c
+ZERO8
+:rn_out
+ZERO8
+:rn_max
+ZERO8
+:rn_n
+ZERO8
+
+## scan_name (returns ptr+len; pointer goes here, length in a0).
+:sn_start
+ZERO8
+
+## record_fixup scratch
+:rf_name
+ZERO8
+:rf_name_len
+ZERO8
+:rf_other
+ZERO8
+:rf_other_len
+ZERO8
+:rf_out_off
+ZERO8
+:rf_ip_after
+ZERO8
+:rf_idx
+ZERO8
+:rf_fp
+ZERO8
+:rf_i
+ZERO8
+
+## patch_fixups scratch
+:pf_i
+ZERO8
+:pf_fp
+ZERO8
+:pf_t_label
+ZERO8
+:pf_value
+ZERO8
+:pf_stack
+ZERO8
+:pf_depth
+ZERO8
+
+## process_reference scratch (single-pass record path)
+:pref_name
+ZERO8
+:pref_name_len
+ZERO8
+:pref_other
+ZERO8
+:pref_other_len
+ZERO8
+
+## decimal read
+:rd_val
+ZERO8
+:rd_saw
+ZERO8
+
+## byte stream
+:pbs_acc
+ZERO8
+:pbs_have
+ZERO8
+:pbs_c
+ZERO8
+
+## one byte literal
+:p1b_out
+ZERO8
+:p1b_acc
+ZERO8
+:p1b_have
+ZERO8
+:p1b_c
+ZERO8
+
+## intern
+:intern_src
+ZERO8
+:intern_len
+ZERO8
+:intern_dst
+ZERO8
+:intern_orig
+ZERO8
+:intern_i
+ZERO8
+
+## name_eq
+:ne_label
+ZERO8
+:ne_src
+ZERO8
+:ne_len
+ZERO8
+
+## define_label
+:dl_src
+ZERO8
+:dl_len
+ZERO8
+:dl_scope
+ZERO8
+:dl_i
+ZERO8
+:dl_label
+ZERO8
+:dl_name_off
+ZERO8
+
+## lookup_label_in
+:ll_src
+ZERO8
+:ll_len
+ZERO8
+:ll_stack
+ZERO8
+:ll_depth
+ZERO8
+:ll_d
+ZERO8
+:ll_sid
+ZERO8
+:ll_i
+ZERO8
+:ll_label
+ZERO8
+
+## process_reference / set_sigil_info
+:cur_sigil
+ZERO8
+:pr_width
+ZERO8
+:pr_is_rel
+ZERO8
+:pr_lo
+ZERO8
+:pr_hi
+ZERO8
+:pr_range_check
+ZERO8
+:pr_llen
+ZERO8
+:pr_olen
+ZERO8
+:pr_has_other
+ZERO8
+:pr_t_label
+ZERO8
+:pr_value
+ZERO8
+
+## emit_value / write_value
+:ev_value
+ZERO8
+:ev_width
+ZERO8
+:ev_lo
+ZERO8
+:ev_hi
+ZERO8
+:ev_range_check
+ZERO8
+:ev_pack_v
+ZERO8
+:ev_i
+ZERO8
+:ev_out_off
+ZERO8
+
+## emit_zeros / emit_fill scratch
+:emz_n
+ZERO8
+:emz_off
+ZERO8
+:emf_n
+ZERO8
+:emf_b
+ZERO8
+
+## directive scratch
+:da_n
+ZERO8
+:da_has_pat
+ZERO8
+:da_patlen
+ZERO8
+:da_pad
+ZERO8
+:da_i
+ZERO8
+:df_n
+ZERO8
+:df_i
+ZERO8
+:dp_n
+ZERO8
+
+## str/mem
+:se_p
+ZERO8
+:se_q
+ZERO8
+:se_len
+ZERO8
+:me_p
+ZERO8
+:me_q
+ZERO8
+:me_len
+ZERO8
+
+## parse_long
+:pl_p
+ZERO8
+:pl_val
+ZERO8
+:pl_neg
+ZERO8
+
+## fatal
+:fm_msg
+ZERO8
+:fm_tmp
+ZERO8
+
+## write_decimal
+:wd_v
+ZERO8
+:wd_pos
+ZERO8
+
+## --- BSS pointer slots ----------------------------------------------------
+:scope_stack_ptr
+ZERO8
+:name_buf_ptr
+ZERO8
+:label_buf_ptr
+ZERO8
+:other_buf_ptr
+ZERO8
+:pat_buf_ptr
+ZERO8
+:line_scratch_ptr
+ZERO8
+:ev_bytes_ptr
+ZERO8
+:df_byte_ptr
+ZERO8
+:input_buf_ptr
+ZERO8
+:output_buf_ptr
+ZERO8
+:text_buf_ptr
+ZERO8
+:labels_ptr
+ZERO8
+:fixups_ptr
+ZERO8
+:scope_history_ptr
+ZERO8
+
+:ELF_end

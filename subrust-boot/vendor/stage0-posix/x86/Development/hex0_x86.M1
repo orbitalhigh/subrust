@@ -1,0 +1,140 @@
+# SPDX-FileCopyrightText: 2017 Jeremiah Orians
+# SPDX-FileCopyrightText: 2022 Andrius Štikonas
+# SPDX-FileCopyrightText: 2024 Noah Goldstein
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+DEFINE add_al, 04
+DEFINE add_ebp,eax 01C5
+DEFINE and_al, 24
+DEFINE cdq 99
+DEFINE cmp_al, 3C
+DEFINE dec_esi 4E
+DEFINE inc_eax 40
+DEFINE inc_edx 42
+DEFINE int CD
+DEFINE jae 73
+DEFINE jb 72
+DEFINE je 74
+DEFINE jl 7C
+DEFINE jmp EB
+DEFINE jne 75
+DEFINE mov_al, B0
+DEFINE mov_al,[ecx] 8A01
+DEFINE mov_ebx,edi 89FB
+DEFINE mov_ecx,esp 89E1
+DEFINE mov_[ecx],ebp 8929
+DEFINE mov_esi,edx 89D6
+DEFINE mov_cx, 66B9
+DEFINE mov_dx, 66BA
+DEFINE neg_edi F7DF
+DEFINE pop_eax 58
+DEFINE pop_ebx 5B
+DEFINE push_eax 50
+DEFINE push_ebx 53
+DEFINE push 6A
+DEFINE shl_ebp, C1E5
+DEFINE sub_al, 2C
+DEFINE test_eax,eax 85C0
+DEFINE test_esi,esi 85F6
+DEFINE xchg_eax,edi 97
+DEFINE xor_ebp,ebp 31ED
+DEFINE xor_ebx,ebx 31DB
+DEFINE xor_ecx,ecx 31C9
+
+# Where the ELF Header is going to hit
+# Simply jump to _start
+# Our main function
+:_start
+	pop_eax                     # Get the number of arguments
+	pop_ebx                     # Get the program name
+	pop_ebx                     # Get the actual input name
+	xor_ecx,ecx                 # prepare read_only, ecx = 0
+	push !5                     # prepare to set eax to 5
+	pop_eax                     # the syscall number for open()
+	cdq                         # Extra sure, edx = 0
+	int !0x80                   # Now open that damn file
+	pop_ebx                     # Get the output name
+	push_eax                    # Preserve the file pointer we were given
+	mov_cx, @577                # Prepare file as O_WRONLY|O_CREAT|O_TRUNC
+	mov_dx, @448                # Prepare file as RWX for owner only (700 in octal)
+	push !0x5                   # Prepare to set eax to 5
+	pop_eax                     # the syscall number for open()
+	int !0x80                   # Now open that damn file
+	cdq                         # edx = 0 since file descriptor is nonnegative
+	inc_edx                     # edx = 1 (count for read/write)
+	xchg_eax,edi                # Preserve outfile
+
+:loop_reset_all
+	xor_ebp,ebp                 # ebp = 0 (no prior hex val)
+
+# Comment tracking is done with esi.
+# esi is decremented if we hit a
+# comment (';' or '#') and reset
+# if we hit a new-line.
+:loop_reset_comment
+	mov_esi,edx                 # Set no current comment
+:loop_add_comment
+	dec_esi
+:loop
+
+	# Read a byte
+	pop_ebx                     # Get infile
+	mov_ecx,esp                 # Set buffer
+	# edx is already set to 1.
+	push !3
+	pop_eax                     # Set read syscall in eax
+	int !0x80                   # Do the actual read
+	push_ebx                    # Re-save infile
+	test_eax,eax                # Check what we got
+	jne !cont                   # No EOF
+
+	# Exit successfully
+	inc_eax                     # Set exit syscall in eax
+	xor_ebx,ebx                 # Set return success (ebx = 0)
+	int !0x80                   # Exit
+
+:cont
+	mov_al,[ecx]                # Move prog byte in eax
+
+	# New line check
+	cmp_al, !10                 # Check new-line
+	je !loop_reset_comment      # If new-line, end comment handling
+
+	# In comment check
+	test_esi,esi                # Skip byte if we are in a comment
+	jne !loop
+
+	# Start comment check
+	cmp_al, !35                 # Start of '#' comment
+	je !loop_add_comment
+
+	cmp_al, !59                 # Start of ';' comment
+	je !loop_add_comment
+
+	# Start of hex str to int
+	sub_al, !48                 # Subtract ascii '0' from al
+	sub_al, !10                 # Check for value in '0'-'9'
+	jb !write                   # We have hex value, write it
+
+	sub_al, !7                  # Subtract ('A'-'0') from al
+	and_al, !0xDF               # Remove lower case bit
+	cmp_al, !7                  # Check for value 'A'-'F'
+	jae !loop                   # We don't have hex value ignore it
+
+:write
+	shl_ebp, !4                 # Shift up existing hex digit
+	add_al, !10                 # Finish converting ascii to raw value
+	add_ebp,eax                 # Combine the hex digits
+
+	# Check if this is first digit in hex val
+	neg_edi                     # Flip sign of edi to indicate we got a digit
+	jl !loop                    # Negative -> first digit, get another one
+
+	# We have both digits in low byte of ebp, good to write
+	mov_[ecx],ebp               # Move edge to buffer
+	mov_ebx,edi                 # Move outfile to ebx
+	mov_al, !4                  # Set write syscall in eax
+	int !0x80                   # Do the write
+	jmp !loop_reset_all         # Start a fresh byte
+:ELF_end

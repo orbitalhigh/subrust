@@ -1,0 +1,281 @@
+# SPDX-FileCopyrightText: © Andrius Štikonas
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+* 1.9.1 - 2025-08-17
+** M2-Planet
+   + Added support for global initializer list for structs of integers.
+   + Added support for initializing global arrays of structs using initializer lists.
+   + Added support for prefix operators =++= and =--=.
+   + Added support for postfix operators =++= and =--=.
+   + Added ability to parse typedefs for simple function pointers.
+   + Added support for anonymous structs (C11 extension). This was already implemented as the only way to use unions.
+   + Added support for unions in all places where structs work.
+   + Added initial support for variable arguments.
+   + Added initial very hacky support for casting after dereferencing.
+   + Added support for calling function pointers directly on global variables and struct members. Previously only locals worked.
+   + Added support for initializing global variables with negative values.
+   + Added support for optional argument names in function pointers.
+   + Added support for function pointers in casts and function pointer arguments.
+   + Added support for array arguments to functions.
+   + Allow switch statement without default case.
+   + Various codegen optimizations.
+   + Added support for declaring variables in for loops.
+   + Added support for using includes with the =--expand-includes= CLI option.
+   + Fixed include on first line being ignored.
+
+** M2-Mesoplanet
+   + Look up include in directory of current file as well as CWD.
+   + Added support for =-c= (no linking).
+   + Added support for multiple include directories using =-I=.
+   + Added support for calling without arguments (when explicit - is used for stdin).
+
+** M2libc
+   + Added =printf=.
+   + Added =stdarg.h= header with =va_arg= definitions.
+   + Added =isdigit=, =atoi=, =strdup= and =realloc=.
+   + Fixed =strstr= function.
+   + Added support for "a" (append) to =fopen=.
+   + Fixed =chroot= call on x86.
+   + M1 define =cmp= was replaced with =cmp_ebx,eax=.
+   + Added =fread= and =fwrite= to =bootstrap.c=.
+
+** mescc-tools
+   + Add support for 16bit immediate constants in RISC-V.
+
+** mescc-tools-extra
+
+** bootstrap-seeds
+
+** stage0-posix-x86
+   + Added =stdarg.h=, =ctype.c= and =cc_emit.c= to kaem scripts.
+   + Added support for anonymous enums to =cc_x86=.
+   + Negation operator in =cc_x86= now works for integers greater than 1.
+   + M1 define =cmp= was replaced with =cmp_ebx,eax=.
+
+** stage0-posix-amd64
+   + Added =stdarg.h=, =ctype.c= and =cc_emit.c= to kaem scripts.
+   + Added support for anonymous enums to =cc_amd64=.
+   + Negation operator in =cc_amd64= now works for integers greater than 1.
+
+** stage0-posix-aarch64
+   + Added =stdarg.h=, =ctype.c= and =cc_emit.c= to kaem scripts.
+   + Added support for anonymous enums to =cc_aarch64=.
+   + Negation operator in =cc_aarch64= now works for integers greater than 1.
+
+** stage0-posix-riscv64
+   + Added =stdarg.h=, =ctype.c= and =cc_emit.c= to kaem scripts.
+   + Added support for anonymous enums to =cc_riscv64=.
+   + Negation operator in =cc_riscv64= now works for integers greater than 1.
+
+** stage0-posix-riscv32
+   + Added =stdarg.h=, =ctype.c= and =cc_emit.c= to kaem scripts.
+   + Added support for anonymous enums to =cc_riscv32=.
+   + Negation operator in =cc_riscv32= now works for integers greater than 1.
+
+* 1.8.0 - 2025-03-15
+** M2-Planet
+   + Added support for pointer arithmetic for += and -= operators (not yet supported for =+= and =-=).
+   + Added support for =__LINE__= macro.
+   + Added support for =__FILE__= macro.
+   + Added support for =__DATE__= macro which will always be =Jan  1 1970= and =__TIME__= which will always be =00:00:00=.
+   + Added support for =__STDC__=, =__STDC_HOSTED__=, and =__STDC_VERSION__= macros. =__STDC_VERSION__= claims support for C89.
+   + Added initial support for function-like macros.
+   + =enum= support.
+   + Added =_Bool= type.
+   + Added support for west-=const= for variables and function arguments.
+   + Improved RISC-V support to work with large types (size > 11 bits).
+   + Added support for octal and \? escape codes.
+   + Make arguments that aren't options be considered files.
+   + Make help output more accurately describe available options.
+   + Added support for multiple variable declarations per statement.
+   + Added support for static/inline/_Noreturn qualifiers on globals.
+   + Added support for static local variables.
+   + Make implicit return load 0 for the =main= function.
+   + Fix dereferencing =char= pointers (or other types whose size is not equal to register size).
+   + Added support for multi token integer types (=unsigned int=, =long long=, =long long int=, etc.).
+   + Allow anonymous structs/enums and inline =typedef=.
+   + Added support arrays on the stack.
+   + Added support for using variables in =sizeof=, including dereferencing.
+   + Added support for string literals in =sizeof=.
+   + Added support for variables in loop bodies (doesn't work with =goto= yet).
+   + Added =__M2C__=, =__M2C_MINOR__=, and =__M2C_PATCHLEVEL__= defines.
+   + Add support for locals in loops.
+   + Fixed multiple chained uses of dot and arrow operators segfaulting.
+   + Added support for initializer lists for global integer arrays.
+   + Added support for global arrays without explicit size when initializer lists are used.
+   + Improved =switch= statement to support constant expressions in =case= statements.
+
+** M2-Mesoplanet
+   + Make arguments that aren't options be considered files.
+   + Make help output more accurately describe available options.
+   + Fix =make install= not working.
+
+** M2libc
+   + Convert setenv/getenv calls to use C-like pointer arithmetic.
+   + Add =stdbool.h=
+   + Fixed a few =aarch64= syscalls.
+   + Add support for =symlink= system call.
+   + Make retrieving UEFI variables conform to spec.
+   + Removed undefined behavior in int2str.
+
+** mescc-tools
+   + Added support for %&! to M1 for knight architecture and allowed @$ syntax.
+
+** mescc-tools-extra
+   + Mount =/dev/pts= in the =wrap= environment.
+   + Add support for symlinks in =untar=.
+   + Switch =ungz= to use C-like pointer arithmetic.
+   + =unxz=: Do not crash when input file is not found.
+
+** bootstrap-seeds
+   + Reduced =POSIX/x86/hex0-seed= from 190 to 181 bytes.
+   + Reduced =POSIX/x86/kaem-optional-seed= from 640 to 632 bytes.
+   + Reduced =POSIX/AMD64/hex0-seed= from 292 to 229 bytes.
+
+** stage0-posix-x86
+   + Updated =hex0= source to match the one in bootstrap-seeds.
+
+** stage0-posix-amd64
+
+** stage0-posix-aarch64
+
+** stage0-posix-riscv64
+
+** stage0-posix-riscv32
+
+* 1.7.0 - 2024-09-23
+** M2-Planet
+   + Added more advanced switch statement tests
+   + Fix a typo in the docs
+   + Remove VPATH from makefiles.
+   + add missing make ${program} targets
+   + Add M2-planet and M2-minimal makefile targets to .PHONY
+   + ensure arithmetic priority better matches the C spec
+
+** M2-Mesoplanet
+   + Ignore UEFI files if Linux; ignore linux files if UEFI
+
+** M2libc
+   + Add syscalls needed for a simple sandbox
+   + Fix function formatting to comply with existing standard
+   + Fix UEFI calling convention.
+   + Improve handling of relative paths in UEFI.
+   + Remove /./ from paths rather than convert them to ///.
+   + Fix file opening modes in UEFI (== has higher precedence than | )
+   + Add non-trivial access function to UEFI.
+   + Add UEFI task priority level defines.
+   + Add dummy stdint.h
+   + Fix sal_eax,cl and sal_rax,cl encoding.
+   + Move the utsname struct definition to sys/utsname.h
+   + Add dummy sys/wait.h
+   + A very rough prototype for strstr
+   + ensure needed libraries are read first for fcntl.h
+
+** mescc-tools
+   + Fix shebang of check.sh
+   + makefile: Call cleanup.sh for test12 and test13
+   + Remove VPATH from makefile.
+   + Also fix kaem's makefile
+
+** mescc-tools-extra
+   + Remove VPATH from makefile
+   + Remove obsolete comment from makefile
+   + Add wrap - A small bubblewrap like program
+   + clean up cc_*-isms
+   + Add a fully functional unxz program
+
+** bootstrap-seeds
+   + Reduced =POSIX/x86/hex0-seed= from 256 to 190 bytes.
+   + Fix UEFI bootstrap binaries.
+   + Fix minor typos in comments in UEFI kaem-optional
+   + Make sure read function works if file descriptor is longer than 1 byte.
+
+** stage0-posix-x86
+   + Make sure read function works if file descriptor is longer than 1 byte
+   + Fix encoding for sal_eax,cl
+   + Fix regression caused by M2libc commit: fb6701a73189afca152ea1154650c315df4e6a93
+
+** stage0-posix-amd64
+   + Fix encoding of some mov instructions to actually use 64-bit registers rather than 32
+   + Fix encoding for sal_rax,cl.
+   + Fix regression caused by M2libc's fb6701a73189afca152ea1154650c315df4e6a93 commit
+
+** stage0-posix-aarch64
+   + Add M2libc/stdio.h to build sources.
+   + Set OPERATING_SYSTEM=Linux environmental variable.
+   + Fix a typo in a comment in cc_aarch64
+   + Fix regression caused by M2libc's fb6701a73189afca152ea1154650c315df4e6a93 commit
+
+** stage0-posix-riscv64
+   + Fix regression caused by M2libc's fb6701a73189afca152ea1154650c315df4e6a93 commit
+
+** stage0-posix-riscv32
+   + Fix regression caused by M2libc's fb6701a73189afca152ea1154650c315df4e6a93 commit
+
+* 1.6.0 - 2023-11-02
+** M2-Planet
+   + Added support for =#warning=.
+   + Added global structs (and =.= operator).
+   + Added local structs.
+   + Added =(u)int8_t=, =(u)int16_t= and =(u)int32_t=.
+   + Properly remove blocks that are not used (e.g. after =#if 0=)
+
+   + Fixed doubly indirect structs.
+   + Fixed a few segfaults.
+   + Fixed macro expressions with =)=.
+   + Add sufficient padding when assigning global constants on 64-bit architectures.
+   + Fix structs greater than 512bytes in size on armv7l.
+
+** M2-Mesoplanet
+   + Added =#warning=.
+   + Added =-D= flags.
+   + Added support for building UEFI binaries.
+
+   + Fixed macro expressions with =)=.
+   + Fixed =--no-includes= option.
+
+** M2libc
+   + Added a memory manager for =malloc()= and =free()=.
+   + Added =getenv= and =setenv= calls.
+   + Added support for building UEFI applications.
+
+** mescc-tools
+   + Set SHELL variable in =kaem=.
+   + Fix =kaem= aliases that are longer than commands.
+   + =kaem= now supports running commands with 510 command line arguments instead of 254.
+   + Fix quoted DEFINE statements in =M1=.
+   + =hex2= added support for signed and unsigned =range_check= behavior.
+   + Fix =kaem= bug where unset removes the first environment variable when a token value is =NULL=.
+
+** mescc-tools-extra
+   + Added =unbz2=.
+   + Added =replace= utility to replace strings in file.
+   + Added =rm= to remove files.
+   + Added =--file= and =--output= to =ungz=.
+   + Added =--verbose= to =untar= and made default mode quiet.
+
+   + Fixed some segfaults.
+
+** bootstrap-seeds
+   + Reduced =POSIX/x86/hex0-seed= from 357 to 256 bytes.
+   + Reduced =POSIX/x86/kaem-optional-seed= from 757 to 640 bytes.
+   + Reduced =POSIX/AMD64/hex0-seed= to from 405 to 292 bytes.
+   + Reduced =POSIX/AMD64/kaem-optional-seed= from 896 to 618 bytes.
+   + Add =NATIVE/x86/builder-hex0-x86-stage1.img= seed for kernel bootstrapping.
+
+** stage0-posix-x86
+   + Switched M1 defines to GAS-like style.
+
+** stage0-posix-amd64
+   + All binaries except for kaem-optional are now position independent (PIE).
+   + Switched M1 defines to GAS-like style.
+
+** stage0-posix-aarch64
+
+** stage0-posix-riscv64
+   + Switch to lowercase M1 defines.
+
+** stage0-posix-riscv32
+   + Switch to lowercase M1 defines.
+
+* 1.5.0 - 2022-05-01

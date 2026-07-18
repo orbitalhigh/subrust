@@ -1,0 +1,23 @@
+# P1/entry-libc.P1pp — executable entry stub for links that include
+# our libc (vendor/mes-libc + boot2-syscall.c).
+#
+# Same shape as entry-plain.P1pp but threads __libc_init in front of
+# main. __libc_init (boot2-syscall.c) reads argv's NULL terminator
+# to populate `environ` so getenv()/etc don't dereference a NULL
+# environment pointer on the first call. argc/argv arrive in a0/a1
+# from the bootstrap _start; save them across __libc_init so main sees
+# the original process arguments even if libc init returns through a0.
+#
+# Cat this in exactly once at the head of a libc-using catm chain
+# and pair with P1/elf-end.P1pp at the tail. Library TUs (libc,
+# client) should be built with cc.scm --lib=PFX so they don't
+# also try to define :p1_main.
+
+%fn(p1_main, 16, {
+    %st(a0, sp, 0)
+    %st(a1, sp, 8)
+    %call(&__libc_init)
+    %ld(a0, sp, 0)
+    %ld(a1, sp, 8)
+    %call(&main)
+})

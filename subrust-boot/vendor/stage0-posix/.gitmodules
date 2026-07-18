@@ -1,0 +1,36 @@
+[submodule "M2-Planet"]
+	path = M2-Planet
+	url = https://github.com/oriansj/M2-Planet.git
+[submodule "mescc-tools"]
+	path = mescc-tools
+	url = https://git.savannah.nongnu.org/git/mescc-tools.git
+[submodule "bootstrap-seeds"]
+	path = bootstrap-seeds
+	url = https://github.com/oriansj/bootstrap-seeds
+[submodule "M2libc"]
+	path = M2libc
+	url = https://github.com/oriansj/M2libc
+[submodule "mescc-tools-extra"]
+	path = mescc-tools-extra
+	url = https://github.com/oriansj/mescc-tools-extra
+[submodule "M2-Mesoplanet"]
+	path = M2-Mesoplanet
+	url = https://github.com/oriansj/M2-Mesoplanet.git
+[submodule "x86"]
+	path = x86
+	url = https://github.com/oriansj/stage0-posix-x86.git
+[submodule "AMD64"]
+	path = AMD64
+	url = https://github.com/oriansj/stage0-posix-amd64.git
+[submodule "AArch64"]
+	path = AArch64
+	url = https://github.com/oriansj/stage0-posix-aarch64.git
+[submodule "armv7l"]
+	path = armv7l
+	url = https://github.com/oriansj/stage0-posix-armv7l.git
+[submodule "riscv32"]
+	path = riscv32
+	url = https://github.com/oriansj/stage0-posix-riscv32.git
+[submodule "riscv64"]
+	path = riscv64
+	url = https://github.com/oriansj/stage0-posix-riscv64.git

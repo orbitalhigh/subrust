@@ -1,0 +1,7147 @@
+## m1pp.M1 — bootstrap M1 macro-expander, P1.
+##
+## Runtime shape: m1pp input.M1 output.M1
+##
+## Pipeline:
+##   p1_main         argc/argv from the backend :_start stub; stash argv[1..2]
+##                   into input_path / output_path; openat+read into
+##                   input_buf; call lex_source, then process_tokens;
+##                   openat+write output_buf to output_path; return 0.
+##   lex_source      input_buf -> source_tokens[] (via append_text +
+##                   push_source_token).
+##   process_tokens  Stream-driven loop. Pushes source_tokens as the initial
+##                   stream and walks it token-by-token, dispatching to
+##                   define_macro at line-start %macro, emit_newline /
+##                   emit_token for pass-through, expand_builtin_call for
+##                   !@%$, %select, %str, %local, and expand_call
+##                   for user macros. Macro expansions and %select push
+##                   fresh streams onto streams[]; popping rewinds the
+##                   expansion pool.
+##
+## Output is consumed directly by hex2pp -- there is no intermediate M0/hex2
+## stage. Lexical scoping for control-flow labels is delegated to hex2pp's
+## nestable .scope / .endscope; M1pp itself only handles per-expansion
+## macro hygiene labels (:@name / &@name).
+##   define_macro    Parse %macro header+body; record in macros[] +
+##                   macro_body_tokens[]; consume through the %endm line
+##                   without emitting output.
+##
+## P1 ABI: a0..a3 arg/return, t0..t2 caller-saved temps, s0..s3 callee-saved
+## (unused here). Non-leaf functions use enter_0 / eret. Entry is the portable
+## p1_main (a0=argc, a1=argv); the backend-owned :_start stub captures
+## argc/argv from the native entry state and sys_exits p1_main's return value.
+
+## --- Constants & sizing ------------------------------------------------------
+
+## Caps bumped 2025-04 for tcc-boot2: cc.scm against the flattened
+## tcc.flat.c emits ~6.5 MB of macro-rich .P1pp; m1pp's old caps were
+## sized for the scheme1 build at ~256 KiB. New caps cover the larger
+## working set the cc-bootstrap path exercises:
+##
+##   16 MiB input        — combined prelude + tcc.flat.P1pp
+##  128 MiB output       — final .M1 (~8x source after expansion)
+##   64 MiB text-arena   — pasted names, hex literals from %(...) eval,
+##                         per-call @local label rewrites (cc.scm
+##                         triggers ~hundreds of K of each)
+##  256 MiB source-toks  — 8 M Token slots × 32 B
+DEFINE M1PP_INPUT_CAP 0000000100000000
+DEFINE M1PP_OUTPUT_CAP 0000000800000000
+DEFINE M1PP_TEXT_CAP 0000000400000000
+## source_tokens cap: 256 MB / 32-byte tokens = ~8.4 M tokens. cc.scm
+## emits one source token per ~3 input bytes (heavy macro use), so a
+## 6.5 MB tcc.flat.P1pp tokenises to ~2.5 M; 8 M leaves comfortable
+## headroom for the larger TUs the harness will exercise next.
+DEFINE M1PP_TOKENS_END 0000001000000000
+## Macro record is 304 bytes: name (16) + param_count (8) + params[16]*16 (256)
+## + body_start (8) + body_end (8) + has_paste (8). MACROS_CAP fits 1024
+## records (311296 B). The 2x BSS slot for macros (0x94000 B) still has
+## ample headroom past the new cap. has_paste is a 0/1 flag set during
+## define_macro when the body contains TOK_PASTE; expand_macro_tokens
+## reads it (along with args_have_paste from parse_args) to skip the
+## paste_pool_range scan when neither side contributes a `##`.
+## Body-token arena fits 65536 tokens (2 MB = 0x200000).
+DEFINE M1PP_MACRO_RECORD_SIZE 3001000000000000
+DEFINE M1PP_MACRO_BODY_START_OFF 1801000000000000
+DEFINE M1PP_MACRO_BODY_END_OFF 2001000000000000
+DEFINE M1PP_MACRO_HAS_PASTE_OFF 2801000000000000
+DEFINE M1PP_MACROS_CAP 00C0040000000000
+DEFINE M1PP_MACRO_BODY_CAP 0000200000000000
+DEFINE O_WRONLY_CREAT_TRUNC 4102000000000000
+DEFINE MODE_0644 A401000000000000
+DEFINE AT_FDCWD 9CFFFFFFFFFFFFFF
+DEFINE ZERO32 '0000000000000000000000000000000000000000000000000000000000000000'
+DEFINE ZERO8 '0000000000000000'
+DEFINE ZERO4 '00000000'
+
+DEFINE TOK_WORD 0000000000000000
+DEFINE TOK_STRING 0100000000000000
+DEFINE TOK_NEWLINE 0200000000000000
+DEFINE TOK_LPAREN 0300000000000000
+DEFINE TOK_RPAREN 0400000000000000
+DEFINE TOK_COMMA 0500000000000000
+DEFINE TOK_PASTE 0600000000000000
+DEFINE TOK_LBRACE 0700000000000000
+DEFINE TOK_RBRACE 0800000000000000
+
+## Token record stride (kind + text_ptr + text_len + tight). Advance by this.
+## Layout: +0 kind (8), +8 text_ptr (8), +16 text_len (8), +24 tight (8) = 32.
+## Only byte 0 of the tight word is meaningful (0/1); upper bytes are zero.
+DEFINE M1PP_TOK_SIZE 2000000000000000
+DEFINE M1PP_TOK_TIGHT_OFF 1800000000000000
+
+## --- Stream / expansion-pool / expression-frame sizes ------------------------
+## Stream record: 40 bytes. Fields (each 8 bytes):
+##   +0   start       Token*
+##   +8   end         Token*   (exclusive)
+##   +16  pos         Token*
+##   +24  line_start  u64      (1 at entry, 0 after first non-newline emit)
+##   +32  pool_mark   i64      (byte offset into expand_pool; -1 for source)
+DEFINE M1PP_STREAM_SIZE 2800000000000000
+DEFINE M1PP_STREAM_END_OFF 0800000000000000
+DEFINE M1PP_STREAM_POS_OFF 1000000000000000
+DEFINE M1PP_STREAM_LS_OFF 1800000000000000
+DEFINE M1PP_STREAM_MARK_OFF 2000000000000000
+
+## Stream stack cap: 128 streams × 40 = 5120 bytes (was 16 × 40 = 640).
+## Each nested macro / expression eval pushes a stream; cc.scm's macro
+## chains (%ld → %p1_mem → %select → %aa64_mem → %aa64_mem_after_nonneg
+## → %aa64_ldst_uimm12 → %(EXPR), plus %fn / %ifelse_* / @local label
+## scopes around the call site) routinely exceed 16 deep on the
+## tcc-boot2 path. Note: the runtime overflow message ("token buffer
+## overflow") at line 2504 is misleadingly shared with EXPAND/TOKENS;
+## hitting the cap there means *stream* stack exhaustion.
+DEFINE M1PP_STREAM_STACK_CAP 0014000000000000
+
+## Expansion pool fits 524288 Token slots × 32 bytes = 16 MB (0x1000000).
+## cc.scm emits %fn(name, sz, { body }), and m1pp eagerly copies the
+## body argument into the pool when expanding %fn — so the entire body
+## of a long function lives in the pool until %fn pops. tcc.c's
+## next_nomacro1 (~5900 lines × ~13 tokens/line ≈ 77 K tokens, ~2.5 MiB)
+## plus nested expansions sit comfortably under 16 MiB.
+DEFINE M1PP_EXPAND_CAP 0000000100000000
+
+## ExprFrame record: 144 bytes. Fields:
+##   +0   op_code  u64
+##   +8   argc     u64
+##   +16  args     i64[16]  (16 × 8 = 128 bytes)
+DEFINE M1PP_EXPR_FRAME_SIZE 9000000000000000
+DEFINE M1PP_EXPR_ARGC_OFF 0800000000000000
+DEFINE M1PP_EXPR_ARGS_OFF 1000000000000000
+
+## Expr frame stack cap: 16 frames × 144 = 2304 bytes.
+DEFINE M1PP_EXPR_FRAMES_CAP 0009000000000000
+
+## Common cap used by macro params, call args, and expression args.
+DEFINE M1PP_MAX_PARAMS 1000000000000000
+
+## ExprOp codes (indexed by apply_expr_op).
+DEFINE EXPR_ADD 0000000000000000
+DEFINE EXPR_SUB 0100000000000000
+DEFINE EXPR_MUL 0200000000000000
+DEFINE EXPR_DIV 0300000000000000
+DEFINE EXPR_MOD 0400000000000000
+DEFINE EXPR_SHL 0500000000000000
+DEFINE EXPR_SHR 0600000000000000
+DEFINE EXPR_AND 0700000000000000
+DEFINE EXPR_OR 0800000000000000
+DEFINE EXPR_XOR 0900000000000000
+DEFINE EXPR_NOT 0A00000000000000
+DEFINE EXPR_EQ 0B00000000000000
+DEFINE EXPR_NE 0C00000000000000
+DEFINE EXPR_LT 0D00000000000000
+DEFINE EXPR_LE 0E00000000000000
+DEFINE EXPR_GT 0F00000000000000
+DEFINE EXPR_GE 1000000000000000
+DEFINE EXPR_STRLEN 1100000000000000
+DEFINE EXPR_INVALID 1200000000000000
+## --- BSS layout (offsets from ELF_end) -------------------------------------
+## Total BSS ~499 MB, under the 512 MB segment memsz set by
+## vendor/seed/<arch>/ELF.hex2. (If a future bump pushes past 512 MB,
+## raise p_memsz in vendor/seed/<arch>/ELF.hex2 to 1 GiB and bump here.)
+##
+## Per-region BSS slot sizes (offset diffs):
+##   input_buf          32 MB    (2x INPUT_CAP, headroom for trailing NUL etc.)
+##   output_buf        128 MB    (1x OUTPUT_CAP)
+##   text_buf           64 MB    (1x TEXT_CAP)
+##   source_tokens     256 MB    (1x TOKENS_END)
+##   macros            592 KB    (2x MACROS_CAP, unchanged)
+##   macro_body_tokens   2 MB
+##   streams          5120 B    (128 streams × 40 B; was 16 × 40 = 640)
+##   expand_pool        16 MB    (1x EXPAND_CAP)
+##   expr_frames     2304 B
+DEFINE OFF_paste_scratch 0000000000000000
+DEFINE OFF_local_label_scratch 0001000000000000
+DEFINE OFF_df_name_scratch 8003000000000000
+DEFINE OFF_ebc_str_scratch 8004000000000000
+DEFINE OFF_arg_starts 8005000000000000
+DEFINE OFF_arg_ends 0006000000000000
+DEFINE OFF_input_buf 8006000000000000
+DEFINE OFF_output_buf 8006000200000000
+DEFINE OFF_text_buf 8006000A00000000
+DEFINE OFF_source_tokens 8006000E00000000
+DEFINE OFF_macros 8006001E00000000
+DEFINE OFF_macro_body_tokens 8046091E00000000
+DEFINE OFF_streams 8046291E00000000
+DEFINE OFF_expand_pool 805A291E00000000
+DEFINE OFF_expr_frames 805A291F00000000
+## local_lookup_scratch — 256-byte working buffer used by
+## expand_local_into_pool to assemble "<frame>_FRAME.<field>" before
+## the macro-table linear search. Placed past expr_frames (BSS end) so
+## adding it does not shift any existing OFF_*.
+DEFINE OFF_local_lookup_scratch 0052850000000000
+## macro_body_param_idx / macro_body_is_local_label — 1 byte per body
+## token slot (M1PP_MACRO_BODY_CAP / 32 = 65536 slots, so each region
+## is 0x10000 bytes). Populated at %macro definition time so the
+## expand_macro_tokens body loop reads cached classifications instead
+## of re-running find_param + is_local_label_token per body token per
+## expansion. Placed past the existing expr_frames (BSS end ≈ 0x1F296380)
+## so adding them does not shift any other OFF_*.
+DEFINE OFF_macro_body_param_idx 8063291F00000000
+DEFINE OFF_macro_body_is_local_label 80632A1F00000000
+
+
+## --- Runtime shell: argv, read input, call pipeline, write output, exit ------
+
+:p1_main
+    enter_0
+    # --- init BSS pointer slots from ELF_end via table walk ------------------
+    # Each bss_init_tbl entry is 16 bytes:
+    #   +0  slot ptr   (&label + 4 zero pad = 8-byte absolute address)
+    #   +8  offset     (8-byte OFF_* constant)
+    # For each entry: *slot_ptr = ELF_end + offset.
+    la_t0 &ELF_end
+    la_t1 &bss_init_tbl
+    la_t2 &bss_init_tbl_end
+:bss_init_loop
+    la_br &bss_init_done
+    beq_t1,t2
+    ld_a2,t1,0
+    ld_a3,t1,8
+    add_a3,a3,t0
+    st_a3,a2,0
+    addi_t1,t1,16
+    la_br &bss_init_loop
+    b
+:bss_init_done
+    # --- end BSS init -------------------------------------------------------
+
+    # a0 = argc, a1 = argv (pointer to argv[0]).
+    # if (argc < 3) usage
+    li_a2 %3 %0
+    la_br &err_usage
+    blt_a0,a2
+
+    # Stash argv[1] and argv[2] into memory before anything clobbers a1.
+    ld_t0,a1,8
+    la_a2 &input_path
+    st_t0,a2,0
+    ld_t0,a1,16
+    la_a2 &output_path
+    st_t0,a2,0
+
+    # source_end = &source_tokens   (running tail pointer)
+    la_a0 &source_tokens_ptr
+    ld_a0,a0,0
+    la_a2 &source_end
+    st_a0,a2,0
+
+    # macros_end = &macros; macro_body_end = &macro_body_tokens
+    la_a0 &macros_ptr
+    ld_a0,a0,0
+    la_a2 &macros_end
+    st_a0,a2,0
+    la_a0 &macro_body_tokens_ptr
+    ld_a0,a0,0
+    la_a2 &macro_body_end
+    st_a0,a2,0
+
+    # input_fd = openat(AT_FDCWD, input_path, O_RDONLY, 0)
+    li_a0 sys_openat
+    li_a1 AT_FDCWD
+    la_a2 &input_path
+    ld_a2,a2,0
+    li_a3 %0 %0
+    li_t0 %0 %0
+    syscall
+    la_br &err_open_input
+    bltz_a0
+    la_a1 &input_fd
+    st_a0,a1,0
+
+:read_loop
+    # while (input_len < INPUT_CAP)
+    la_a0 &input_len
+    ld_t1,a0,0
+    li_t2 M1PP_INPUT_CAP
+    la_br &read_done
+    beq_t1,t2
+
+    # n = read(input_fd, &input_buf[input_len], INPUT_CAP - input_len)
+    la_a0 &input_fd
+    ld_a1,a0,0
+    la_a2 &input_buf_ptr
+    ld_a2,a2,0
+    add_a2,a2,t1
+    sub_a3,t2,t1
+    li_a0 sys_read
+    syscall
+
+    # if (n == 0) break;  if (n < 0) fatal
+    la_br &read_done
+    beqz_a0
+    la_br &err_read
+    bltz_a0
+
+    # input_len += n
+    la_a1 &input_len
+    ld_a2,a1,0
+    add_a2,a2,a0
+    st_a2,a1,0
+    la_br &read_loop
+    b
+
+:read_done
+    # if (input_len == INPUT_CAP) fatal  (no room for null terminator)
+    la_a0 &input_len
+    ld_t0,a0,0
+    li_t1 M1PP_INPUT_CAP
+    la_br &err_input_too_big
+    beq_t0,t1
+
+    # input_buf[input_len] = '\0'
+    la_a0 &input_buf_ptr
+    ld_a0,a0,0
+    add_a0,a0,t0
+    li_t1 %0 %0
+    sb_t1,a0,0
+
+    # lex_source(); process_tokens()
+    la_br &lex_source
+    call
+    la_br &process_tokens
+    call
+
+    la_br &write_output
+    b
+
+:write_output
+    # output_fd = openat(AT_FDCWD, output_path, O_WRONLY|O_CREAT|O_TRUNC, 0644)
+    la_a0 &output_path
+    ld_a2,a0,0
+    li_a0 sys_openat
+    li_a1 AT_FDCWD
+    li_a3 O_WRONLY_CREAT_TRUNC
+    li_t0 MODE_0644
+    syscall
+    la_br &err_open_output
+    bltz_a0
+    la_a1 &output_fd
+    st_a0,a1,0
+
+:write_loop
+    # while (output_written < output_used)
+    la_a0 &output_written
+    ld_t0,a0,0
+    la_a1 &output_used
+    ld_t1,a1,0
+    la_br &write_done
+    beq_t0,t1
+
+    # n = write(output_fd, &output_buf[output_written], output_used - output_written)
+    la_a0 &output_fd
+    ld_a1,a0,0
+    la_a2 &output_buf_ptr
+    ld_a2,a2,0
+    add_a2,a2,t0
+    sub_a3,t1,t0
+    li_a0 sys_write
+    syscall
+
+    # n <= 0 is fatal (short write or error)
+    la_br &err_write
+    bltz_a0
+    la_br &err_write
+    beqz_a0
+
+    # output_written += n
+    la_a1 &output_written
+    ld_a2,a1,0
+    add_a2,a2,a0
+    st_a2,a1,0
+    la_br &write_loop
+    b
+
+:write_done
+    # return 0 (backend :_start stub sys_exits with a0)
+    li_a0 %0 %0
+    eret
+
+## --- Helpers: text arena + token array + equality ----------------------------
+## append_text appends bytes to text_buf (used for synthesized token text,
+## e.g. single-char parens/commas and the paste `##`). Source-word and string
+## tokens point directly into input_buf and skip this arena.
+
+## append_text(a0=src, a1=len) -> a0=text ptr. Leaf.
+:append_text
+    # a3 = text_used
+    la_a2 &text_used
+    ld_a3,a2,0
+
+    # if (text_used + len + 1) > TEXT_CAP: fatal
+    add_t0,a3,a1
+    addi_t0,t0,1
+    li_t1 M1PP_TEXT_CAP
+    la_br &err_text_overflow
+    blt_t1,t0
+
+    # dst = &text_buf[text_used]
+    la_t0 &text_buf_ptr
+    ld_t0,t0,0
+    add_t0,t0,a3
+
+    # for (i = 0; i < len; i++) dst[i] = src[i]
+    li_t1 %0 %0
+:append_text_loop
+    la_br &append_text_done
+    beq_t1,a1
+    add_t2,a0,t1
+    lb_t2,t2,0
+    add_a2,t0,t1
+    sb_t2,a2,0
+    addi_t1,t1,1
+    la_br &append_text_loop
+    b
+:append_text_done
+    # dst[len] = '\0'
+    add_a2,t0,t1
+    li_t2 %0 %0
+    sb_t2,a2,0
+
+    # text_used += len + 1
+    la_a2 &text_used
+    ld_a3,a2,0
+    add_a3,a3,a1
+    addi_a3,a3,1
+    st_a3,a2,0
+
+    # return dst
+    mov_a0,t0
+    ret
+
+## push_source_token(a0=kind, a1=text_ptr, a2=text_len, a3=tight). Leaf.
+## Token layout: +0 kind, +8 text_ptr, +16 text_len, +24 tight (32B total).
+## tight=1 means "no whitespace before this token"; consulted only on LPAREN
+## by the paren-call recognizers (%FOO(...), !(...), @(...), %(...), $(...),
+## %select(...), %str(...)). All other kinds carry the bit but ignore it.
+:push_source_token
+    # tok = source_end
+    la_t2 &source_end
+    ld_t0,t2,0
+
+    # if (tok == &source_tokens[0] + TOKENS_END) fatal
+    la_t1 &source_tokens_ptr
+    ld_t1,t1,0
+    li_t2 M1PP_TOKENS_END
+    add_t1,t1,t2
+    la_br &err_token_overflow
+    beq_t0,t1
+
+    # tok->kind = kind; tok->text_ptr = text_ptr; tok->text_len = text_len;
+    # tok->tight = tight (8-byte stores zero the rest of each slot).
+    st_a0,t0,0
+    st_a1,t0,8
+    st_a2,t0,16
+    st_a3,t0,24
+
+    # source_end = tok + 1 (advance 32 bytes)
+    la_t2 &source_end
+    addi_t0,t0,32
+    st_t0,t2,0
+    ret
+
+## tok_eq_const(a0=token_ptr, a1=const_ptr, a2=const_len) -> a0=0/1. Leaf.
+## Compares a token's text against a constant byte string.
+:tok_eq_const
+    # if (tok->text_len != const_len) return 0
+    ld_a3,a0,16
+    la_br &tok_eq_false
+    bne_a3,a2
+
+    # src = tok->text_ptr; i = 0
+    ld_t0,a0,8
+    li_t1 %0 %0
+:tok_eq_loop
+    # if (i == const_len) return 1
+    la_br &tok_eq_true
+    beq_t1,a2
+
+    # if (src[i] != const_ptr[i]) return 0
+    add_t2,t0,t1
+    lb_t2,t2,0
+    add_a3,a1,t1
+    lb_a3,a3,0
+    la_br &tok_eq_false
+    bne_t2,a3
+
+    # i++
+    addi_t1,t1,1
+    la_br &tok_eq_loop
+    b
+:tok_eq_true
+    li_a0 %1 %0
+    ret
+:tok_eq_false
+    li_a0 %0 %0
+    ret
+
+## --- Lexer -------------------------------------------------------------------
+## Dispatches on the first byte at lex_ptr:
+##   whitespace (sp/tab/cr/ff/vt) -> lex_skip_one
+##   newline (\n)                 -> lex_newline   -> TOK_NEWLINE
+##   quote (" or ')               -> lex_string    -> TOK_STRING
+##   `#`                          -> lex_hash      -> TOK_PASTE on ##, else comment
+##   `;`                          -> lex_comment   (drop to end of line)
+##   `(` `)` `,`                  -> lex_lparen / rparen / comma
+##   otherwise                    -> lex_word      -> TOK_WORD
+##
+## All branches loop back to lex_loop. lex_done exits once lex_ptr hits
+## the terminating NUL that _start writes past the end of input_buf.
+
+## lex_source(): fills source_tokens[] from input_buf.
+## lex_saw_separator tracks whether whitespace (sp/tab/CR/etc., newline,
+## or `;`/`#` line comment) precedes the next token. Each non-newline push
+## passes tight = !lex_saw_separator and then sets lex_saw_separator = 0.
+## Initialized to 1 at start of file so the first token is never tight.
+:lex_source
+    enter_0
+    la_a0 &input_buf_ptr
+    ld_a0,a0,0
+    la_a1 &lex_ptr
+    st_a0,a1,0
+    la_a0 &lex_saw_separator
+    li_t0 %1 %0
+    st_t0,a0,0
+:lex_loop
+    # c = *lex_ptr; dispatch on lex_char_class[c].
+    #   0 word, 1 skip ws, 2 newline, 3 string, 4 hash, 5 comment,
+    #   6 '(', 7 ')', 8 ',', 9 '{', 10 '}', 11 NUL (fall through to done).
+    la_a0 &lex_ptr
+    ld_t0,a0,0
+    lb_a0,t0,0
+    la_a1 &lex_char_class
+    add_a1,a1,a0
+    lb_a2,a1,0
+
+    la_br &lex_word
+    beqz_a2
+    li_a1 %1 %0
+    la_br &lex_skip_one
+    beq_a2,a1
+    li_a1 %2 %0
+    la_br &lex_newline
+    beq_a2,a1
+    li_a1 %3 %0
+    la_br &lex_string
+    beq_a2,a1
+    li_a1 %4 %0
+    la_br &lex_hash
+    beq_a2,a1
+    li_a1 %5 %0
+    la_br &lex_comment
+    beq_a2,a1
+    li_a1 %6 %0
+    la_br &lex_lparen
+    beq_a2,a1
+    li_a1 %7 %0
+    la_br &lex_rparen
+    beq_a2,a1
+    li_a1 %8 %0
+    la_br &lex_comma
+    beq_a2,a1
+    li_a1 %9 %0
+    la_br &lex_lbrace
+    beq_a2,a1
+    li_a1 %10 %0
+    la_br &lex_rbrace
+    beq_a2,a1
+    ## class 11 (NUL) — fall through
+    la_br &lex_done
+    b
+
+:lex_skip_one
+    # whitespace separator: lex_saw_separator = 1; lex_ptr++
+    la_a1 &lex_saw_separator
+    li_a2 %1 %0
+    st_a2,a1,0
+    addi_t0,t0,1
+    la_a0 &lex_ptr
+    st_t0,a0,0
+    la_br &lex_loop
+    b
+
+:lex_newline
+    # push_source_token(TOK_NEWLINE, lex_ptr, 1, tight=0); newline acts as a
+    # separator for the NEXT token, so lex_saw_separator = 1 afterwards.
+    mov_a1,t0
+    li_a0 TOK_NEWLINE
+    li_a2 %1 %0
+    li_a3 %0 %0
+    la_br &push_source_token
+    call
+
+    la_a0 &lex_saw_separator
+    li_t0 %1 %0
+    st_t0,a0,0
+
+    # lex_ptr++
+    la_a0 &lex_ptr
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &lex_loop
+    b
+
+:lex_string
+    # lex_start = lex_ptr; lex_quote = c; lex_ptr++
+    la_a1 &lex_start
+    st_t0,a1,0
+    la_a1 &lex_quote
+    st_a0,a1,0
+    addi_t0,t0,1
+:lex_string_scan
+    # c = *lex_ptr
+    lb_a0,t0,0
+    # if (c == '\0') finish (unterminated; keep what we have)
+    la_br &lex_string_finish
+    beqz_a0
+    # if (c == '\\' && lex_ptr[1] != '\0') skip both bytes as a unit so
+    # `\"` and `\\` don't accidentally terminate the string. Decoding
+    # the escape's *meaning* (e.g. for %bytes) happens later — here we
+    # only care about token boundaries.
+    li_a1 %92 %0
+    la_br &lex_string_check_backslash
+    beq_a0,a1
+    la_br &lex_string_no_escape
+    b
+:lex_string_check_backslash
+    addi_a1,t0,1
+    lb_a1,a1,0
+    la_br &lex_string_no_escape
+    beqz_a1
+    addi_t0,t0,2
+    la_br &lex_string_scan
+    b
+:lex_string_no_escape
+    # if (c == quote) consume closing quote and finish
+    la_a1 &lex_quote
+    ld_a1,a1,0
+    la_br &lex_string_after_quote
+    beq_a0,a1
+    # else lex_ptr++
+    addi_t0,t0,1
+    la_br &lex_string_scan
+    b
+:lex_string_after_quote
+    addi_t0,t0,1
+:lex_string_finish
+    # lex_ptr = t0
+    la_a1 &lex_ptr
+    st_t0,a1,0
+
+    # text_ptr = append_text(lex_start, lex_ptr - lex_start)
+    la_a1 &lex_start
+    ld_a0,a1,0
+    sub_a1,t0,a0
+    la_br &append_text
+    call
+
+    # push_source_token(TOK_STRING, text_ptr, lex_ptr - lex_start,
+    #                   tight = !lex_saw_separator); then lex_saw_separator = 0.
+    la_a1 &lex_ptr
+    ld_t0,a1,0
+    la_a1 &lex_start
+    ld_t1,a1,0
+    sub_a2,t0,t1
+    mov_a1,a0
+    li_a0 TOK_STRING
+    la_a3 &lex_saw_separator
+    ld_a3,a3,0
+    li_t1 %1 %0
+    sub_a3,t1,a3
+    la_br &push_source_token
+    call
+    la_a0 &lex_saw_separator
+    li_t0 %0 %0
+    st_t0,a0,0
+    la_br &lex_loop
+    b
+
+:lex_hash
+    # if (lex_ptr[1] == '#') goto lex_paste, else lex_comment
+    addi_a1,t0,1
+    lb_a1,a1,0
+    li_a2 %35 %0
+    la_br &lex_paste
+    beq_a1,a2
+    la_br &lex_comment
+    b
+
+:lex_paste
+    # text_ptr = append_text("##", 2)
+    la_a0 &const_paste
+    li_a1 %2 %0
+    la_br &append_text
+    call
+
+    # push_source_token(TOK_PASTE, text_ptr, 2, tight = !lex_saw_separator).
+    mov_a1,a0
+    li_a0 TOK_PASTE
+    li_a2 %2 %0
+    la_a3 &lex_saw_separator
+    ld_a3,a3,0
+    li_t1 %1 %0
+    sub_a3,t1,a3
+    la_br &push_source_token
+    call
+
+    la_a0 &lex_saw_separator
+    li_t0 %0 %0
+    st_t0,a0,0
+
+    # lex_ptr += 2
+    la_a0 &lex_ptr
+    ld_t0,a0,0
+    addi_t0,t0,2
+    st_t0,a0,0
+    la_br &lex_loop
+    b
+
+:lex_comment
+    # skip to end of line: while (c != '\0' && c != '\n') lex_ptr++
+    la_a0 &lex_ptr
+    ld_t0,a0,0
+:lex_comment_loop
+    lb_a0,t0,0
+    la_br &lex_comment_done
+    beqz_a0
+    li_a1 %10 %0
+    la_br &lex_comment_done
+    beq_a0,a1
+    addi_t0,t0,1
+    la_br &lex_comment_loop
+    b
+:lex_comment_done
+    # `;` / `#` line comment counts as a separator for the next token.
+    la_a0 &lex_ptr
+    st_t0,a0,0
+    la_a0 &lex_saw_separator
+    li_t0 %1 %0
+    st_t0,a0,0
+    la_br &lex_loop
+    b
+
+## lex_lparen / lex_rparen / lex_comma all share the same shape:
+## append the single-char constant, push a 1-byte token of the right kind,
+## then fall through to lex_advance_one_then_loop to bump lex_ptr.
+
+:lex_lparen
+    li_a0 TOK_LPAREN
+    la_a1 &const_lparen
+    la_br &lex_punct1
+    b
+:lex_rparen
+    li_a0 TOK_RPAREN
+    la_a1 &const_rparen
+    la_br &lex_punct1
+    b
+:lex_comma
+    li_a0 TOK_COMMA
+    la_a1 &const_comma
+    la_br &lex_punct1
+    b
+:lex_lbrace
+    li_a0 TOK_LBRACE
+    la_a1 &const_lbrace
+    la_br &lex_punct1
+    b
+:lex_rbrace
+    li_a0 TOK_RBRACE
+    la_a1 &const_rbrace
+    ## fall through into lex_punct1
+
+## lex_punct1(a0=kind, a1=const_ptr): append 1 byte to text arena, push a
+## 1-byte token of the given kind, advance lex_ptr by 1, branch back to
+## lex_loop. Called by tail-branch from the single-char lex_X blocks, which
+## all share lex_source's frame. Spills `kind` since append_text clobbers
+## a0..a3.
+:lex_punct1
+    la_t0 &lex_punct_kind
+    st_a0,t0,0
+    mov_a0,a1
+    li_a1 %1 %0
+    la_br &append_text
+    call
+    mov_a1,a0
+    la_t0 &lex_punct_kind
+    ld_a0,t0,0
+    li_a2 %1 %0
+    # tight = !lex_saw_separator (the load is consumed before push_source_token).
+    la_a3 &lex_saw_separator
+    ld_a3,a3,0
+    li_t1 %1 %0
+    sub_a3,t1,a3
+    la_br &push_source_token
+    call
+    la_a0 &lex_saw_separator
+    li_t0 %0 %0
+    st_t0,a0,0
+    ## fall through to lex_advance_one_then_loop
+
+:lex_advance_one_then_loop
+    # lex_ptr++
+    la_a0 &lex_ptr
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &lex_loop
+    b
+
+:lex_word
+    # lex_start = lex_ptr
+    la_a1 &lex_start
+    st_t0,a1,0
+:lex_word_scan
+    # c = *lex_ptr; terminate the word if lex_char_class[c] is non-WORD,
+    # but treat class 3 (string-quote `"`/`'`) as part of the word too —
+    # quotes only start a STRING token at token start, not mid-word.
+    # That matches M1pp.c, where the WORD scanner ignores `"`/`'` and
+    # so `\`"hi"\`` (backtick-quote-...-quote-backtick with no spaces)
+    # lexes as a single WORD.
+    lb_a2,t0,0
+    la_a1 &lex_char_class
+    add_a1,a1,a2
+    lb_a2,a1,0
+    la_br &lex_word_continue
+    beqz_a2
+    li_a1 %3 %0
+    la_br &lex_word_finish
+    bne_a2,a1
+:lex_word_continue
+    addi_t0,t0,1
+    la_br &lex_word_scan
+    b
+:lex_word_finish
+    # lex_ptr = t0
+    la_a1 &lex_ptr
+    st_t0,a1,0
+
+    # text_ptr = append_text(lex_start, lex_ptr - lex_start)
+    la_a1 &lex_start
+    ld_a0,a1,0
+    sub_a1,t0,a0
+    la_br &append_text
+    call
+
+    # push_source_token(TOK_WORD, text_ptr, lex_ptr - lex_start,
+    #                   tight = !lex_saw_separator); lex_saw_separator = 0.
+    la_a1 &lex_ptr
+    ld_t0,a1,0
+    la_a1 &lex_start
+    ld_t1,a1,0
+    sub_a2,t0,t1
+    mov_a1,a0
+    li_a0 TOK_WORD
+    la_a3 &lex_saw_separator
+    ld_a3,a3,0
+    li_t1 %1 %0
+    sub_a3,t1,a3
+    la_br &push_source_token
+    call
+    la_a0 &lex_saw_separator
+    li_t0 %0 %0
+    st_t0,a0,0
+    la_br &lex_loop
+    b
+
+:lex_done
+    eret
+
+## --- Output: normalized token stream to output_buf ---------------------------
+## emit_newline writes '\n' and clears output_need_space.
+## emit_token prefixes a space when output_need_space is set, copies the
+## token text, then sets output_need_space. This is how source whitespace
+## gets normalized: one '\n' per TOK_NEWLINE, one ' ' between consecutive
+## non-newline tokens.
+
+## emit_newline(). Leaf.
+:emit_newline
+    # if (output_used == OUTPUT_CAP) fatal
+    la_a0 &output_used
+    ld_t0,a0,0
+    li_t1 M1PP_OUTPUT_CAP
+    la_br &err_output_overflow
+    beq_t0,t1
+
+    # output_buf[output_used] = '\n'; output_used++
+    la_a1 &output_buf_ptr
+    ld_a1,a1,0
+    add_a1,a1,t0
+    li_t2 %10 %0
+    sb_t2,a1,0
+    addi_t0,t0,1
+    st_t0,a0,0
+
+    # output_need_space = 0
+    la_a0 &output_need_space
+    li_a1 %0 %0
+    st_a1,a0,0
+    ret
+
+## emit_token(a0=token_ptr). Tail-calls emit_string_as_bytes for
+## TOK_STRING (which has its own enter_0/eret frame), so emit_token
+## itself stays leaf for the WORD path.
+:emit_token
+    # brace tokens are no-ops at emit time (belt-and-braces with arg-strip)
+    ld_t0,a0,0
+    li_t1 TOK_LBRACE
+    la_br &emit_token_skip
+    beq_t0,t1
+    li_t1 TOK_RBRACE
+    la_br &emit_token_skip
+    beq_t0,t1
+    # Bare TOK_STRING decodes to raw bytes via emit_string_as_bytes.
+    # Branch (not call): the tail call returns to emit_token's caller.
+    li_t1 TOK_STRING
+    la_br &emit_string_as_bytes
+    beq_t0,t1
+
+    # if (output_need_space) emit ' '  (skip the space for the first token on a line)
+    la_a1 &output_need_space
+    ld_t0,a1,0
+    la_br &emit_token_copy
+    beqz_t0
+
+    la_a1 &output_used
+    ld_t0,a1,0
+    li_t1 M1PP_OUTPUT_CAP
+    la_br &err_output_overflow
+    beq_t0,t1
+    la_a2 &output_buf_ptr
+    ld_a2,a2,0
+    add_a2,a2,t0
+    li_t1 %32 %0
+    sb_t1,a2,0
+    addi_t0,t0,1
+    st_t0,a1,0
+
+:emit_token_copy
+    # src = tok->text_ptr; len = tok->text_len; i = 0
+    ld_t0,a0,8
+    ld_t1,a0,16
+    li_t2 %0 %0
+:emit_token_loop
+    # if (i == len) done
+    la_br &emit_token_done
+    beq_t2,t1
+
+    # if (output_used == OUTPUT_CAP) fatal
+    la_a1 &output_used
+    ld_a2,a1,0
+    li_a3 M1PP_OUTPUT_CAP
+    la_br &err_output_overflow
+    beq_a2,a3
+
+    # output_buf[output_used++] = src[i]
+    add_a3,t0,t2
+    lb_a3,a3,0
+    la_a0 &output_buf_ptr
+    ld_a0,a0,0
+    add_a0,a0,a2
+    sb_a3,a0,0
+    addi_a2,a2,1
+    st_a2,a1,0
+
+    # i++
+    addi_t2,t2,1
+    la_br &emit_token_loop
+    b
+:emit_token_done
+    # output_need_space = 1
+    la_a0 &output_need_space
+    li_a1 %1 %0
+    st_a1,a0,0
+    ret
+:emit_token_skip
+    ret
+
+
+## --- Main processor ----------------------------------------------------------
+## Stream-driven loop. Pushes source_tokens as the initial stream, then drives
+## the streams[] stack until it empties. Per iteration: pop the stream if
+## exhausted, otherwise dispatch on the current token:
+##   - line-start %macro      -> shim into define_macro via proc_pos
+##   - TOK_NEWLINE            -> emit_newline, advance, set line_start = 1
+##   - WORD + LPAREN follow + name in {! @ % $ %select}
+##                            -> expand_builtin_call(s, tok)
+##   - find_macro(tok) hit + LPAREN follow
+##                            -> expand_call(s, macro)
+##   - otherwise              -> emit_token, advance, clear line_start
+##
+## Stack frame: enter_16 reserves two 8-byte slots so we can preserve the
+## current Stream* (sp+16) and the current Token* (sp+24) across calls
+## (a0..a3, t0..t2 are caller-saved).
+
+## process_tokens(): stream-driven main loop.
+:process_tokens
+    enter_16
+
+    # push_stream_span(source_tokens, source_end, -1)
+    la_a0 &source_tokens_ptr
+    ld_a0,a0,0
+    la_a1 &source_end
+    ld_a1,a1,0
+    sub_a2,a2,a2
+    addi_a2,a2,neg1
+    la_br &push_stream_span
+    call
+
+## proc_loop dispatch refactor:
+##
+## A — first-byte gate: most pass-through tokens (plain identifiers,
+##     hex literals, the synthetic WORDs emitted by !@%$ evaluation)
+##     don't begin with %, !, @, or $ and exit through proc_emit after
+##     a single byte compare. The old cascade ran 5 directive +  up to
+##     7 builtin tok_eq_const probes for *every* WORD.
+## B — second-byte dispatch: within the c0=='%' branch, a single
+##     c1-byte switch picks at most one directive/builtin to actually
+##     compare against (e.g. c1='s' selects %struct/%select/%str only).
+##     A user macro %FOO with c1 outside {m,s,e,f,b,l} skips every
+##     tok_eq_const and goes straight to find_macro.
+:proc_loop
+    # s = current_stream();  if (s == 0) done
+    la_br &current_stream
+    call
+    la_br &proc_done
+    beqz_a0
+    st_a0,sp,0
+
+    # if (s->pos == s->end) pop and continue
+    ld_t0,a0,16
+    ld_t1,a0,8
+    la_br &proc_pop_continue
+    beq_t0,t1
+
+    # tok = s->pos
+    st_t0,sp,8
+
+    # ---- TOK_NEWLINE fast path ----
+    ld_a1,t0,0
+    li_a2 TOK_NEWLINE
+    la_br &proc_handle_newline
+    beq_a1,a2
+
+    # Non-WORD tokens (LPAREN, RPAREN, COMMA, LBRACE, RBRACE, STRING,
+    # PASTE) skip the whole dispatch and emit literally.
+    li_a2 TOK_WORD
+    la_br &proc_emit
+    bne_a1,a2
+
+    # tok->text.len, ptr — needed for the byte gate.
+    ld_t1,t0,16
+    la_br &proc_emit
+    beqz_t1
+    ld_t2,t0,8
+    lb_a3,t2,0
+
+    # has_paren = (tok+1 < s->end && (tok+1)->kind == TOK_LPAREN
+    #              && (tok+1)->tight). Stash to proc_has_paren.
+    li_a0 %0 %0
+    la_a1 &proc_has_paren
+    st_a0,a1,0
+    addi_a2,t0,32
+    ld_a1,sp,0
+    ld_a1,a1,8
+    la_br &proc_byte_gate
+    blt_a1,a2
+    la_br &proc_byte_gate
+    beq_a2,a1
+    ld_a0,a2,0
+    li_a1 TOK_LPAREN
+    la_br &proc_byte_gate
+    bne_a0,a1
+    ld_a0,a2,24
+    la_br &proc_byte_gate
+    beqz_a0
+    li_a0 %1 %0
+    la_a1 &proc_has_paren
+    st_a0,a1,0
+
+:proc_byte_gate
+    # c0 == '%' (37) -> percent branch
+    li_a0 %37 %0
+    la_br &proc_c0_pct
+    beq_a3,a0
+    # Arith builtins ! @ $ require len == 1 + has_paren. All other
+    # first-byte values fall through to proc_emit.
+    li_a0 %1 %0
+    la_br &proc_emit
+    bne_t1,a0
+    la_a1 &proc_has_paren
+    ld_a1,a1,0
+    la_br &proc_emit
+    beqz_a1
+    li_a0 %33 %0
+    la_br &proc_do_builtin
+    beq_a3,a0
+    li_a0 %64 %0
+    la_br &proc_do_builtin
+    beq_a3,a0
+    li_a0 %36 %0
+    la_br &proc_do_builtin
+    beq_a3,a0
+    la_br &proc_emit
+    b
+
+:proc_c0_pct
+    # c0 == '%'. Bare '%' (len == 1) + tight-paren -> arith builtin.
+    li_a0 %1 %0
+    la_br &proc_c0_pct_one
+    beq_t1,a0
+    # len >= 2: dispatch on c1 (text[1]).
+    lb_a3,t2,1
+
+    li_a0 %109 %0
+    la_br &proc_c1_m
+    beq_a3,a0
+    li_a0 %115 %0
+    la_br &proc_c1_s
+    beq_a3,a0
+    li_a0 %101 %0
+    la_br &proc_c1_e
+    beq_a3,a0
+    li_a0 %102 %0
+    la_br &proc_c1_f
+    beq_a3,a0
+    li_a0 %98 %0
+    la_br &proc_c1_b
+    beq_a3,a0
+    li_a0 %108 %0
+    la_br &proc_c1_l
+    beq_a3,a0
+    # No directive/builtin candidate — try user macro.
+    la_br &proc_check_macro
+    b
+
+:proc_c0_pct_one
+    la_a1 &proc_has_paren
+    ld_a1,a1,0
+    la_br &proc_emit
+    beqz_a1
+    la_br &proc_do_builtin
+    b
+
+:proc_c1_m
+    # %macro
+    ld_a0,sp,8
+    la_a1 &const_macro
+    li_a2 %6 %0
+    la_br &tok_eq_const
+    call
+    la_br &proc_check_macro
+    beqz_a0
+    ld_a0,sp,0
+    ld_a1,sp,8
+    la_br &proc_save_pos_and_ls
+    call
+    la_br &define_macro
+    call
+    la_br &proc_restore_and_loop
+    b
+
+:proc_c1_s
+    # %struct (no paren); %select / %str (paren).
+    ld_a0,sp,8
+    la_a1 &const_struct
+    li_a2 %7 %0
+    la_br &tok_eq_const
+    call
+    la_br &proc_c1_s_not_struct
+    beqz_a0
+    ld_a0,sp,0
+    ld_a1,sp,8
+    la_br &proc_save_pos_and_ls
+    call
+    li_a0 %8 %0
+    la_a1 &const_size
+    li_a2 %4 %0
+    la_br &define_fielded
+    call
+    la_br &proc_restore_and_loop
+    b
+:proc_c1_s_not_struct
+    la_a1 &proc_has_paren
+    ld_a1,a1,0
+    la_br &proc_check_macro
+    beqz_a1
+    ld_a0,sp,8
+    la_a1 &const_select
+    li_a2 %7 %0
+    la_br &tok_eq_const
+    call
+    la_br &proc_c1_s_not_select
+    beqz_a0
+    la_br &proc_do_builtin
+    b
+:proc_c1_s_not_select
+    ld_a0,sp,8
+    la_a1 &const_str
+    li_a2 %4 %0
+    la_br &tok_eq_const
+    call
+    la_br &proc_check_macro
+    beqz_a0
+    la_br &proc_do_builtin
+    b
+
+:proc_c1_e
+    # %enum (no paren); %endframe (no paren).
+    ld_a0,sp,8
+    la_a1 &const_enum
+    li_a2 %5 %0
+    la_br &tok_eq_const
+    call
+    la_br &proc_c1_e_not_enum
+    beqz_a0
+    ld_a0,sp,0
+    ld_a1,sp,8
+    la_br &proc_save_pos_and_ls
+    call
+    li_a0 %1 %0
+    la_a1 &const_count
+    li_a2 %5 %0
+    la_br &define_fielded
+    call
+    la_br &proc_restore_and_loop
+    b
+:proc_c1_e_not_enum
+    ld_a0,sp,8
+    la_a1 &const_endframe
+    li_a2 %9 %0
+    la_br &tok_eq_const
+    call
+    la_br &proc_check_macro
+    beqz_a0
+    ld_a0,sp,0
+    ld_a1,sp,8
+    la_br &proc_save_pos_and_ls
+    call
+    ld_a0,sp,0
+    ld_a0,a0,8
+    la_br &pop_frame
+    call
+    la_br &proc_restore_and_loop
+    b
+
+:proc_c1_f
+    # %frame (no paren).
+    ld_a0,sp,8
+    la_a1 &const_frame
+    li_a2 %6 %0
+    la_br &tok_eq_const
+    call
+    la_br &proc_check_macro
+    beqz_a0
+    ld_a0,sp,0
+    ld_a1,sp,8
+    la_br &proc_save_pos_and_ls
+    call
+    ld_a0,sp,0
+    ld_a0,a0,8
+    la_br &push_frame
+    call
+    la_br &proc_restore_and_loop
+    b
+
+:proc_c1_b
+    # %bytes (paren).
+    la_a1 &proc_has_paren
+    ld_a1,a1,0
+    la_br &proc_check_macro
+    beqz_a1
+    ld_a0,sp,8
+    la_a1 &const_bytes
+    li_a2 %6 %0
+    la_br &tok_eq_const
+    call
+    la_br &proc_check_macro
+    beqz_a0
+    la_br &proc_do_builtin
+    b
+
+:proc_c1_l
+    # %local (paren).
+    la_a1 &proc_has_paren
+    ld_a1,a1,0
+    la_br &proc_check_macro
+    beqz_a1
+    ld_a0,sp,8
+    la_a1 &const_local
+    li_a2 %6 %0
+    la_br &tok_eq_const
+    call
+    la_br &proc_check_macro
+    beqz_a0
+    la_br &proc_do_builtin
+    b
+
+:proc_handle_newline
+    ld_a0,sp,0
+    ld_t0,sp,8
+    addi_t0,t0,32
+    st_t0,a0,16
+    li_t1 %1 %0
+    st_t1,a0,24
+    la_br &emit_newline
+    call
+    la_br &proc_loop
+    b
+
+:proc_do_builtin
+    # expand_builtin_call(s, tok)
+    ld_a0,sp,0
+    ld_a1,sp,8
+    la_br &expand_builtin_call
+    call
+    la_br &proc_loop
+    b
+
+:proc_check_macro
+    # macro = find_macro(tok); if non-zero AND
+    #   ((tok+1 < s->end AND (tok+1)->kind == TOK_LPAREN) OR macro->param_count == 0)
+    # then expand_call. Paren-less form is reserved for 0-arg macros.
+    ld_a0,sp,8
+    la_br &find_macro
+    call
+    la_br &proc_emit
+    beqz_a0
+    mov_t2,a0
+    ld_a0,sp,0
+    ld_t0,sp,8
+    addi_t1,t0,32
+    ld_a1,a0,8
+    la_br &proc_macro_has_next
+    blt_t1,a1
+    la_br &proc_macro_zero_arg
+    b
+:proc_macro_has_next
+    ld_a1,t1,0
+    li_a2 TOK_LPAREN
+    la_br &proc_macro_zero_arg
+    bne_a1,a2
+    # require (tok+1)->tight — `%FOO ( ... )` with whitespace is the
+    # paren-less form (zero-arg only) followed by a literal `(`.
+    ld_a1,t1,24
+    la_br &proc_macro_zero_arg
+    beqz_a1
+    ld_a0,sp,0
+    mov_a1,t2
+    la_br &expand_call
+    call
+    la_br &proc_loop
+    b
+:proc_macro_zero_arg
+    # No trailing LPAREN (or LPAREN not tight). Expand only if param_count == 0.
+    ld_t0,t2,16
+    la_br &proc_emit
+    bnez_t0
+    ld_a0,sp,0
+    mov_a1,t2
+    la_br &expand_call
+    call
+    la_br &proc_loop
+    b
+
+:proc_emit
+    # emit_token(tok); s->pos += 24; s->line_start = 0
+    ld_a0,sp,8
+    la_br &emit_token
+    call
+    ld_a0,sp,0
+    ld_t0,a0,16
+    addi_t0,t0,32
+    st_t0,a0,16
+    li_t1 %0 %0
+    st_t1,a0,24
+    la_br &proc_loop
+    b
+
+:proc_pop_continue
+    la_br &pop_stream
+    call
+    la_br &proc_loop
+    b
+
+:proc_done
+    # Every %frame must be matched by an %endframe before EOF.
+    la_a0 &frame_active
+    ld_t0,a0,0
+    la_br &err_frame_not_closed
+    bnez_t0
+    eret
+
+## proc_save_pos_and_ls(a0=s, a1=tok): publish the directive's position into
+## proc_pos / proc_line_start so the directive handler can drive against the
+## source stream. Leaf — preserves the caller's other state.
+:proc_save_pos_and_ls
+    la_t0 &proc_pos
+    st_a1,t0,0
+    ld_t1,a0,24
+    la_t0 &proc_line_start
+    st_t1,t0,0
+    ret
+
+## proc_restore_and_loop: reached only via `b` (sp must be intact). Reads
+## sp,0 = s; copies proc_pos into s->pos, sets s->line_start=1, jumps to
+## proc_loop. Tail of every directive shim above.
+:proc_restore_and_loop
+    ld_a0,sp,0
+    la_a1 &proc_pos
+    ld_t0,a1,0
+    st_t0,a0,16
+    li_t1 %1 %0
+    st_t1,a0,24
+    la_br &proc_loop
+    b
+
+## --- %frame / %endframe handlers --------------------------------------------
+## Single-slot frame state used by %local. push_frame(a0=stream_end) parses
+## `%frame NAME`, stashes name's TextSpan in current_frame_ptr/_len, and
+## sets frame_active = 1. pop_frame(a0=stream_end) clears frame_active.
+## Frames do not nest — a second push without an intervening pop is fatal.
+
+:push_frame
+    enter_0
+
+    # proc_pos += 32 (skip past the `%frame` token).
+    la_t0 &proc_pos
+    ld_t1,t0,0
+    addi_t1,t1,32
+    st_t1,t0,0
+
+    # Skip newlines between `%frame` and NAME.
+    la_a1 &pf_stream_end
+    st_a0,a1,0
+    la_br &proc_skip_newlines
+    call
+    la_a1 &pf_stream_end
+    ld_a0,a1,0
+    la_t0 &proc_pos
+    ld_t1,t0,0
+
+    # Require a WORD name token within the stream.
+    la_br &err_bad_frame_header
+    beq_t1,a0
+    ld_t2,t1,0
+    la_br &err_bad_frame_header
+    bnez_t2
+
+    # !frame_active (cannot nest)
+    la_a1 &frame_active
+    ld_a2,a1,0
+    la_br &err_frame_already_active
+    bnez_a2
+
+    # current_frame_ptr = name.text_ptr; current_frame_len = name.text_len
+    la_a3 &current_frame_ptr
+    ld_t2,t1,8
+    st_t2,a3,0
+    la_a3 &current_frame_len
+    ld_t2,t1,16
+    st_t2,a3,0
+
+    # frame_active = 1
+    li_a2 %1 %0
+    st_a2,a1,0
+
+    # proc_pos += 32 (past the name).
+    la_t0 &proc_pos
+    ld_t1,t0,0
+    addi_t1,t1,32
+    st_t1,t0,0
+
+    # Newlines between `%frame NAME` and the body content are insignificant.
+    la_br &proc_skip_newlines
+    call
+    eret
+
+## pop_frame(a0 = stream_end): consume `%endframe` followed by a strict
+## TOK_NEWLINE. Fatal if no frame is active.
+:pop_frame
+    enter_0
+
+    # frame_active?
+    la_a1 &frame_active
+    ld_a2,a1,0
+    la_br &err_frame_underflow
+    beqz_a2
+    li_a2 %0 %0
+    st_a2,a1,0
+
+    # proc_pos += 32 (past the `%endframe` token).
+    la_t0 &proc_pos
+    ld_t1,t0,0
+    addi_t1,t1,32
+    st_t1,t0,0
+
+    # Strict: the token immediately after `%endframe` must be TOK_NEWLINE.
+    la_br &err_bad_frame_header
+    beq_t1,a0
+    ld_t2,t1,0
+    li_t0 TOK_NEWLINE
+    la_br &err_bad_frame_header
+    bne_t2,t0
+    # Consume the trailing newline only when %endframe sat at line-start;
+    # mid-line %endframe leaves the newline so it can be emitted.
+    la_t0 &proc_line_start
+    ld_a1,t0,0
+    la_br &pop_frame_done
+    beqz_a1
+    addi_t1,t1,32
+    la_t0 &proc_pos
+    st_t1,t0,0
+:pop_frame_done
+    eret
+
+## --- %macro storage: parse header + body into macros[] / macro_body_tokens --
+## Called at proc_pos == line-start `%macro`. Leaves proc_pos past the %endm
+## line with proc_line_start = 1. Uses BSS scratch (def_m_ptr, def_param_ptr,
+## def_body_line_start) since P1 enter/eret does not save s* registers.
+##
+## Macro record layout (296 bytes, see M1PP_MACRO_RECORD_SIZE):
+##   +0   name.ptr        (8)
+##   +8   name.len        (8)
+##   +16  param_count     (8)
+##   +24  params[16].ptr/.len  (16 * 16 = 256)
+##   +280 body_start      (8)  -> *Token into macro_body_tokens[]
+##   +288 body_end        (8)  -> exclusive end
+
+## define_macro(): consume `%macro NAME(params...)\n ... %endm\n`.
+:define_macro
+    enter_0
+
+    # macros_end bounds check: if (macros_end == &macros + MACROS_CAP) fatal
+    la_a0 &macros_end
+    ld_t0,a0,0
+    la_a1 &macros_ptr
+    ld_a1,a1,0
+    li_a2 M1PP_MACROS_CAP
+    add_a1,a1,a2
+    la_br &err_too_many_macros
+    beq_t0,a1
+
+    # def_m_ptr = macros_end   (Macro *m = &macros[macro_count])
+    la_a1 &def_m_ptr
+    st_t0,a1,0
+
+    # advance past the %macro token itself
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    addi_t0,t0,32
+    st_t0,a0,0
+
+    # Header is whitespace-insensitive: newlines between the keyword and
+    # any header element (NAME, '(', params, ',', ')') are skipped.
+    la_br &proc_skip_newlines
+    call
+
+    # ---- header: name (WORD) ----
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    la_a1 &source_end
+    ld_t1,a1,0
+    la_br &err_bad_macro_header
+    beq_t0,t1
+    ld_a1,t0,0
+    li_a2 TOK_WORD
+    la_br &err_bad_macro_header
+    bne_a1,a2
+
+    # m->name.ptr = tok->text_ptr; m->name.len = tok->text_len
+    ld_a2,t0,8
+    ld_a3,t0,16
+    la_a0 &def_m_ptr
+    ld_t2,a0,0
+    st_a2,t2,0
+    st_a3,t2,8
+
+    # m->param_count = 0; def_param_ptr = m + 24 (first TextSpan slot in macro)
+    li_a0 %0 %0
+    st_a0,t2,16
+    addi_t2,t2,24
+    la_a0 &def_param_ptr
+    st_t2,a0,0
+
+    # advance past name
+    addi_t0,t0,32
+    la_a0 &proc_pos
+    st_t0,a0,0
+
+    la_br &proc_skip_newlines
+    call
+
+    # ---- header: LPAREN ----
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    la_a1 &source_end
+    ld_t1,a1,0
+    la_br &err_bad_macro_header
+    beq_t0,t1
+    ld_a1,t0,0
+    li_a2 TOK_LPAREN
+    la_br &err_bad_macro_header
+    bne_a1,a2
+
+    # advance past '('
+    addi_t0,t0,32
+    la_a0 &proc_pos
+    st_t0,a0,0
+
+    la_br &proc_skip_newlines
+    call
+
+    # ---- header: optional param list ----
+    # if at end -> fall through to RPAREN check (which will fail)
+    # if next is RPAREN -> skip the param loop
+    # else enter param loop
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    la_a1 &source_end
+    ld_t1,a1,0
+    la_br &def_header_close
+    beq_t0,t1
+    ld_a1,t0,0
+    li_a2 TOK_RPAREN
+    la_br &def_header_close
+    beq_a1,a2
+
+:def_param_loop
+    # reject > 16 params: if (15 < param_count) fail   (param_count capped at 16)
+    la_a0 &def_m_ptr
+    ld_t2,a0,0
+    ld_a1,t2,16
+    li_a2 %15 %0
+    la_br &err_bad_macro_header
+    blt_a2,a1
+
+    # tok must be in range and WORD
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    la_a1 &source_end
+    ld_t1,a1,0
+    la_br &err_bad_macro_header
+    beq_t0,t1
+    ld_a1,t0,0
+    li_a2 TOK_WORD
+    la_br &err_bad_macro_header
+    bne_a1,a2
+
+    # *def_param_ptr = (tok.text_ptr, tok.text_len); def_param_ptr += 16
+    ld_a2,t0,8
+    ld_a3,t0,16
+    la_a0 &def_param_ptr
+    ld_t1,a0,0
+    st_a2,t1,0
+    st_a3,t1,8
+    addi_t1,t1,16
+    st_t1,a0,0
+
+    # m->param_count++
+    la_a0 &def_m_ptr
+    ld_t2,a0,0
+    ld_a1,t2,16
+    addi_a1,a1,1
+    st_a1,t2,16
+
+    # advance past the param word
+    addi_t0,t0,32
+    la_a0 &proc_pos
+    st_t0,a0,0
+
+    # Skip newlines between a param and the following ',' or ')'.
+    la_br &proc_skip_newlines
+    call
+
+    # if next is COMMA, consume and loop; else break
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    la_a1 &source_end
+    ld_t1,a1,0
+    la_br &def_header_close
+    beq_t0,t1
+    ld_a1,t0,0
+    li_a2 TOK_COMMA
+    la_br &def_header_close
+    bne_a1,a2
+    addi_t0,t0,32
+    la_a0 &proc_pos
+    st_t0,a0,0
+    # Skip newlines after ',' so the next param can be on a new line.
+    la_br &proc_skip_newlines
+    call
+    la_br &def_param_loop
+    b
+
+:def_header_close
+    # ---- header: RPAREN ----
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    la_a1 &source_end
+    ld_t1,a1,0
+    la_br &err_bad_macro_header
+    beq_t0,t1
+    ld_a1,t0,0
+    li_a2 TOK_RPAREN
+    la_br &err_bad_macro_header
+    bne_a1,a2
+
+    addi_t0,t0,32
+    la_a0 &proc_pos
+    st_t0,a0,0
+
+    # ---- header self-terminates at ')'. Newlines between the header line
+    # ----  and the body content are insignificant — skip them.
+    la_br &proc_skip_newlines
+    call
+
+    # ---- body: m->body_start = macro_body_end ----
+    la_a1 &macro_body_end
+    ld_t2,a1,0
+    la_a0 &def_m_ptr
+    ld_t1,a0,0
+    li_a0 M1PP_MACRO_BODY_START_OFF
+    add_a0,t1,a0
+    st_t2,a0,0
+
+:def_body_loop
+    # if proc_pos == source_end: unterminated %macro
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    la_a1 &source_end
+    ld_t1,a1,0
+    la_br &err_unterminated_macro
+    beq_t0,t1
+
+    # %endm is recognized anywhere in the body (no line-start gating). If
+    # (tok.kind == TOK_WORD) and (tok eq "%endm"), break; else copy token.
+    ld_a1,t0,0
+    li_a2 TOK_WORD
+    la_br &def_body_copy
+    bne_a1,a2
+
+    mov_a0,t0
+    la_a1 &const_endm
+    li_a2 %5 %0
+    la_br &tok_eq_const
+    call
+    la_br &def_body_copy
+    beqz_a0
+
+    # matched %endm: advance past it and require a TOK_NEWLINE next.
+    la_br &def_endm_after
+    b
+
+:def_body_copy
+    # bounds: if (macro_body_end - macro_body_tokens + 32 > MACRO_BODY_CAP) fail
+    la_a0 &macro_body_end
+    ld_t1,a0,0
+    la_a2 &macro_body_tokens_ptr
+    ld_a2,a2,0
+    sub_a3,t1,a2
+    addi_a3,a3,32
+    li_t2 M1PP_MACRO_BODY_CAP
+    la_br &err_macro_body_overflow
+    blt_t2,a3
+
+    # === C: cache classification for this body token, so expand_macro_tokens
+    # === doesn't re-run find_param + is_local_label_token per body token per
+    # === expansion. Computed once at definition; written to byte-stride
+    # === parallel arrays indexed by (slot - macro_body_tokens_ptr) / 32.
+    # offset = (t1 - macro_body_tokens_ptr) / 32   (t1 still = macro_body_end)
+    la_a0 &macro_body_tokens_ptr
+    ld_a0,a0,0
+    sub_a0,t1,a0
+    shri_a0,a0,5
+    la_a1 &def_body_meta_idx
+    st_a0,a1,0
+
+    # macro_body_param_idx[idx] = find_param(def_m_ptr, proc_pos)
+    la_a0 &def_m_ptr
+    ld_a0,a0,0
+    la_a1 &proc_pos
+    ld_a1,a1,0
+    la_br &find_param
+    call
+    la_a1 &def_body_meta_idx
+    ld_a1,a1,0
+    la_a2 &macro_body_param_idx_ptr
+    ld_a2,a2,0
+    add_a2,a2,a1
+    sb_a0,a2,0
+
+    # macro_body_is_local_label[idx] = (kind==WORD && len>=3 && p[0] in ':&' && p[1]=='@')
+    # Inlined — there's no separate is_local_label_token function in P1; the
+    # full predicate is replicated here in def-time, replacing the per-expansion
+    # emt_check_local_label sequence.
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    li_a3 %0 %0
+    ld_a1,t0,0
+    la_br &def_body_copy_ill_store
+    bnez_a1
+    ld_a1,t0,16
+    li_a2 %3 %0
+    la_br &def_body_copy_ill_store
+    blt_a1,a2
+    ld_a2,t0,8
+    lb_a1,a2,0
+    li_a0 %58 %0
+    la_br &def_body_copy_ill_at
+    beq_a1,a0
+    li_a0 %38 %0
+    la_br &def_body_copy_ill_store
+    bne_a1,a0
+:def_body_copy_ill_at
+    lb_a1,a2,1
+    li_a0 %64 %0
+    la_br &def_body_copy_ill_store
+    bne_a1,a0
+    li_a3 %1 %0
+:def_body_copy_ill_store
+    la_a1 &def_body_meta_idx
+    ld_a1,a1,0
+    la_a2 &macro_body_is_local_label_ptr
+    ld_a2,a2,0
+    add_a2,a2,a1
+    sb_a3,a2,0
+    # === end C ===
+
+    # If the body token is TOK_PASTE, set m->has_paste = 1. expand_macro_tokens
+    # uses this (combined with args_have_paste) to skip paste_pool_range when
+    # neither the body nor the call's args contribute a `##`. Defaulted to 0
+    # by BSS init when macros_end advanced into this slot.
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    ld_a1,t0,0
+    li_a2 TOK_PASTE
+    la_br &def_body_copy_after_paste_chk
+    bne_a1,a2
+    la_a0 &def_m_ptr
+    ld_a2,a0,0
+    li_a3 M1PP_MACRO_HAS_PASTE_OFF
+    add_a2,a2,a3
+    li_a3 %1 %0
+    st_a3,a2,0
+
+:def_body_copy_after_paste_chk
+    # Reload t1 = macro_body_end — clobbered by find_param above.
+    la_a0 &macro_body_end
+    ld_t1,a0,0
+
+    # copy 32 bytes from *proc_pos to *macro_body_end (preserves tight at +24)
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    ld_a1,t0,0
+    st_a1,t1,0
+    ld_a1,t0,8
+    st_a1,t1,8
+    ld_a1,t0,16
+    st_a1,t1,16
+    ld_a1,t0,24
+    st_a1,t1,24
+
+    # macro_body_end += 32
+    addi_t1,t1,32
+    la_a0 &macro_body_end
+    st_t1,a0,0
+
+    # proc_pos += 32
+    addi_t0,t0,32
+    la_a0 &proc_pos
+    st_t0,a0,0
+    la_br &def_body_loop
+    b
+
+:def_endm_after
+    # advance past the %endm token; the next token MUST be TOK_NEWLINE.
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    addi_t0,t0,32
+    st_t0,a0,0
+    la_a1 &source_end
+    ld_t1,a1,0
+    la_br &err_bad_macro_header
+    beq_t0,t1
+    ld_a1,t0,0
+    li_a2 TOK_NEWLINE
+    la_br &err_bad_macro_header
+    bne_a1,a2
+    # Consume the trailing NEWLINE only when the directive started at
+    # line-start; mid-line directives leave the newline in the stream so
+    # the outer loop emits it (preserving line layout).
+    la_a0 &proc_line_start
+    ld_a1,a0,0
+    la_br &def_finish
+    beqz_a1
+    addi_t0,t0,32
+    la_a0 &proc_pos
+    st_t0,a0,0
+
+:def_finish
+    # m->body_end = macro_body_end
+    la_a1 &macro_body_end
+    ld_t2,a1,0
+    la_a0 &def_m_ptr
+    ld_t1,a0,0
+    li_a0 M1PP_MACRO_BODY_END_OFF
+    add_a0,t1,a0
+    st_t2,a0,0
+
+    # macros_end += MACRO_RECORD_SIZE
+    la_a0 &macros_end
+    ld_t0,a0,0
+    li_a1 M1PP_MACRO_RECORD_SIZE
+    add_t0,t0,a1
+    st_t0,a0,0
+
+    # caller resumes at line start
+    la_a0 &proc_line_start
+    li_a1 %1 %0
+    st_a1,a0,0
+    eret
+
+## --- %struct / %enum directive ----------------------------------------------
+## define_fielded(a0=stride, a1=total_name_ptr, a2=total_name_len).
+## Parses `%struct NAME { f1 f2 ... }` or `%enum NAME { ... }` (caller has
+## already detected %struct / %enum at line start and primed proc_pos to
+## that token). Synthesizes N+1 zero-parameter macros — NAME.field_k -> k*stride
+## and NAME.<total_name> -> N*stride — by appending each {name, body-token}
+## pair into macros[] / macro_body_tokens[].
+##
+## All working state lives in BSS (df_* slots + df_name_scratch / df_digit_scratch)
+## because df_emit_field calls append_text, which clobbers caller-saved regs.
+:define_fielded
+    enter_0
+
+    # Save directive args to BSS.
+    la_a3 &df_stride
+    st_a0,a3,0
+    la_a3 &df_total_name_ptr
+    st_a1,a3,0
+    la_a3 &df_total_name_len
+    st_a2,a3,0
+
+    # advance past the %struct / %enum directive token
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    addi_t0,t0,32
+    st_t0,a0,0
+
+    # Header is whitespace-insensitive: newlines between %struct/%enum and
+    # the NAME (and between NAME and '{') are skipped.
+    la_br &proc_skip_newlines
+    call
+
+    # ---- header: name (WORD) ----
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    la_a1 &source_end
+    ld_t1,a1,0
+    la_br &err_bad_directive
+    beq_t0,t1
+    ld_a1,t0,0
+    li_a2 TOK_WORD
+    la_br &err_bad_directive
+    bne_a1,a2
+
+    # df_base_ptr = tok.text_ptr; df_base_len = tok.text_len
+    ld_a2,t0,8
+    la_a3 &df_base_ptr
+    st_a2,a3,0
+    ld_a2,t0,16
+    la_a3 &df_base_len
+    st_a2,a3,0
+
+    # advance past the base name
+    addi_t0,t0,32
+    la_a0 &proc_pos
+    st_t0,a0,0
+
+## skip NEWLINE tokens before '{' (tolerates `%struct NAME\n{ ... }`)
+:df_skip_nl_before_lbrace
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    la_a1 &source_end
+    ld_t1,a1,0
+    la_br &err_bad_directive
+    beq_t0,t1
+    ld_a1,t0,0
+    li_a2 TOK_NEWLINE
+    la_br &df_require_lbrace
+    bne_a1,a2
+    addi_t0,t0,32
+    la_a0 &proc_pos
+    st_t0,a0,0
+    la_br &df_skip_nl_before_lbrace
+    b
+
+:df_require_lbrace
+    # expect LBRACE
+    li_a2 TOK_LBRACE
+    la_br &err_bad_directive
+    bne_a1,a2
+
+    # advance past '{'
+    addi_t0,t0,32
+    la_a0 &proc_pos
+    st_t0,a0,0
+
+    # df_index = 0
+    li_a0 %0 %0
+    la_a1 &df_index
+    st_a0,a1,0
+
+## field loop: skip comma/newline separators, stop at '}', else consume a WORD.
+:df_field_loop
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    la_a1 &source_end
+    ld_t1,a1,0
+    la_br &err_unterminated_directive
+    beq_t0,t1
+    ld_a1,t0,0
+
+    # separator: COMMA or NEWLINE -> advance and reloop
+    li_a2 TOK_COMMA
+    la_br &df_field_skip_sep
+    beq_a1,a2
+    li_a2 TOK_NEWLINE
+    la_br &df_field_skip_sep
+    beq_a1,a2
+
+    # end-of-list marker '}' -> break
+    li_a2 TOK_RBRACE
+    la_br &df_fields_done
+    beq_a1,a2
+
+    # else must be a WORD
+    li_a2 TOK_WORD
+    la_br &err_bad_directive
+    bne_a1,a2
+
+    # df_suffix_ptr = tok.text_ptr; df_suffix_len = tok.text_len
+    ld_a2,t0,8
+    la_a3 &df_suffix_ptr
+    st_a2,a3,0
+    ld_a2,t0,16
+    la_a3 &df_suffix_len
+    st_a2,a3,0
+
+    # df_value = df_index * df_stride
+    la_a0 &df_index
+    ld_t1,a0,0
+    la_a0 &df_stride
+    ld_t2,a0,0
+    mul_a0,t1,t2
+    la_a1 &df_value
+    st_a0,a1,0
+
+    # synthesize the field macro
+    la_br &df_emit_field
+    call
+
+    # df_index++
+    la_a0 &df_index
+    ld_t1,a0,0
+    addi_t1,t1,1
+    st_t1,a0,0
+
+    # advance past the field word
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    addi_t0,t0,32
+    st_t0,a0,0
+    la_br &df_field_loop
+    b
+
+:df_field_skip_sep
+    addi_t0,t0,32
+    la_a0 &proc_pos
+    st_t0,a0,0
+    la_br &df_field_loop
+    b
+
+:df_fields_done
+    # advance past '}'
+    addi_t0,t0,32
+    la_a0 &proc_pos
+    st_t0,a0,0
+
+    # ---- emit totalizer: df_suffix <- df_total_name; df_value = N * stride ----
+    la_a0 &df_total_name_ptr
+    ld_t0,a0,0
+    la_a1 &df_suffix_ptr
+    st_t0,a1,0
+    la_a0 &df_total_name_len
+    ld_t0,a0,0
+    la_a1 &df_suffix_len
+    st_t0,a1,0
+
+    la_a0 &df_index
+    ld_t1,a0,0
+    la_a0 &df_stride
+    ld_t2,a0,0
+    mul_a0,t1,t2
+    la_a1 &df_value
+    st_a0,a1,0
+
+    la_br &df_emit_field
+    call
+
+    # Strict: the closing '}' must be immediately followed by TOK_NEWLINE.
+    # Consume that newline only when the directive started at line-start,
+    # mirroring %endm / %endframe.
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    la_a1 &source_end
+    ld_t1,a1,0
+    la_br &err_bad_directive
+    beq_t0,t1
+    ld_a1,t0,0
+    li_a2 TOK_NEWLINE
+    la_br &err_bad_directive
+    bne_a1,a2
+    la_a0 &proc_line_start
+    ld_a1,a0,0
+    la_br &df_finish
+    beqz_a1
+    addi_t0,t0,32
+    la_a0 &proc_pos
+    st_t0,a0,0
+
+:df_finish
+    la_a0 &proc_line_start
+    li_a1 %1 %0
+    st_a1,a0,0
+    eret
+
+## df_emit_field(): read df_base_*, df_suffix_*, df_value from BSS; synthesize
+## one macro record + one body token. Builds the "NAME.field" identifier in
+## df_name_scratch and the decimal body text via df_render_decimal, then
+## copies both into text_buf via append_text so they outlive the scratch.
+:df_emit_field
+    enter_0
+
+    # macros_end capacity check
+    la_a0 &macros_end
+    ld_t0,a0,0
+    la_a1 &macros_ptr
+    ld_a1,a1,0
+    li_a2 M1PP_MACROS_CAP
+    add_a1,a1,a2
+    la_br &err_too_many_macros
+    beq_t0,a1
+
+    # ---- assemble "BASE.SUFFIX" into df_name_scratch ----
+    # copy base bytes
+    la_a0 &df_base_ptr
+    ld_t0,a0,0
+    la_a0 &df_base_len
+    ld_t1,a0,0
+    la_t2 &df_name_scratch_ptr
+    ld_t2,t2,0
+    li_a3 %0 %0
+:df_ef_base_loop
+    la_br &df_ef_base_done
+    beq_a3,t1
+    add_a0,t0,a3
+    lb_a0,a0,0
+    add_a1,t2,a3
+    sb_a0,a1,0
+    addi_a3,a3,1
+    la_br &df_ef_base_loop
+    b
+:df_ef_base_done
+    # scratch[base_len] = '.'
+    add_a1,t2,t1
+    li_a0 %46 %0
+    sb_a0,a1,0
+
+    # copy suffix bytes into scratch[base_len + 1 ..]
+    la_a0 &df_suffix_ptr
+    ld_t0,a0,0
+    la_a0 &df_suffix_len
+    ld_t1,a0,0
+    addi_a1,a1,1
+    li_a3 %0 %0
+:df_ef_suffix_loop
+    la_br &df_ef_suffix_done
+    beq_a3,t1
+    add_a0,t0,a3
+    lb_a0,a0,0
+    add_a2,a1,a3
+    sb_a0,a2,0
+    addi_a3,a3,1
+    la_br &df_ef_suffix_loop
+    b
+:df_ef_suffix_done
+
+    # name_len = base_len + 1 + suffix_len
+    la_a0 &df_base_len
+    ld_t0,a0,0
+    la_a0 &df_suffix_len
+    ld_t1,a0,0
+    add_t0,t0,t1
+    addi_t0,t0,1
+    la_a1 &df_name_len
+    st_t0,a1,0
+
+    # durable_name = append_text(&df_name_scratch, name_len)
+    la_a0 &df_name_scratch_ptr
+    ld_a0,a0,0
+    mov_a1,t0
+    la_br &append_text
+    call
+    # a0 = durable_name ptr
+
+    # m = macros_end; m->name.ptr = durable_name; m->name.len = name_len
+    la_a1 &macros_end
+    ld_t2,a1,0
+    st_a0,t2,0
+    la_a0 &df_name_len
+    ld_a0,a0,0
+    st_a0,t2,8
+
+    # m->param_count = 0  (params[] left zeroed; not read when count == 0)
+    li_a0 %0 %0
+    st_a0,t2,16
+
+    # render df_value into df_digit_scratch (reverse fill)
+    la_br &df_render_decimal
+    call
+
+    # durable_digits = append_text(&df_digit_cursor, df_digit_count)
+    la_a0 &df_digit_cursor
+    ld_a0,a0,0
+    la_a1 &df_digit_count
+    ld_a1,a1,0
+    la_br &append_text
+    call
+    # a0 = durable_digits
+
+    # macro_body_end capacity check
+    la_a1 &macro_body_end
+    ld_t0,a1,0
+    la_a2 &macro_body_tokens_ptr
+    ld_a2,a2,0
+    sub_a3,t0,a2
+    addi_a3,a3,32
+    li_t2 M1PP_MACRO_BODY_CAP
+    la_br &err_macro_body_overflow
+    blt_t2,a3
+
+    # body_tok = TOK_WORD { durable_digits, df_digit_count, tight=0 }
+    li_a1 TOK_WORD
+    st_a1,t0,0
+    st_a0,t0,8
+    la_a2 &df_digit_count
+    ld_a2,a2,0
+    st_a2,t0,16
+    li_a1 %0 %0
+    st_a1,t0,24
+
+    # m->body_start = macro_body_end (the slot we just wrote)
+    la_a0 &macros_end
+    ld_t2,a0,0
+    li_a1 M1PP_MACRO_BODY_START_OFF
+    add_a1,t2,a1
+    st_t0,a1,0
+
+    # macro_body_end += 24
+    addi_t0,t0,32
+    la_a1 &macro_body_end
+    st_t0,a1,0
+
+    # m->body_end = macro_body_end
+    li_a1 M1PP_MACRO_BODY_END_OFF
+    add_a1,t2,a1
+    st_t0,a1,0
+
+    # macros_end += MACRO_RECORD_SIZE
+    li_a0 M1PP_MACRO_RECORD_SIZE
+    add_t2,t2,a0
+    la_a1 &macros_end
+    st_t2,a1,0
+
+    eret
+
+## df_render_decimal(): reads df_value; writes a reverse-filled decimal
+## rendering into df_digit_scratch[cursor..end) and stores df_digit_count +
+## df_digit_cursor for a subsequent append_text call. Leaf.
+:df_render_decimal
+    la_a0 &df_value
+    ld_t0,a0,0
+    la_t1 &df_digit_scratch
+    li_a2 %24 %0
+    add_t1,t1,a2
+    mov_t2,t1
+
+    # special-case v == 0 -> single '0'
+    la_br &df_rd_loop
+    bnez_t0
+    addi_t2,t2,neg1
+    li_a0 %48 %0
+    sb_a0,t2,0
+    la_br &df_rd_done
+    b
+:df_rd_loop
+    la_br &df_rd_done
+    beqz_t0
+    mov_a0,t0
+    li_a1 %10 %0
+    rem_a2,a0,a1
+    addi_a2,a2,48
+    addi_t2,t2,neg1
+    sb_a2,t2,0
+    mov_a0,t0
+    li_a1 %10 %0
+    div_a0,a0,a1
+    mov_t0,a0
+    la_br &df_rd_loop
+    b
+:df_rd_done
+    la_a1 &df_digit_scratch
+    li_a2 %24 %0
+    add_a1,a1,a2
+    sub_a0,a1,t2
+    la_a1 &df_digit_count
+    st_a0,a1,0
+    la_a1 &df_digit_cursor
+    st_t2,a1,0
+    ret
+
+## ============================================================================
+## --- Stream stack + expansion-pool lifetime ---------------------------------
+## ============================================================================
+## process_tokens drives a stack of token streams. The source token array is
+## pushed first; each macro expansion or %select chosen-branch pushes a fresh
+## stream backed by a slice of expand_pool, popping rewinds pool_used to the
+## stream's pool_mark.
+
+## push_stream_span(a0=start_tok, a1=end_tok, a2=pool_mark) -> void (fatal on overflow)
+## Push Stream { start = pos = a0, end = a1, line_start = 1, pool_mark = a2 }
+## onto streams[]. Bumps stream_top. pool_mark is a byte offset into
+## expand_pool, or -1 for a source-owned stream (pop_stream won't rewind).
+##
+## stream_top is maintained as a byte offset into streams[] (count * 40),
+## matching the running-tail-pointer pattern used by source_end / macros_end.
+## Reads/writes: streams, stream_top. Leaf.
+:push_stream_span
+    # new_top = stream_top + STREAM_SIZE; if (cap < new_top) fatal
+    la_t0 &stream_top
+    ld_t1,t0,0
+    li_t2 M1PP_STREAM_SIZE
+    add_t2,t1,t2
+    li_a3 M1PP_STREAM_STACK_CAP
+    la_br &err_token_overflow
+    blt_a3,t2
+
+    # s = &streams[stream_top]
+    la_a3 &streams_ptr
+    ld_a3,a3,0
+    add_a3,a3,t1
+
+    # s->start = a0; s->end = a1; s->pos = a0; s->line_start = 1; s->pool_mark = a2
+    st_a0,a3,0
+    st_a1,a3,8
+    st_a0,a3,16
+    li_t1 %1 %0
+    st_t1,a3,24
+    st_a2,a3,32
+
+    # stream_top = new_top
+    st_t2,t0,0
+    ret
+
+## current_stream() -> a0 = &streams[stream_top-1], or 0 if empty. Leaf.
+## stream_top is a byte offset, so &streams[top-1] = streams + stream_top - 40.
+## Reads: streams, stream_top.
+:current_stream
+    la_a0 &stream_top
+    ld_t0,a0,0
+    la_br &current_stream_empty
+    beqz_t0
+    la_a0 &streams_ptr
+    ld_a0,a0,0
+    add_a0,a0,t0
+    li_t1 M1PP_STREAM_SIZE
+    sub_a0,a0,t1
+    ret
+:current_stream_empty
+    li_a0 %0 %0
+    ret
+
+## pop_stream() -> void. Leaf.
+## Decrement stream_top. If the popped stream's pool_mark >= 0, restore
+## pool_used = pool_mark (reclaim the expansion-pool space it used).
+## Reads/writes: streams, stream_top, pool_used.
+:pop_stream
+    la_a0 &stream_top
+    ld_t0,a0,0
+    la_br &pop_stream_done
+    beqz_t0
+    li_t1 M1PP_STREAM_SIZE
+    sub_t0,t0,t1
+    st_t0,a0,0
+
+    # mark = popped->pool_mark
+    la_a1 &streams_ptr
+    ld_a1,a1,0
+    add_a1,a1,t0
+    ld_t0,a1,32
+
+    # if (mark < 0) skip; else pool_used = mark
+    la_br &pop_stream_done
+    bltz_t0
+    la_a1 &pool_used
+    st_t0,a1,0
+:pop_stream_done
+    ret
+
+## copy_span_to_pool(a0=start_tok, a1=end_tok) -> void (fatal on pool overflow)
+## Append each 32-byte Token in [start, end) to expand_pool at pool_used,
+## advancing pool_used accordingly. Preserves tight bit at +24.
+## Reads/writes: expand_pool, pool_used. Leaf.
+:copy_span_to_pool
+:cstp_loop
+    # if (start == end) done
+    la_br &cstp_done
+    beq_a0,a1
+
+    # bounds: pool_used + 32 must fit in EXPAND_CAP
+    la_a2 &pool_used
+    ld_t0,a2,0
+    addi_t1,t0,32
+    li_t2 M1PP_EXPAND_CAP
+    la_br &err_token_overflow
+    blt_t2,t1
+
+    # dst = &expand_pool[pool_used]
+    la_a3 &expand_pool_ptr
+    ld_a3,a3,0
+    add_a3,a3,t0
+
+    # copy 32 bytes (4 × u64)
+    ld_t1,a0,0
+    st_t1,a3,0
+    ld_t1,a0,8
+    st_t1,a3,8
+    ld_t1,a0,16
+    st_t1,a3,16
+    ld_t1,a0,24
+    st_t1,a3,24
+
+    # pool_used += 32; start += 32
+    addi_t0,t0,32
+    st_t0,a2,0
+    addi_a0,a0,32
+    la_br &cstp_loop
+    b
+:cstp_done
+    ret
+
+## push_pool_stream_from_mark(a0=mark) -> void (fatal on overflow)
+## If pool_used == mark (empty expansion), do nothing and return.
+## Otherwise push_stream_span(expand_pool+mark, expand_pool+pool_used, mark).
+## Reads/writes: expand_pool, pool_used, streams, stream_top. Non-leaf:
+## needs a frame so the call to push_stream_span doesn't clobber LR.
+:push_pool_stream_from_mark
+    enter_0
+    # if (pool_used == mark) return
+    la_a1 &pool_used
+    ld_t0,a1,0
+    la_br &ppsfm_done
+    beq_t0,a0
+
+    # push_stream_span(expand_pool+mark, expand_pool+pool_used, mark)
+    la_a2 &expand_pool_ptr
+    ld_a2,a2,0
+    mov_t1,a0
+    add_a0,a2,a0
+    add_a1,a2,t0
+    mov_a2,t1
+    la_br &push_stream_span
+    call
+:ppsfm_done
+    eret
+
+## ============================================================================
+## --- Argument parsing -------------------------------------------------------
+## ============================================================================
+
+## parse_args(a0=lparen_tok, a1=limit_tok) -> void (fatal on unterminated/overflow)
+## Scan tokens from lparen+1 up to limit, tracking paren depth. At depth 1 each
+## TOK_COMMA ends one arg and starts the next; the matching TOK_RPAREN at
+## depth 0 ends the last arg. An empty `()` is arg_count = 0.
+##
+## Writes globals:
+##   arg_starts[i]  = first token of arg i
+##   arg_ends[i]    = one past last token of arg i
+##   arg_count      = number of args (0..16)
+##   call_end_pos   = one past the closing RPAREN
+##
+## Fatal on: > 16 args, reaching limit without matching RPAREN.
+:parse_args
+    # tok = lparen + 1; arg_start = tok; depth = 1; arg_index = 0; brace_depth = 0
+    addi_a0,a0,32
+    la_a2 &pa_pos
+    st_a0,a2,0
+    la_a2 &pa_arg_start
+    st_a0,a2,0
+    la_a2 &pa_limit
+    st_a1,a2,0
+    li_a2 %1 %0
+    la_a3 &pa_depth
+    st_a2,a3,0
+    li_a2 %0 %0
+    la_a3 &pa_arg_index
+    st_a2,a3,0
+    li_a2 %0 %0
+    la_a3 &pa_brace_depth
+    st_a2,a3,0
+
+    # args_have_paste = 0 — set to 1 below if any TOK_PASTE appears in the
+    # call's argument span. expand_macro_tokens snapshots this right after
+    # parse_args returns; bare arg copies preserve embedded ## tokens, and
+    # the snapshot tells us whether we still have to run paste_pool_range
+    # even when the body itself contains no ##.
+    li_a2 %0 %0
+    la_a3 &args_have_paste
+    st_a2,a3,0
+
+:pa_loop
+    # if (tok >= limit) fatal unterminated
+    la_a0 &pa_pos
+    ld_t0,a0,0
+    la_a1 &pa_limit
+    ld_t1,a1,0
+    la_br &err_unterminated_macro
+    beq_t0,t1
+
+    # kind = tok->kind
+    ld_a2,t0,0
+
+    # if (kind == TOK_PASTE) { args_have_paste = 1; fall through to default-advance }
+    li_a3 TOK_PASTE
+    la_br &pa_kind_check
+    bne_a2,a3
+    li_a3 %1 %0
+    la_a0 &args_have_paste
+    st_a3,a0,0
+
+:pa_kind_check
+    # if (kind == TOK_LPAREN) { depth++; tok++; loop }
+    li_a3 TOK_LPAREN
+    la_br &pa_lparen
+    beq_a2,a3
+    li_a3 TOK_RPAREN
+    la_br &pa_rparen
+    beq_a2,a3
+    li_a3 TOK_COMMA
+    la_br &pa_maybe_comma
+    beq_a2,a3
+    li_a3 TOK_LBRACE
+    la_br &pa_lbrace
+    beq_a2,a3
+    li_a3 TOK_RBRACE
+    la_br &pa_rbrace
+    beq_a2,a3
+
+    # default: tok++
+    addi_t0,t0,32
+    la_a0 &pa_pos
+    st_t0,a0,0
+    la_br &pa_loop
+    b
+
+:pa_lparen
+    la_a0 &pa_depth
+    ld_t1,a0,0
+    addi_t1,t1,1
+    st_t1,a0,0
+    addi_t0,t0,32
+    la_a0 &pa_pos
+    st_t0,a0,0
+    la_br &pa_loop
+    b
+
+:pa_rparen
+    # depth--
+    la_a0 &pa_depth
+    ld_t1,a0,0
+    addi_t1,t1,neg1
+    st_t1,a0,0
+    # if (depth != 0) tok++; loop
+    la_br &pa_rparen_close
+    beqz_t1
+    addi_t0,t0,32
+    la_a0 &pa_pos
+    st_t0,a0,0
+    la_br &pa_loop
+    b
+
+:pa_rparen_close
+    # depth == 0: if brace_depth != 0 -> unbalanced braces
+    la_a0 &pa_brace_depth
+    ld_t1,a0,0
+    la_br &err_unbalanced_braces
+    bnez_t1
+    # close out the call.
+    # arg_start (BSS), arg_index (BSS), tok = current pos.
+    la_a0 &pa_arg_start
+    ld_a1,a0,0
+    la_a0 &pa_arg_index
+    ld_a2,a0,0
+
+    # if (arg_start == tok && arg_index == 0) -> arg_count = 0
+    la_br &pa_close_with_arg
+    bne_a1,t0
+    la_br &pa_close_with_arg
+    bnez_a2
+
+    # empty (): arg_count = 0
+    li_a3 %0 %0
+    la_a0 &arg_count
+    st_a3,a0,0
+    la_br &pa_finish
+    b
+
+:pa_close_with_arg
+    # if (arg_index >= 16) fatal: branch to ok only if arg_index < 16
+    li_a3 M1PP_MAX_PARAMS
+    la_br &pa_close_with_arg_ok
+    blt_a2,a3
+    la_br &err_bad_macro_header
+    b
+:pa_close_with_arg_ok
+    # arg_starts[arg_index] = arg_start; arg_ends[arg_index] = tok
+    la_a3 &arg_starts_ptr
+    ld_a3,a3,0
+    shli_t1,a2,3
+    add_a3,a3,t1
+    st_a1,a3,0
+    la_a3 &arg_ends_ptr
+    ld_a3,a3,0
+    add_a3,a3,t1
+    st_t0,a3,0
+    # arg_count = arg_index + 1
+    addi_a2,a2,1
+    la_a0 &arg_count
+    st_a2,a0,0
+
+:pa_finish
+    # call_end_pos = tok + 24
+    addi_t0,t0,32
+    la_a0 &call_end_pos
+    st_t0,a0,0
+    ret
+
+:pa_maybe_comma
+    # only split at depth == 1
+    la_a0 &pa_depth
+    ld_t1,a0,0
+    li_a3 %1 %0
+    la_br &pa_default_advance
+    bne_t1,a3
+    # and only when brace_depth == 0
+    la_a0 &pa_brace_depth
+    ld_t1,a0,0
+    la_br &pa_default_advance
+    bnez_t1
+
+    # depth == 1 && brace_depth == 0 split: append (arg_start, tok) at arg_index
+    la_a0 &pa_arg_index
+    ld_a2,a0,0
+    li_a3 M1PP_MAX_PARAMS
+    la_br &pa_comma_ok
+    blt_a2,a3
+    la_br &err_bad_macro_header
+    b
+:pa_comma_ok
+    la_a0 &pa_arg_start
+    ld_a1,a0,0
+    la_a3 &arg_starts_ptr
+    ld_a3,a3,0
+    shli_t1,a2,3
+    add_a3,a3,t1
+    st_a1,a3,0
+    la_a3 &arg_ends_ptr
+    ld_a3,a3,0
+    add_a3,a3,t1
+    st_t0,a3,0
+    # arg_index++
+    addi_a2,a2,1
+    la_a0 &pa_arg_index
+    st_a2,a0,0
+    # arg_start = tok + 24
+    addi_t0,t0,32
+    la_a0 &pa_arg_start
+    st_t0,a0,0
+    la_a0 &pa_pos
+    st_t0,a0,0
+    la_br &pa_loop
+    b
+
+:pa_default_advance
+    # comma at depth != 1: just advance
+    addi_t0,t0,32
+    la_a0 &pa_pos
+    st_t0,a0,0
+    la_br &pa_loop
+    b
+
+:pa_lbrace
+    # brace_depth++; tok++
+    la_a0 &pa_brace_depth
+    ld_t1,a0,0
+    addi_t1,t1,1
+    st_t1,a0,0
+    addi_t0,t0,32
+    la_a0 &pa_pos
+    st_t0,a0,0
+    la_br &pa_loop
+    b
+
+:pa_rbrace
+    # if (brace_depth <= 0) fatal unbalanced braces
+    la_a0 &pa_brace_depth
+    ld_t1,a0,0
+    la_br &err_unbalanced_braces
+    beqz_t1
+    # brace_depth--; tok++
+    addi_t1,t1,neg1
+    st_t1,a0,0
+    addi_t0,t0,32
+    la_a0 &pa_pos
+    st_t0,a0,0
+    la_br &pa_loop
+    b
+
+## ============================================================================
+## --- Macro lookup + call expansion ------------------------------------------
+## ============================================================================
+
+## find_macro(a0=tok) -> a0 = Macro* or 0. Leaf.
+## Non-zero only if tok is TOK_WORD, text.len >= 2, text[0] == '%', and
+## (text+1, len-1) equals macros[i].name for some i. First match wins.
+## Reads: macros, macros_end.
+:find_macro
+    # if (tok.kind != TOK_WORD) return 0
+    ld_a1,a0,0
+    li_a2 TOK_WORD
+    la_br &find_macro_zero
+    bne_a1,a2
+
+    # if (tok.text.len < 2) return 0
+    ld_a2,a0,16
+    li_a3 %2 %0
+    la_br &find_macro_zero
+    blt_a2,a3
+
+    # if (tok.text[0] != '%') return 0
+    ld_a1,a0,8
+    lb_a3,a1,0
+    li_t0 %37 %0
+    la_br &find_macro_zero
+    bne_a3,t0
+
+    # name_ptr = tok.text + 1; name_len = tok.text.len - 1
+    addi_a1,a1,1
+    addi_a2,a2,neg1
+
+    # m = &macros[0]; m_end = macros_end
+    la_a3 &macros_ptr
+    ld_a3,a3,0
+    la_t0 &macros_end
+    ld_t0,t0,0
+
+:find_macro_loop
+    # if (m == macros_end) return 0
+    la_br &find_macro_zero
+    beq_a3,t0
+
+    # if (m->name.len != name_len) advance
+    ld_t1,a3,8
+    la_br &find_macro_next
+    bne_t1,a2
+
+    # byte-compare m->name.ptr vs name_ptr for name_len bytes
+    ld_t1,a3,0
+    li_t2 %0 %0
+:find_macro_cmp
+    la_br &find_macro_match
+    beq_t2,a2
+    add_a0,t1,t2
+    lb_a0,a0,0
+    add_t0,a1,t2
+    lb_t0,t0,0
+    la_br &find_macro_next
+    bne_a0,t0
+    addi_t2,t2,1
+    la_br &find_macro_cmp
+    b
+
+:find_macro_next
+    # m += M1PP_MACRO_RECORD_SIZE
+    li_t1 M1PP_MACRO_RECORD_SIZE
+    add_a3,a3,t1
+    # reload macros_end (clobbered by the comparisons)
+    la_t0 &macros_end
+    ld_t0,t0,0
+    la_br &find_macro_loop
+    b
+
+:find_macro_match
+    mov_a0,a3
+    ret
+
+:find_macro_zero
+    li_a0 %0 %0
+    ret
+
+## find_param(a0=macro_ptr, a1=tok) -> a0 = (index+1) or 0. Leaf.
+## Linear search over macro->params[0..param_count). Non-WORD tok -> 0, so
+## callers can test the return against zero without pre-filtering.
+:find_param
+    # if (tok.kind != TOK_WORD) return 0
+    ld_a2,a1,0
+    li_a3 TOK_WORD
+    la_br &find_param_zero
+    bne_a2,a3
+
+    # param_count = macro->param_count
+    ld_a2,a0,16
+    la_br &find_param_zero
+    beqz_a2
+
+    # Spill bases into BSS so the cmp loop has free temp regs.
+    #   fp_macro     = macro_ptr
+    #   fp_tok       = tok ptr
+    #   fp_pcount    = param_count
+    #   fp_idx       = current param index
+    la_a3 &fp_macro
+    st_a0,a3,0
+    la_a3 &fp_tok
+    st_a1,a3,0
+    la_a3 &fp_pcount
+    st_a2,a3,0
+    li_a3 %0 %0
+    la_a0 &fp_idx
+    st_a3,a0,0
+
+:find_param_outer
+    # idx, pcount
+    la_a0 &fp_idx
+    ld_t0,a0,0
+    la_a0 &fp_pcount
+    ld_a1,a0,0
+    la_br &find_param_zero
+    beq_t0,a1
+
+    # param_ptr = fp_macro + 24 + idx * 16   (macro record params start at +24)
+    la_a0 &fp_macro
+    ld_a2,a0,0
+    addi_a2,a2,24
+    shli_a3,t0,4
+    add_a2,a2,a3
+
+    # tok ptr
+    la_a0 &fp_tok
+    ld_a3,a0,0
+
+    # Compare lengths.
+    ld_t1,a2,8
+    ld_t2,a3,16
+    la_br &find_param_next
+    bne_t1,t2
+
+    # Lengths match. Byte-compare param.ptr vs tok.text.ptr for t1 bytes.
+    # After this point we either return or restart the outer loop, so
+    # all caller-saved regs are free.
+    ld_a0,a2,0
+    ld_a1,a3,8
+    li_t0 %0 %0
+:find_param_cmp
+    la_br &find_param_match
+    beq_t0,t1
+    add_t2,a0,t0
+    lb_t2,t2,0
+    add_a2,a1,t0
+    lb_a2,a2,0
+    la_br &find_param_next
+    bne_t2,a2
+    addi_t0,t0,1
+    la_br &find_param_cmp
+    b
+
+:find_param_next
+    # idx++
+    la_a0 &fp_idx
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_br &find_param_outer
+    b
+
+:find_param_match
+    # return idx + 1
+    la_a0 &fp_idx
+    ld_a0,a0,0
+    addi_a0,a0,1
+    ret
+
+:find_param_zero
+    li_a0 %0 %0
+    ret
+
+## arg_is_braced(a0=start, a1=end) -> a0 = 1 if the span wraps in a matching
+## outer { ... } pair (outer RBRACE is the same-level mate of the leading
+## LBRACE), else 0. Leaf.
+:arg_is_braced
+    # if (end - start < 2 tokens = 64 bytes) return 0
+    sub_a2,a1,a0
+    li_a3 %64 %0
+    la_br &aib_zero
+    blt_a2,a3
+
+    # if (start->kind != TOK_LBRACE) return 0
+    ld_a2,a0,0
+    li_a3 TOK_LBRACE
+    la_br &aib_zero
+    bne_a2,a3
+
+    # if ((end - 24)->kind != TOK_RBRACE) return 0
+    addi_t0,a1,neg32
+    ld_a2,t0,0
+    li_a3 TOK_RBRACE
+    la_br &aib_zero
+    bne_a2,a3
+
+    # walk tokens tracking depth; if depth hits 0 before reaching end-24,
+    # the leading LBRACE doesn't match the trailing RBRACE -> return 0.
+    # t0 = tok, t1 = depth, t2 = last_tok = end - 24
+    mov_t0,a0
+    li_t1 %0 %0
+    addi_t2,a1,neg32
+:aib_loop
+    la_br &aib_done
+    beq_t0,a1
+    ld_a2,t0,0
+    li_a3 TOK_LBRACE
+    la_br &aib_incr
+    beq_a2,a3
+    li_a3 TOK_RBRACE
+    la_br &aib_decr
+    beq_a2,a3
+    # non-brace: advance
+    addi_t0,t0,32
+    la_br &aib_loop
+    b
+:aib_incr
+    addi_t1,t1,1
+    addi_t0,t0,32
+    la_br &aib_loop
+    b
+:aib_decr
+    addi_t1,t1,neg1
+    # if (depth == 0 && tok != end - 24) -> not wrapping
+    la_br &aib_decr_skip
+    bnez_t1
+    la_br &aib_zero
+    bne_t0,t2
+:aib_decr_skip
+    addi_t0,t0,32
+    la_br &aib_loop
+    b
+:aib_done
+    # return (depth == 0) ? 1 : 0
+    la_br &aib_zero
+    bnez_t1
+    li_a0 %1 %0
+    ret
+:aib_zero
+    li_a0 %0 %0
+    ret
+
+## copy_arg_tokens_to_pool(a0=arg_start, a1=arg_end) -> void (fatal if empty)
+## Non-leaf (calls copy_span_to_pool). Empty arg is an error.
+## If the span is wrapped in a matching outer { ... } pair, strip the outer
+## braces before copying; an empty inner span is a no-op.
+:copy_arg_tokens_to_pool
+    enter_16
+    # if (arg_start == arg_end) fatal
+    la_br &err_bad_macro_header
+    beq_a0,a1
+    # spill a0/a1 so arg_is_braced can clobber regs
+    st_a0,sp,0
+    st_a1,sp,8
+    la_br &arg_is_braced
+    call
+    la_br &catp_plain
+    beqz_a0
+    # braced: strip outer braces (start+24, end-24)
+    ld_a0,sp,0
+    ld_a1,sp,8
+    addi_a0,a0,32
+    addi_a1,a1,neg32
+    la_br &catp_done
+    beq_a0,a1
+    la_br &copy_span_to_pool
+    call
+    la_br &catp_done
+    b
+:catp_plain
+    ld_a0,sp,0
+    ld_a1,sp,8
+    la_br &copy_span_to_pool
+    call
+:catp_done
+    eret
+
+## copy_paste_arg_to_pool(a0=arg_start, a1=arg_end) -> void (fatal unless len 1)
+## Enforces the single-token-argument rule for params adjacent to ##.
+## Braced args are rejected — pasting onto a block is nonsense.
+:copy_paste_arg_to_pool
+    enter_16
+    # spill a0/a1 for the arg_is_braced call
+    st_a0,sp,0
+    st_a1,sp,8
+    la_br &arg_is_braced
+    call
+    la_br &err_bad_macro_header
+    bnez_a0
+    ld_a0,sp,0
+    ld_a1,sp,8
+    # if ((arg_end - arg_start) != 24) fatal
+    sub_a2,a1,a0
+    li_a3 M1PP_TOK_SIZE
+    la_br &err_bad_macro_header
+    bne_a2,a3
+    la_br &copy_span_to_pool
+    call
+    eret
+
+## expand_macro_tokens(a0=call_tok, a1=limit, a2=macro_ptr) -> void (fatal on bad)
+## Requires call_tok+1 is TOK_LPAREN. Runs parse_args(call_tok+1, limit),
+## verifies arg_count == macro->param_count, walks macro body, substituting
+## each param token via copy_arg_tokens_to_pool (or copy_paste_arg_to_pool
+## when adjacent to ##), copying other body tokens as-is, then runs
+## paste_pool_range over the newly-written slice.
+##
+## Outputs via globals (callers must snapshot before any nested call that
+## could overwrite them):
+##   emt_after_pos = token one past the matching ')' (= call_end_pos)
+##   emt_mark      = pool_used as of entry (start of expansion slice)
+##
+:expand_macro_tokens
+    enter_0
+
+    # Snapshot inputs into BSS (find_param/copy_*/paste_pool_range clobber regs).
+    la_a3 &emt_call_tok
+    st_a0,a3,0
+    la_a3 &emt_limit
+    st_a1,a3,0
+    la_a3 &emt_macro
+    st_a2,a3,0
+
+    # lparen = call_tok + 24
+    addi_a0,a0,32
+
+    # Branch split for paren-less 0-arg calls:
+    #   if lparen < limit AND lparen->kind == TOK_LPAREN: parse_args as usual.
+    #   else if macro->param_count == 0: synthesize empty arg list, no parse_args.
+    #   else: fatal "bad macro call".
+
+    # if (lparen >= limit) goto emt_try_zero_arg
+    la_br &emt_try_zero_arg
+    beq_a0,a1
+    la_br &emt_try_zero_arg
+    blt_a1,a0
+
+    # if (lparen->kind != TOK_LPAREN) goto emt_try_zero_arg
+    ld_a2,a0,0
+    li_a3 TOK_LPAREN
+    la_br &emt_try_zero_arg
+    bne_a2,a3
+
+    # if (!lparen->tight) goto emt_try_zero_arg — `%FOO ( ... )` with a space
+    # is a paren-less zero-arg call followed by a literal `(`.
+    ld_a2,a0,24
+    la_br &emt_try_zero_arg
+    beqz_a2
+
+    # parse_args(lparen, limit)
+    # a0 already lparen; a1 already limit
+    la_br &parse_args
+    call
+
+    # Snapshot args_have_paste -> emt_saw_arg_paste BEFORE the body loop
+    # potentially runs nested expansions that would clobber the global. This
+    # snapshot is OR'd with macro->has_paste at emt_done to decide whether
+    # to run paste_pool_range.
+    la_a0 &args_have_paste
+    ld_t0,a0,0
+    la_a1 &emt_saw_arg_paste
+    st_t0,a1,0
+
+    # Check arg_count == macro->param_count
+    la_a0 &arg_count
+    ld_t0,a0,0
+    la_a0 &emt_macro
+    ld_t1,a0,0
+    ld_t1,t1,16
+    la_br &err_bad_macro_header
+    bne_t0,t1
+
+    # expansion_id = ++next_expansion_id (monotonic; used by local-label
+    # rewriting in the body-copy path to rename :@name / &@name tokens).
+    la_a0 &next_expansion_id
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+    la_a1 &emt_expansion_id
+    st_t0,a1,0
+
+    # Snapshot call_end_pos -> emt_after_pos before the body walk, so
+    # nothing in the substitution loop can clobber the resume position.
+    la_a0 &call_end_pos
+    ld_t0,a0,0
+    la_a1 &emt_after_pos
+    st_t0,a1,0
+    la_br &emt_after_arg_setup
+    b
+
+:emt_try_zero_arg
+    # No trailing LPAREN. Allowed only if macro->param_count == 0.
+    la_a0 &emt_macro
+    ld_t1,a0,0
+    ld_t1,t1,16
+    la_br &err_bad_macro_header
+    bnez_t1
+
+    # No parse_args ran in this branch; args_have_paste from a stale earlier
+    # call MUST NOT leak into emt_saw_arg_paste. Force it to 0 so emt_done's
+    # paste-gate uses only macro->has_paste here.
+    li_t0 %0 %0
+    la_a1 &emt_saw_arg_paste
+    st_t0,a1,0
+
+    # arg_count = 0
+    la_a0 &arg_count
+    li_t0 %0 %0
+    st_t0,a0,0
+
+    # emt_after_pos = call_tok + 24
+    la_a0 &emt_call_tok
+    ld_t0,a0,0
+    addi_t0,t0,32
+    la_a1 &emt_after_pos
+    st_t0,a1,0
+
+:emt_after_arg_setup
+
+    # mark = pool_used; emt_mark = mark
+    la_a0 &pool_used
+    ld_t0,a0,0
+    la_a1 &emt_mark
+    st_t0,a1,0
+
+    # body_pos = macro->body_start; body_end = macro->body_end
+    la_a0 &emt_macro
+    ld_t1,a0,0
+    li_a2 M1PP_MACRO_BODY_START_OFF
+    add_a3,t1,a2
+    ld_a3,a3,0
+    la_a0 &emt_body_pos
+    st_a3,a0,0
+    la_a0 &emt_body_start
+    st_a3,a0,0
+    li_a2 M1PP_MACRO_BODY_END_OFF
+    add_a3,t1,a2
+    ld_a3,a3,0
+    la_a0 &emt_body_end
+    st_a3,a0,0
+
+:emt_loop
+    # if (body_pos == body_end) break
+    la_a0 &emt_body_pos
+    ld_t0,a0,0
+    la_a1 &emt_body_end
+    ld_t1,a1,0
+    la_br &emt_done
+    beq_t0,t1
+
+    # Cached param_idx = macro_body_param_idx[(body_pos - macro_body_tokens) / 32].
+    # Set at %macro define time so the body loop never has to call find_param.
+    la_a1 &macro_body_tokens_ptr
+    ld_a1,a1,0
+    sub_a0,t0,a1
+    shri_a0,a0,5
+    la_a1 &macro_body_param_idx_ptr
+    ld_a1,a1,0
+    add_a1,a1,a0
+    lb_a0,a1,0
+    # Spill for emt_do_substitute_paste / _plain (no need to re-derive).
+    la_a1 &emt_cached_param_idx
+    st_a0,a1,0
+
+    # if (param_idx == 0) body-native token: check for local-label rewrite,
+    # else fall through to substitute logic.
+    la_br &emt_check_local_label
+    beqz_a0
+
+    # param_idx != 0: substitute. The emt_do_substitute_* paths read
+    # emt_cached_param_idx (no re-call to find_param).
+
+    # Reload body_pos for the pasted-classification loads.
+    la_a0 &emt_body_pos
+    ld_t0,a0,0
+
+    # Compute pasted = (body_pos > body_start AND (body_pos - 24)->kind == TOK_PASTE)
+    #                  OR (body_pos + 24 < body_end AND (body_pos + 24)->kind == TOK_PASTE)
+    la_a1 &emt_body_start
+    ld_t1,a1,0
+
+    # Branch to emt_check_after if body_pos == body_start
+    la_br &emt_check_after
+    beq_t0,t1
+
+    # prev_kind = (body_pos - 24)->kind
+    addi_t2,t0,neg32
+    ld_a2,t2,0
+    li_a3 TOK_PASTE
+    la_br &emt_pasted
+    beq_a2,a3
+
+:emt_check_after
+    # next_pos = body_pos + 24; if (next_pos >= body_end) skip
+    addi_t2,t0,32
+    la_a1 &emt_body_end
+    ld_a3,a1,0
+    # if (next_pos == body_end) -> not pasted (need next_pos < body_end)
+    la_br &emt_not_pasted
+    beq_t2,a3
+    # next_kind = next_pos->kind
+    ld_a2,t2,0
+    li_a3 TOK_PASTE
+    la_br &emt_pasted
+    beq_a2,a3
+    la_br &emt_not_pasted
+    b
+
+:emt_pasted
+    # body_pos is a param adjacent to ##: substitute one-token arg.
+    la_br &emt_do_substitute_paste
+    b
+
+:emt_not_pasted
+    # body_pos is a param NOT adjacent to ##: substitute arg span.
+    la_br &emt_do_substitute_plain
+    b
+
+## emt_check_local_label: read the cached macro_body_is_local_label[]
+## flag (set at %macro define time). 0 -> emt_copy_literal copies the
+## body token verbatim; 1 -> falls through to emt_rewrite_local_label.
+## Replaces the per-expansion ':@' / '&@' / '@' predicate that used to
+## live inline here.
+:emt_check_local_label
+    la_a0 &emt_body_pos
+    ld_t0,a0,0
+    la_a1 &macro_body_tokens_ptr
+    ld_a1,a1,0
+    sub_a0,t0,a1
+    shri_a0,a0,5
+    la_a1 &macro_body_is_local_label_ptr
+    ld_a1,a1,0
+    add_a1,a1,a0
+    lb_a0,a1,0
+    la_br &emt_copy_literal
+    beqz_a0
+    # Cached flag is 1: fall through to rewrite.
+
+## emt_rewrite_local_label: build "sigil + tail + __ + decimal(NN)" in
+## local_label_scratch, stash it into text_buf via append_text, and push
+## a TOK_WORD to expand_pool.
+:emt_rewrite_local_label
+    # Stash body_tok text_ptr / text_len into BSS so they survive
+    # function calls (append_text is non-leaf via its arena bump).
+    la_a0 &emt_body_pos
+    ld_t0,a0,0
+    ld_a1,t0,8
+    la_a2 &ll_src_ptr
+    st_a1,a2,0
+    ld_a1,t0,16
+    la_a2 &ll_src_len
+    st_a1,a2,0
+
+    # --- Convert emt_expansion_id to decimal, reverse-fill into
+    # --- local_label_digits[0..24). Write right-to-left starting at
+    # --- offset 23 so digits are adjacent at [cursor, &scratch+24).
+    la_a0 &emt_expansion_id
+    ld_t0,a0,0                 # t0 = id (mutated)
+    la_t1 &local_label_digits
+    li_a2 %24 %0
+    add_t1,t1,a2               # t1 = end (one past last slot)
+    mov_t2,t1                  # t2 = cursor (moves left)
+
+    # Special-case id == 0 -> single '0' digit.
+    la_br &emt_rldg_loop
+    bnez_t0
+    addi_t2,t2,neg1
+    li_a0 %48 %0
+    sb_a0,t2,0
+    la_br &emt_rldg_done
+    b
+:emt_rldg_loop
+    la_br &emt_rldg_done
+    beqz_t0
+    # digit = id % 10
+    mov_a0,t0
+    li_a1 %10 %0
+    rem_a2,a0,a1               # a2 = id % 10
+    addi_a2,a2,48              # a2 = '0' + digit
+    addi_t2,t2,neg1
+    sb_a2,t2,0                 # *--cursor = digit
+    # id = id / 10
+    mov_a0,t0
+    li_a1 %10 %0
+    div_a0,a0,a1
+    mov_t0,a0
+    la_br &emt_rldg_loop
+    b
+:emt_rldg_done
+    # digit_count = end - cursor
+    la_a1 &local_label_digits
+    li_a2 %24 %0
+    add_a1,a1,a2               # a1 = end
+    sub_a0,a1,t2               # a0 = digit_count
+    la_a1 &ll_digit_count
+    st_a0,a1,0
+    # Save cursor (start of digits) for the copy step.
+    la_a1 &ll_digit_cursor
+    st_t2,a1,0
+
+    # --- Build final text in local_label_scratch ---
+    # Layout: [0]=sigil, [1..1+tail_len)=tail, then "__", then digits.
+    # tail_len = len - 2
+
+    # Write sigil (src_ptr[0]) to scratch[0].
+    la_a0 &ll_src_ptr
+    ld_a1,a0,0
+    lb_a2,a1,0
+    la_a3 &local_label_scratch_ptr
+    ld_a3,a3,0
+    sb_a2,a3,0
+
+    # Copy tail: scratch[1..1+tail_len) <- src_ptr[2..2+tail_len).
+    la_a0 &ll_src_len
+    ld_a1,a0,0
+    li_a2 %2 %0
+    sub_t0,a1,a2               # t0 = tail_len = src_len - 2
+    la_a0 &ll_src_ptr
+    ld_a1,a0,0                 # a1 = src_ptr
+    addi_a1,a1,2               # a1 = src_ptr + 2 (tail start)
+    la_a2 &local_label_scratch_ptr
+    ld_a2,a2,0
+    addi_a2,a2,1               # a2 = scratch + 1 (dst tail start)
+    li_t1 %0 %0                # t1 = i
+:emt_rlbuild_tail_loop
+    la_br &emt_rlbuild_tail_done
+    beq_t1,t0
+    add_a3,a1,t1
+    lb_a3,a3,0
+    add_t2,a2,t1
+    sb_a3,t2,0
+    addi_t1,t1,1
+    la_br &emt_rlbuild_tail_loop
+    b
+:emt_rlbuild_tail_done
+    # Save tail_len for later offset math.
+    la_a0 &ll_tail_len
+    st_t0,a0,0
+
+    # Write "__" at scratch[1+tail_len], scratch[2+tail_len].
+    la_a2 &local_label_scratch_ptr
+    ld_a2,a2,0
+    addi_a2,a2,1
+    add_a2,a2,t0               # a2 = &scratch[1+tail_len]
+    li_a3 %95 %0               # '_'
+    sb_a3,a2,0
+    addi_a2,a2,1
+    sb_a3,a2,0
+
+    # Copy digits: scratch[3+tail_len..3+tail_len+digit_count) <- digit_cursor[0..digit_count).
+    la_a0 &ll_digit_count
+    ld_t1,a0,0                 # t1 = digit_count
+    la_a0 &ll_digit_cursor
+    ld_a1,a0,0                 # a1 = digit_cursor (src)
+    la_a0 &ll_tail_len
+    ld_t0,a0,0                 # t0 = tail_len
+    la_a2 &local_label_scratch_ptr
+    ld_a2,a2,0
+    addi_a2,a2,3
+    add_a2,a2,t0               # a2 = &scratch[3+tail_len] (dst)
+    li_t2 %0 %0                # t2 = i
+:emt_rlbuild_digits_loop
+    la_br &emt_rlbuild_digits_done
+    beq_t2,t1
+    add_a3,a1,t2
+    lb_a3,a3,0
+    add_a0,a2,t2
+    sb_a3,a0,0
+    addi_t2,t2,1
+    la_br &emt_rlbuild_digits_loop
+    b
+:emt_rlbuild_digits_done
+
+    # total_len = 1 + tail_len + 2 + digit_count = 3 + tail_len + digit_count
+    la_a0 &ll_tail_len
+    ld_a1,a0,0
+    la_a0 &ll_digit_count
+    ld_a2,a0,0
+    add_a1,a1,a2
+    addi_a1,a1,3
+    la_a0 &ll_total_len
+    st_a1,a0,0
+
+    # durable_ptr = append_text(&local_label_scratch, total_len)
+    la_a0 &local_label_scratch_ptr
+    ld_a0,a0,0
+    la_br &append_text
+    call
+    # a0 = durable_ptr (into text_buf)
+
+    # Push TOK_WORD { kind=0, text_ptr=durable_ptr, text_len=total_len } to expand_pool.
+    la_a1 &pool_used
+    ld_t0,a1,0
+    li_a2 M1PP_EXPAND_CAP
+    la_br &err_token_overflow
+    beq_t0,a2
+    la_a3 &expand_pool_ptr
+    ld_a3,a3,0
+    add_a3,a3,t0               # a3 = dst slot
+    # kind = TOK_WORD
+    li_a2 TOK_WORD
+    st_a2,a3,0
+    # text_ptr
+    st_a0,a3,8
+    # text_len
+    la_a0 &ll_total_len
+    ld_a2,a0,0
+    st_a2,a3,16
+    # tight = 0 (synthetic local-label token)
+    li_a2 %0 %0
+    st_a2,a3,24
+    # pool_used += 32
+    addi_t0,t0,32
+    la_a1 &pool_used
+    st_t0,a1,0
+
+    # body_pos += 32
+    la_a0 &emt_body_pos
+    ld_t0,a0,0
+    addi_t0,t0,32
+    st_t0,a0,0
+    la_br &emt_loop
+    b
+
+:emt_copy_literal
+    # Append *body_pos to expand_pool. Check overflow.
+    la_a0 &pool_used
+    ld_t0,a0,0
+    li_a1 M1PP_EXPAND_CAP
+    la_br &err_token_overflow
+    beq_t0,a1
+    # dst = &expand_pool + pool_used
+    la_a2 &expand_pool_ptr
+    ld_a2,a2,0
+    add_a2,a2,t0
+    # src = body_pos
+    la_a0 &emt_body_pos
+    ld_a3,a0,0
+    # copy 32 bytes (4 x 8) — preserves tight at +24
+    ld_a0,a3,0
+    st_a0,a2,0
+    ld_a0,a3,8
+    st_a0,a2,8
+    ld_a0,a3,16
+    st_a0,a2,16
+    ld_a0,a3,24
+    st_a0,a2,24
+    # pool_used += 32
+    addi_t0,t0,32
+    la_a0 &pool_used
+    st_t0,a0,0
+    # body_pos += 32
+    addi_a3,a3,32
+    la_a0 &emt_body_pos
+    st_a3,a0,0
+    la_br &emt_loop
+    b
+
+:emt_do_substitute_paste
+    # Use the cached param_idx (set at the top of emt_loop) instead of
+    # re-running find_param.
+    la_a0 &emt_cached_param_idx
+    ld_a0,a0,0
+    addi_a0,a0,neg1
+    shli_a0,a0,3
+    la_a1 &arg_starts_ptr
+    ld_a1,a1,0
+    add_a1,a1,a0
+    ld_t0,a1,0
+    la_a1 &arg_ends_ptr
+    ld_a1,a1,0
+    add_a1,a1,a0
+    ld_t1,a1,0
+    mov_a0,t0
+    mov_a1,t1
+    la_br &copy_paste_arg_to_pool
+    call
+    # body_pos += 24
+    la_a0 &emt_body_pos
+    ld_t0,a0,0
+    addi_t0,t0,32
+    st_t0,a0,0
+    la_br &emt_loop
+    b
+
+:emt_do_substitute_plain
+    # Use the cached param_idx (set at the top of emt_loop) instead of
+    # re-running find_param.
+    la_a0 &emt_cached_param_idx
+    ld_a0,a0,0
+    addi_a0,a0,neg1
+    shli_a0,a0,3
+    la_a1 &arg_starts_ptr
+    ld_a1,a1,0
+    add_a1,a1,a0
+    ld_t0,a1,0
+    la_a1 &arg_ends_ptr
+    ld_a1,a1,0
+    add_a1,a1,a0
+    ld_t1,a1,0
+    mov_a0,t0
+    mov_a1,t1
+    la_br &copy_arg_tokens_to_pool
+    call
+    # body_pos += 24
+    la_a0 &emt_body_pos
+    ld_t0,a0,0
+    addi_t0,t0,32
+    st_t0,a0,0
+    la_br &emt_loop
+    b
+
+:emt_done
+    # Gate paste_pool_range(mark) on (macro->has_paste OR emt_saw_arg_paste).
+    # When neither side contains TOK_PASTE the pool sweep is wasted work — the
+    # whole point of has_paste / args_have_paste is to skip it for the common
+    # case of a `##`-free expansion.
+    la_a0 &emt_macro
+    ld_t0,a0,0
+    li_a1 M1PP_MACRO_HAS_PASTE_OFF
+    add_t0,t0,a1
+    ld_t0,t0,0
+    la_a0 &emt_saw_arg_paste
+    ld_t1,a0,0
+    or_t0,t0,t1
+    la_br &emt_done_skip_paste
+    beqz_t0
+    la_a0 &emt_mark
+    ld_a0,a0,0
+    la_br &paste_pool_range
+    call
+
+:emt_done_skip_paste
+    eret
+
+## expand_call(a0=stream_ptr, a1=macro_ptr) -> void (fatal on bad call)
+## Calls expand_macro_tokens for the call at stream->pos, sets
+## stream->pos = emt_after_pos, stream->line_start = 0, and
+## push_pool_stream_from_mark(emt_mark) to rescan the expansion.
+:expand_call
+    enter_8
+
+    # spill stream_ptr to local frame slot (sp+16 is the first local; sp+0/+8
+    # hold the saved return address and saved caller sp).
+    st_a0,sp,0
+
+    # expand_macro_tokens(stream->pos, stream->end, macro)
+    # stream->pos at +16, stream->end at +8
+    ld_t0,a0,16
+    ld_t1,a0,8
+    mov_a2,a1
+    mov_a0,t0
+    mov_a1,t1
+    la_br &expand_macro_tokens
+    call
+
+    # stream->pos = emt_after_pos
+    ld_a0,sp,0
+    la_a1 &emt_after_pos
+    ld_t0,a1,0
+    st_t0,a0,16
+
+    # stream->line_start = 0
+    li_t0 %0 %0
+    st_t0,a0,24
+
+    # push_pool_stream_from_mark(emt_mark)
+    la_a0 &emt_mark
+    ld_a0,a0,0
+    la_br &push_pool_stream_from_mark
+    call
+
+    eret
+
+## ============================================================================
+## --- ## token paste compaction ----------------------------------------------
+## ============================================================================
+
+## append_pasted_token(a0=dst_tok, a1=left_tok, a2=right_tok) -> void (fatal)
+## Concatenate left->text and right->text into paste_scratch, then call
+## append_text(&paste_scratch, total_len) for stable storage in text_buf,
+## and write *dst = { TOK_WORD, text_ptr, total_len }. paste_scratch is
+## 256 bytes (M0's quoted-literal cap). Fatal err_text_overflow if combined
+## length exceeds 256 bytes; append_text handles its own text_buf overflow.
+:append_pasted_token
+    enter_0
+
+    # ---- Spill all three operands to BSS so we can survive append_text. ----
+    la_t0 &paste_dst_save
+    st_a0,t0,0
+    la_t0 &paste_left_ptr
+    ld_t1,a1,8
+    st_t1,t0,0
+    la_t0 &paste_left_len
+    ld_t1,a1,16
+    st_t1,t0,0
+    la_t0 &paste_right_ptr
+    ld_t1,a2,8
+    st_t1,t0,0
+    la_t0 &paste_right_len
+    ld_t1,a2,16
+    st_t1,t0,0
+
+    # ---- total_len = left.len + right.len; fatal if > 256 ----
+    la_t0 &paste_left_len
+    ld_t1,t0,0
+    la_t0 &paste_right_len
+    ld_t2,t0,0
+    add_a0,t1,t2
+    li_a1 %256 %0
+    la_br &err_text_overflow
+    blt_a1,a0
+    # save total_len for the append_text call below
+    la_t0 &paste_total_len
+    st_a0,t0,0
+
+    # ---- Copy left bytes: paste_scratch[0..left.len) <- left.text_ptr ----
+    la_t0 &paste_left_ptr
+    ld_t0,t0,0
+    la_t1 &paste_left_len
+    ld_t1,t1,0
+    la_t2 &paste_scratch_ptr
+    ld_t2,t2,0
+    li_a0 %0 %0
+:append_pasted_left_loop
+    la_br &append_pasted_left_done
+    beq_a0,t1
+    add_a1,t0,a0
+    lb_a1,a1,0
+    add_a2,t2,a0
+    sb_a1,a2,0
+    addi_a0,a0,1
+    la_br &append_pasted_left_loop
+    b
+:append_pasted_left_done
+
+    # ---- Copy right bytes: paste_scratch[left.len..total_len) <- right.text_ptr ----
+    la_t0 &paste_right_ptr
+    ld_t0,t0,0
+    la_t1 &paste_right_len
+    ld_t1,t1,0
+    la_t2 &paste_scratch_ptr
+    ld_t2,t2,0
+    la_a3 &paste_left_len
+    ld_a3,a3,0
+    add_t2,t2,a3              # t2 = &paste_scratch[left.len]
+    li_a0 %0 %0
+:append_pasted_right_loop
+    la_br &append_pasted_right_done
+    beq_a0,t1
+    add_a1,t0,a0
+    lb_a1,a1,0
+    add_a2,t2,a0
+    sb_a1,a2,0
+    addi_a0,a0,1
+    la_br &append_pasted_right_loop
+    b
+:append_pasted_right_done
+
+    # ---- text_ptr = append_text(&paste_scratch, total_len) ----
+    la_a0 &paste_scratch_ptr
+    ld_a0,a0,0
+    la_a1 &paste_total_len
+    ld_a1,a1,0
+    la_br &append_text
+    call
+    # a0 = text_ptr (returned)
+
+    # ---- *dst = { TOK_WORD, text_ptr, total_len, tight=0 } ----
+    la_t0 &paste_dst_save
+    ld_t0,t0,0
+    li_a2 TOK_WORD
+    st_a2,t0,0
+    st_a0,t0,8
+    la_a1 &paste_total_len
+    ld_a1,a1,0
+    st_a1,t0,16
+    li_a1 %0 %0
+    st_a1,t0,24
+
+    eret
+
+## paste_pool_range(a0=mark) -> void (fatal on bad paste)
+## In-place compactor over expand_pool[mark..pool_used). For each TOK_PASTE,
+## walk back from `out` over already-copied NEWLINE tokens to find the left
+## operand, walk forward from `in+1` over NEWLINE tokens to find the right
+## operand, then paste left+right into the left slot. The discarded newlines
+## on either side are dropped. Copy other tokens forward. Update pool_used
+## to the new end. Fatal if ## has no operand on a side, or its operand is
+## itself PASTE.
+:paste_pool_range
+    enter_0
+
+    # ---- start = expand_pool + mark ----
+    la_t0 &expand_pool_ptr
+    ld_t0,t0,0
+    add_t0,t0,a0
+    la_t1 &paste_start
+    st_t0,t1,0
+    # paste_in = start
+    la_t1 &paste_in
+    st_t0,t1,0
+    # paste_out = start
+    la_t1 &paste_out
+    st_t0,t1,0
+
+    # ---- end = expand_pool + pool_used ----
+    la_t1 &pool_used
+    ld_t2,t1,0
+    la_t1 &expand_pool_ptr
+    ld_t1,t1,0
+    add_t2,t1,t2
+    la_t1 &paste_end
+    st_t2,t1,0
+
+:paste_pool_loop
+    # in = paste_in; end = paste_end; if (in == end) done
+    la_a0 &paste_in
+    ld_t0,a0,0
+    la_a1 &paste_end
+    ld_t1,a1,0
+    la_br &paste_pool_done
+    beq_t0,t1
+
+    # kind = in->kind
+    ld_a2,t0,0
+    li_a3 TOK_PASTE
+    la_br &paste_pool_handle_paste
+    beq_a2,a3
+
+    # ---- non-PASTE: copy *in to *out, advance both by 32 ----
+    la_a0 &paste_out
+    ld_t2,a0,0
+    # if (in == out) skip the copy
+    la_br &paste_pool_skip_copy
+    beq_t0,t2
+    ld_a3,t0,0
+    st_a3,t2,0
+    ld_a3,t0,8
+    st_a3,t2,8
+    ld_a3,t0,16
+    st_a3,t2,16
+    ld_a3,t0,24
+    st_a3,t2,24
+:paste_pool_skip_copy
+    addi_t0,t0,32
+    addi_t2,t2,32
+    la_a0 &paste_in
+    st_t0,a0,0
+    la_a0 &paste_out
+    st_t2,a0,0
+    la_br &paste_pool_loop
+    b
+
+:paste_pool_handle_paste
+    # ---- TOK_PASTE handling ----
+    # Find left operand: start at out, walk back over NEWLINE tokens, then
+    # step one more to land on the actual left operand. If we cannot step
+    # back past start, the ## has no left operand -> fatal.
+    la_a0 &paste_out
+    ld_t1,a0,0                   # t1 = left (initially = out)
+    la_a1 &paste_start
+    ld_t2,a1,0                   # t2 = start
+:paste_pool_left_skip_nl
+    la_br &paste_pool_left_step
+    beq_t1,t2
+    ld_a2,t1,neg32
+    li_a3 TOK_NEWLINE
+    la_br &paste_pool_left_step
+    bne_a2,a3
+    addi_t1,t1,neg32
+    la_br &paste_pool_left_skip_nl
+    b
+:paste_pool_left_step
+    # left == start? then ## is first (fatal).
+    la_br &err_bad_macro_header
+    beq_t1,t2
+    addi_t1,t1,neg32             # left now points at the operand
+    # Validate left->kind != TOK_PASTE.
+    ld_a2,t1,0
+    li_a3 TOK_PASTE
+    la_br &err_bad_macro_header
+    beq_a2,a3
+
+    # Find right operand: start at in+1, walk forward over NEWLINE tokens.
+    # If we run out of tokens, ## is last (fatal). If right is PASTE, fatal.
+    addi_t0,t0,32                # t0 = right (initially = in + 1)
+    la_a1 &paste_end
+    ld_a2,a1,0                   # a2 = end
+:paste_pool_right_skip_nl
+    la_br &err_bad_macro_header
+    beq_t0,a2
+    ld_a3,t0,0
+    li_a1 TOK_NEWLINE
+    la_br &paste_pool_right_step
+    bne_a3,a1
+    addi_t0,t0,32
+    la_br &paste_pool_right_skip_nl
+    b
+:paste_pool_right_step
+    # Validate right->kind != TOK_PASTE.
+    li_a1 TOK_PASTE
+    la_br &err_bad_macro_header
+    beq_a3,a1
+
+    # Pre-publish out = left + 1 and in = right + 1, since the call below
+    # clobbers the t* / a* registers we used to track them.
+    addi_a3,t1,32
+    la_a1 &paste_out
+    st_a3,a1,0
+    addi_a3,t0,32
+    la_a1 &paste_in
+    st_a3,a1,0
+
+    # append_pasted_token(left, left, right)
+    mov_a0,t1
+    mov_a1,t1
+    mov_a2,t0
+    la_br &append_pasted_token
+    call
+
+    la_br &paste_pool_loop
+    b
+
+:paste_pool_done
+    # pool_used = (out - expand_pool)
+    la_a0 &paste_out
+    ld_t0,a0,0
+    la_a1 &expand_pool_ptr
+    ld_a1,a1,0
+    sub_t0,t0,a1
+    la_a1 &pool_used
+    st_t0,a1,0
+    eret
+
+## ============================================================================
+## --- Integer atoms + S-expression evaluator ---------------------------------
+## ============================================================================
+
+## parse_int_token(a0=tok) -> a0 = i64 (fatal on bad). Leaf.
+## Accepts decimal (optional leading '-') and 0x-prefixed hex. Positive
+## values are accumulated as u64 and reinterpreted as i64, so values with
+## the high bit set wrap to negative i64.
+##
+## Register usage (leaf, no calls):
+##   t0 = src ptr (cursor into text)
+##   t1 = end ptr (text + len)
+##   t2 = current byte
+##   a0 = accumulator (return)
+##   a1 = negative flag (0/1)
+##   a2 = scratch (digit, multiplier)
+##   a3 = scratch (compare value)
+:parse_int_token
+    # if (tok->kind != TOK_WORD) fatal
+    ld_t0,a0,0
+    li_t1 TOK_WORD
+    la_br &err_bad_macro_header
+    bne_t0,t1
+
+    # src = tok->text_ptr; len = tok->text_len; end = src + len
+    ld_t0,a0,8
+    ld_t1,a0,16
+
+    # if (len <= 0) fatal
+    la_br &err_bad_macro_header
+    beqz_t1
+    add_t1,t0,t1
+
+    # negative = 0
+    li_a1 %0 %0
+
+    # if (*src == '-') { negative = 1; src++; if (src == end) fatal }
+    lb_t2,t0,0
+    li_a3 %45 %0
+    la_br &pit_after_sign
+    bne_t2,a3
+    li_a1 %1 %0
+    addi_t0,t0,1
+    la_br &err_bad_macro_header
+    beq_t0,t1
+
+:pit_after_sign
+    # accumulator = 0
+    li_a0 %0 %0
+
+    # check for 0x / 0X prefix: need at least 2 chars left
+    mov_a2,t1
+    sub_a2,a2,t0
+    li_a3 %2 %0
+    la_br &pit_decimal
+    blt_a2,a3
+
+    # if (src[0] == '0' && (src[1] == 'x' || src[1] == 'X')) -> hex
+    lb_t2,t0,0
+    li_a3 %48 %0
+    la_br &pit_decimal
+    bne_t2,a3
+    addi_a2,t0,1
+    lb_a2,a2,0
+    li_a3 %120 %0
+    la_br &pit_hex_start
+    beq_a2,a3
+    li_a3 %88 %0
+    la_br &pit_hex_start
+    beq_a2,a3
+    la_br &pit_decimal
+    b
+
+:pit_hex_start
+    # consume "0x"; require at least one hex digit after
+    addi_t0,t0,2
+    la_br &err_bad_macro_header
+    beq_t0,t1
+:pit_hex_loop
+    la_br &pit_finish
+    beq_t0,t1
+    lb_t2,t0,0
+
+    # 0..9
+    li_a3 %48 %0
+    la_br &pit_hex_check_lower
+    blt_t2,a3
+    li_a3 %57 %0
+    la_br &pit_hex_check_lower
+    blt_a3,t2
+    # digit = c - '0'
+    addi_a2,t2,neg48
+    la_br &pit_hex_accum
+    b
+
+:pit_hex_check_lower
+    # 'a'..'f'
+    li_a3 %97 %0
+    la_br &pit_hex_check_upper
+    blt_t2,a3
+    li_a3 %102 %0
+    la_br &pit_hex_check_upper
+    blt_a3,t2
+    # digit = (c - 'a') + 10
+    li_a3 %97 %0
+    sub_a2,t2,a3
+    addi_a2,a2,8
+    addi_a2,a2,2
+    la_br &pit_hex_accum
+    b
+
+:pit_hex_check_upper
+    # 'A'..'F'
+    li_a3 %65 %0
+    la_br &err_bad_macro_header
+    blt_t2,a3
+    li_a3 %70 %0
+    la_br &err_bad_macro_header
+    blt_a3,t2
+    # digit = (c - 'A') + 10
+    li_a3 %65 %0
+    sub_a2,t2,a3
+    addi_a2,a2,8
+    addi_a2,a2,2
+
+:pit_hex_accum
+    # accum = (accum << 4) | digit
+    shli_a0,a0,4
+    or_a0,a0,a2
+    addi_t0,t0,1
+    la_br &pit_hex_loop
+    b
+
+:pit_decimal
+    # decimal loop: accum = accum * 10 + digit
+    # (caller already ensured len > 0 and that src points to first digit)
+:pit_decimal_loop
+    la_br &pit_finish
+    beq_t0,t1
+    lb_t2,t0,0
+    li_a3 %48 %0
+    la_br &err_bad_macro_header
+    blt_t2,a3
+    li_a3 %57 %0
+    la_br &err_bad_macro_header
+    blt_a3,t2
+    # accum = accum * 10
+    li_a3 %10 %0
+    mul_a0,a0,a3
+    # digit = c - '0'; accum += digit
+    addi_a2,t2,neg48
+    add_a0,a0,a2
+    addi_t0,t0,1
+    la_br &pit_decimal_loop
+    b
+
+:pit_finish
+    # if (negative) accum = 0 - accum
+    la_br &pit_done
+    beqz_a1
+    li_a3 %0 %0
+    sub_a0,a3,a0
+:pit_done
+    ret
+
+## expr_op_code(a0=tok) -> a0 = EXPR_ADD..EXPR_STRLEN, or EXPR_INVALID.
+## Accepts operator tokens: +  -  *  /  %  <<  >>  &  |  ^  ~  =  !=
+## <  <=  >  >=  strlen. Non-WORD tok or unknown operator -> EXPR_INVALID.
+##
+## tok_eq_const is a leaf but clobbers a0..a3,t0..t2; spill tok to eoc_tok
+## once, reload before each compare. Needs an enter_0 frame because it
+## issues `call` instructions (aarch64 CALL writes LR).
+:expr_op_code
+    enter_0
+    # spill tok; reject non-WORD up front
+    la_a1 &eoc_tok
+    st_a0,a1,0
+    ld_t0,a0,0
+    li_t1 TOK_WORD
+    la_br &eoc_invalid
+    bne_t0,t1
+
+    # "+" -> EXPR_ADD
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_plus
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_add
+    bnez_a0
+
+    # "-" -> EXPR_SUB
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_minus
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_sub
+    bnez_a0
+
+    # "*" -> EXPR_MUL
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_star
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_mul
+    bnez_a0
+
+    # "/" -> EXPR_DIV
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_slash
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_div
+    bnez_a0
+
+    # "%" -> EXPR_MOD
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_percent
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_mod
+    bnez_a0
+
+    # "<<" -> EXPR_SHL
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_shl
+    li_a2 %2 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_shl
+    bnez_a0
+
+    # ">>" -> EXPR_SHR
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_shr
+    li_a2 %2 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_shr
+    bnez_a0
+
+    # "&" -> EXPR_AND
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_amp
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_and
+    bnez_a0
+
+    # "|" -> EXPR_OR
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_bar
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_or
+    bnez_a0
+
+    # "^" -> EXPR_XOR
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_caret
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_xor
+    bnez_a0
+
+    # "~" -> EXPR_NOT
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_tilde
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_not
+    bnez_a0
+
+    # "=" -> EXPR_EQ
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_eq
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_eq
+    bnez_a0
+
+    # "!=" -> EXPR_NE
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_ne
+    li_a2 %2 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_ne
+    bnez_a0
+
+    # "<=" -> EXPR_LE (check before single "<")
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_le
+    li_a2 %2 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_le
+    bnez_a0
+
+    # "<" -> EXPR_LT
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_lt
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_lt
+    bnez_a0
+
+    # ">=" -> EXPR_GE (check before single ">")
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_ge
+    li_a2 %2 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_ge
+    bnez_a0
+
+    # ">" -> EXPR_GT
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_gt
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_gt
+    bnez_a0
+
+    # "strlen" -> EXPR_STRLEN
+    la_a0 &eoc_tok
+    ld_a0,a0,0
+    la_a1 &op_strlen
+    li_a2 %6 %0
+    la_br &tok_eq_const
+    call
+    la_br &eoc_strlen
+    bnez_a0
+
+:eoc_invalid
+    li_a0 EXPR_INVALID
+    eret
+:eoc_add
+    li_a0 EXPR_ADD
+    eret
+:eoc_sub
+    li_a0 EXPR_SUB
+    eret
+:eoc_mul
+    li_a0 EXPR_MUL
+    eret
+:eoc_div
+    li_a0 EXPR_DIV
+    eret
+:eoc_mod
+    li_a0 EXPR_MOD
+    eret
+:eoc_shl
+    li_a0 EXPR_SHL
+    eret
+:eoc_shr
+    li_a0 EXPR_SHR
+    eret
+:eoc_and
+    li_a0 EXPR_AND
+    eret
+:eoc_or
+    li_a0 EXPR_OR
+    eret
+:eoc_xor
+    li_a0 EXPR_XOR
+    eret
+:eoc_not
+    li_a0 EXPR_NOT
+    eret
+:eoc_eq
+    li_a0 EXPR_EQ
+    eret
+:eoc_ne
+    li_a0 EXPR_NE
+    eret
+:eoc_lt
+    li_a0 EXPR_LT
+    eret
+:eoc_le
+    li_a0 EXPR_LE
+    eret
+:eoc_gt
+    li_a0 EXPR_GT
+    eret
+:eoc_ge
+    li_a0 EXPR_GE
+    eret
+:eoc_strlen
+    li_a0 EXPR_STRLEN
+    eret
+
+## apply_expr_op(a0=op_code, a1=args_ptr, a2=argc) -> a0 = i64 result
+## Reduce args[0..argc) per op:
+##   + * & | $      variadic, argc >= 1
+##   -              argc >= 1 (argc == 1 is negate, else left-assoc subtract)
+##   / %            binary, div-by-zero fatal
+##   << >>          binary (>> is arithmetic)
+##   ~              unary
+##   = == != < <= > >=  binary
+## Fatal on wrong argc or EXPR_INVALID.
+##
+## Calls aeo_require_* helpers via `call`, so it needs a frame.
+## State held in BSS scratch (aeo_op/args/argc/acc/i) since loops trash registers.
+:apply_expr_op
+    enter_0
+    # spill op, args, argc to BSS
+    la_a3 &aeo_op
+    st_a0,a3,0
+    la_a3 &aeo_args
+    st_a1,a3,0
+    la_a3 &aeo_argc
+    st_a2,a3,0
+
+    # dispatch: compare op against each EXPR_* and branch to its handler
+    li_t0 EXPR_ADD
+    la_br &aeo_do_add
+    beq_a0,t0
+    li_t0 EXPR_SUB
+    la_br &aeo_do_sub
+    beq_a0,t0
+    li_t0 EXPR_MUL
+    la_br &aeo_do_mul
+    beq_a0,t0
+    li_t0 EXPR_DIV
+    la_br &aeo_do_div
+    beq_a0,t0
+    li_t0 EXPR_MOD
+    la_br &aeo_do_mod
+    beq_a0,t0
+    li_t0 EXPR_SHL
+    la_br &aeo_do_shl
+    beq_a0,t0
+    li_t0 EXPR_SHR
+    la_br &aeo_do_shr
+    beq_a0,t0
+    li_t0 EXPR_AND
+    la_br &aeo_do_and
+    beq_a0,t0
+    li_t0 EXPR_OR
+    la_br &aeo_do_or
+    beq_a0,t0
+    li_t0 EXPR_XOR
+    la_br &aeo_do_xor
+    beq_a0,t0
+    li_t0 EXPR_NOT
+    la_br &aeo_do_not
+    beq_a0,t0
+    li_t0 EXPR_EQ
+    la_br &aeo_do_eq
+    beq_a0,t0
+    li_t0 EXPR_NE
+    la_br &aeo_do_ne
+    beq_a0,t0
+    li_t0 EXPR_LT
+    la_br &aeo_do_lt
+    beq_a0,t0
+    li_t0 EXPR_LE
+    la_br &aeo_do_le
+    beq_a0,t0
+    li_t0 EXPR_GT
+    la_br &aeo_do_gt
+    beq_a0,t0
+    li_t0 EXPR_GE
+    la_br &aeo_do_ge
+    beq_a0,t0
+    # EXPR_INVALID or unknown
+    la_br &err_bad_macro_header
+    b
+
+## --- shared helpers for variadic folds ----------------------------------
+## aeo_require_argc_ge1: branch to err if argc < 1
+## aeo_require_argc_eq2: branch to err if argc != 2
+## aeo_load_arg0_to_acc: acc = args[0]; i = 1
+
+:aeo_do_add
+    la_br &aeo_require_argc_ge1
+    call
+    la_br &aeo_load_arg0_to_acc
+    call
+:aeo_add_loop
+    la_a0 &aeo_i
+    ld_t0,a0,0
+    la_a1 &aeo_argc
+    ld_t1,a1,0
+    la_br &aeo_finish
+    beq_t0,t1
+    # acc += args[i]
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    shli_t2,t0,3
+    add_t2,a1,t2
+    ld_a2,t2,0
+    la_a0 &aeo_acc
+    ld_a3,a0,0
+    add_a3,a3,a2
+    st_a3,a0,0
+    addi_t0,t0,1
+    la_a1 &aeo_i
+    st_t0,a1,0
+    la_br &aeo_add_loop
+    b
+
+:aeo_do_sub
+    la_br &aeo_require_argc_ge1
+    call
+    # if (argc == 1) acc = -args[0]; else acc = args[0]
+    la_a0 &aeo_argc
+    ld_t0,a0,0
+    li_t1 %1 %0
+    la_br &aeo_sub_unary
+    beq_t0,t1
+    la_br &aeo_load_arg0_to_acc
+    call
+:aeo_sub_loop
+    la_a0 &aeo_i
+    ld_t0,a0,0
+    la_a1 &aeo_argc
+    ld_t1,a1,0
+    la_br &aeo_finish
+    beq_t0,t1
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    shli_t2,t0,3
+    add_t2,a1,t2
+    ld_a2,t2,0
+    la_a0 &aeo_acc
+    ld_a3,a0,0
+    sub_a3,a3,a2
+    st_a3,a0,0
+    addi_t0,t0,1
+    la_a1 &aeo_i
+    st_t0,a1,0
+    la_br &aeo_sub_loop
+    b
+:aeo_sub_unary
+    # acc = 0 - args[0]
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    ld_a2,a1,0
+    li_a3 %0 %0
+    sub_a3,a3,a2
+    la_a0 &aeo_acc
+    st_a3,a0,0
+    la_br &aeo_finish
+    b
+
+:aeo_do_mul
+    la_br &aeo_require_argc_ge1
+    call
+    la_br &aeo_load_arg0_to_acc
+    call
+:aeo_mul_loop
+    la_a0 &aeo_i
+    ld_t0,a0,0
+    la_a1 &aeo_argc
+    ld_t1,a1,0
+    la_br &aeo_finish
+    beq_t0,t1
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    shli_t2,t0,3
+    add_t2,a1,t2
+    ld_a2,t2,0
+    la_a0 &aeo_acc
+    ld_a3,a0,0
+    mul_a3,a3,a2
+    st_a3,a0,0
+    addi_t0,t0,1
+    la_a1 &aeo_i
+    st_t0,a1,0
+    la_br &aeo_mul_loop
+    b
+
+:aeo_do_div
+    la_br &aeo_require_argc_eq2
+    call
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    ld_a2,a1,0
+    ld_a3,a1,8
+    # if (args[1] == 0) fatal
+    la_br &err_bad_macro_header
+    beqz_a3
+    div_a2,a2,a3
+    la_a0 &aeo_acc
+    st_a2,a0,0
+    la_br &aeo_finish
+    b
+
+:aeo_do_mod
+    la_br &aeo_require_argc_eq2
+    call
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    ld_a2,a1,0
+    ld_a3,a1,8
+    la_br &err_bad_macro_header
+    beqz_a3
+    rem_a2,a2,a3
+    la_a0 &aeo_acc
+    st_a2,a0,0
+    la_br &aeo_finish
+    b
+
+:aeo_do_shl
+    la_br &aeo_require_argc_eq2
+    call
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    ld_a2,a1,0
+    ld_a3,a1,8
+    shl_a2,a2,a3
+    la_a0 &aeo_acc
+    st_a2,a0,0
+    la_br &aeo_finish
+    b
+
+:aeo_do_shr
+    la_br &aeo_require_argc_eq2
+    call
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    ld_a2,a1,0
+    ld_a3,a1,8
+    sar_a2,a2,a3
+    la_a0 &aeo_acc
+    st_a2,a0,0
+    la_br &aeo_finish
+    b
+
+:aeo_do_and
+    la_br &aeo_require_argc_ge1
+    call
+    la_br &aeo_load_arg0_to_acc
+    call
+:aeo_and_loop
+    la_a0 &aeo_i
+    ld_t0,a0,0
+    la_a1 &aeo_argc
+    ld_t1,a1,0
+    la_br &aeo_finish
+    beq_t0,t1
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    shli_t2,t0,3
+    add_t2,a1,t2
+    ld_a2,t2,0
+    la_a0 &aeo_acc
+    ld_a3,a0,0
+    and_a3,a3,a2
+    st_a3,a0,0
+    addi_t0,t0,1
+    la_a1 &aeo_i
+    st_t0,a1,0
+    la_br &aeo_and_loop
+    b
+
+:aeo_do_or
+    la_br &aeo_require_argc_ge1
+    call
+    la_br &aeo_load_arg0_to_acc
+    call
+:aeo_or_loop
+    la_a0 &aeo_i
+    ld_t0,a0,0
+    la_a1 &aeo_argc
+    ld_t1,a1,0
+    la_br &aeo_finish
+    beq_t0,t1
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    shli_t2,t0,3
+    add_t2,a1,t2
+    ld_a2,t2,0
+    la_a0 &aeo_acc
+    ld_a3,a0,0
+    or_a3,a3,a2
+    st_a3,a0,0
+    addi_t0,t0,1
+    la_a1 &aeo_i
+    st_t0,a1,0
+    la_br &aeo_or_loop
+    b
+
+:aeo_do_xor
+    la_br &aeo_require_argc_ge1
+    call
+    la_br &aeo_load_arg0_to_acc
+    call
+:aeo_xor_loop
+    la_a0 &aeo_i
+    ld_t0,a0,0
+    la_a1 &aeo_argc
+    ld_t1,a1,0
+    la_br &aeo_finish
+    beq_t0,t1
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    shli_t2,t0,3
+    add_t2,a1,t2
+    ld_a2,t2,0
+    la_a0 &aeo_acc
+    ld_a3,a0,0
+    xor_a3,a3,a2
+    st_a3,a0,0
+    addi_t0,t0,1
+    la_a1 &aeo_i
+    st_t0,a1,0
+    la_br &aeo_xor_loop
+    b
+
+:aeo_do_not
+    # require argc == 1
+    la_a0 &aeo_argc
+    ld_t0,a0,0
+    li_t1 %1 %0
+    la_br &err_bad_macro_header
+    bne_t0,t1
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    ld_a2,a1,0
+    # ~x = x XOR -1
+    li_a3 %1 %0
+    li_t0 %0 %0
+    sub_a3,t0,a3
+    xor_a2,a2,a3
+    la_a0 &aeo_acc
+    st_a2,a0,0
+    la_br &aeo_finish
+    b
+
+## --- comparison ops: return 0 or 1 ----------------------------------------
+## EQ:  args[0] == args[1]
+## NE:  args[0] != args[1]
+## LT:  args[0] <  args[1]   (signed)
+## LE:  args[0] <= args[1]   (signed)
+## GT:  args[0] >  args[1]   (signed)
+## GE:  args[0] >= args[1]   (signed)
+
+:aeo_do_eq
+    la_br &aeo_require_argc_eq2
+    call
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    ld_a2,a1,0
+    ld_a3,a1,8
+    li_t0 %0 %0
+    la_br &aeo_cmp_finish
+    bne_a2,a3
+    li_t0 %1 %0
+    la_br &aeo_cmp_finish
+    b
+
+:aeo_do_ne
+    la_br &aeo_require_argc_eq2
+    call
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    ld_a2,a1,0
+    ld_a3,a1,8
+    li_t0 %0 %0
+    la_br &aeo_cmp_finish
+    beq_a2,a3
+    li_t0 %1 %0
+    la_br &aeo_cmp_finish
+    b
+
+:aeo_do_lt
+    la_br &aeo_require_argc_eq2
+    call
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    ld_a2,a1,0
+    ld_a3,a1,8
+    li_t0 %1 %0
+    la_br &aeo_cmp_finish
+    blt_a2,a3
+    li_t0 %0 %0
+    la_br &aeo_cmp_finish
+    b
+
+:aeo_do_le
+    # a[0] <= a[1]   <=>   !(a[1] < a[0])
+    la_br &aeo_require_argc_eq2
+    call
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    ld_a2,a1,0
+    ld_a3,a1,8
+    li_t0 %0 %0
+    la_br &aeo_cmp_finish
+    blt_a3,a2
+    li_t0 %1 %0
+    la_br &aeo_cmp_finish
+    b
+
+:aeo_do_gt
+    # a[0] > a[1]   <=>   a[1] < a[0]
+    la_br &aeo_require_argc_eq2
+    call
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    ld_a2,a1,0
+    ld_a3,a1,8
+    li_t0 %1 %0
+    la_br &aeo_cmp_finish
+    blt_a3,a2
+    li_t0 %0 %0
+    la_br &aeo_cmp_finish
+    b
+
+:aeo_do_ge
+    # a[0] >= a[1]   <=>   !(a[0] < a[1])
+    la_br &aeo_require_argc_eq2
+    call
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    ld_a2,a1,0
+    ld_a3,a1,8
+    li_t0 %0 %0
+    la_br &aeo_cmp_finish
+    blt_a2,a3
+    li_t0 %1 %0
+    la_br &aeo_cmp_finish
+    b
+
+## Shared tail for the comparison ops: store t0 (the 0/1 result) into
+## aeo_acc, then jump to aeo_finish. Reached only via `b`.
+:aeo_cmp_finish
+    la_a0 &aeo_acc
+    st_t0,a0,0
+    la_br &aeo_finish
+    b
+
+:aeo_finish
+    la_a0 &aeo_acc
+    ld_a0,a0,0
+    eret
+
+## helper: validate argc >= 1; fatal otherwise. (Returns to caller.)
+:aeo_require_argc_ge1
+    la_a0 &aeo_argc
+    ld_t0,a0,0
+    li_t1 %1 %0
+    la_br &err_bad_macro_header
+    blt_t0,t1
+    ret
+
+## helper: validate argc == 2; fatal otherwise.
+:aeo_require_argc_eq2
+    la_a0 &aeo_argc
+    ld_t0,a0,0
+    li_t1 %2 %0
+    la_br &err_bad_macro_header
+    bne_t0,t1
+    ret
+
+## helper: acc = args[0]; i = 1.
+:aeo_load_arg0_to_acc
+    la_a0 &aeo_args
+    ld_a1,a0,0
+    ld_a2,a1,0
+    la_a0 &aeo_acc
+    st_a2,a0,0
+    li_t0 %1 %0
+    la_a0 &aeo_i
+    st_t0,a0,0
+    ret
+
+## skip_expr_newlines(a0=pos, a1=end) -> a0 = new pos. Leaf.
+## Advance pos past consecutive TOK_NEWLINE tokens so expressions may span
+## lines. Also used by directive header parsers to make whitespace
+## (newlines specifically) insignificant inside %macro/%struct/%frame
+## headers and around `##` paste operands.
+:skip_expr_newlines
+:sen_loop
+    # if (pos == end) done
+    la_br &sen_done
+    beq_a0,a1
+    # if (pos->kind != TOK_NEWLINE) done
+    ld_t0,a0,0
+    li_t1 TOK_NEWLINE
+    la_br &sen_done
+    bne_t0,t1
+    # pos += 24
+    addi_a0,a0,32
+    la_br &sen_loop
+    b
+:sen_done
+    ret
+
+## proc_skip_newlines(): advance proc_pos past TOK_NEWLINE tokens, bounded by
+## source_end. Convenience wrapper used by directive header parsers.
+:proc_skip_newlines
+:psn_loop
+    la_a0 &proc_pos
+    ld_t0,a0,0
+    la_a1 &source_end
+    ld_t1,a1,0
+    la_br &psn_done
+    beq_t0,t1
+    ld_a2,t0,0
+    li_a3 TOK_NEWLINE
+    la_br &psn_done
+    bne_a2,a3
+    addi_t0,t0,32
+    st_t0,a0,0
+    la_br &psn_loop
+    b
+:psn_done
+    ret
+
+## eval_expr_atom(a0=tok, a1=limit) -> void
+## Outputs via globals:
+##   eval_after_pos = token one past the consumed atom (or one past ')' for
+##                    a macro atom)
+##   eval_value     = the atom's i64 value
+##
+## If tok is a defined macro followed by TOK_LPAREN: expand_macro_tokens into
+## the pool at mark = pool_used, recursively eval_expr_range over the new
+## slice, require exactly one value (no trailing tokens), restore
+## pool_used = mark, and set eval_after_pos = emt_after_pos. Otherwise
+## parse_int_token(tok) and set eval_after_pos = tok + 24 bytes.
+##
+## CAVEAT: this path can recurse through eval_expr_range. Callers MUST
+## snapshot eval_after_pos / eval_value into local stack slots (via
+## enter_N) before any further call that might overwrite them.
+##
+## Stack-local layout (enter_40):
+##   sp+16  saved tok
+##   sp+24  saved limit
+##   sp+32  macro_ptr (find_macro result)
+##   sp+40  saved emt_after_pos
+##   sp+48  saved emt_mark
+:eval_expr_atom
+    enter_40
+    st_a0,sp,0
+    st_a1,sp,8
+
+    # ---- tok eq "%local" with tight ( -> expand and recurse over body ----
+    # %local is a built-in (not a macro) but expands to an integer-yielding
+    # token sequence, so eval_expr_atom must handle it before the find_macro
+    # path. Validation (tight LPAREN, arg shape, frame_active, name lookup)
+    # is centralized in expand_local_into_pool.
+    ld_a0,sp,0
+    la_a1 &const_local
+    li_a2 %6 %0
+    la_br &tok_eq_const
+    call
+    la_br &eea_skip_local
+    beqz_a0
+
+    # Confirm tight LPAREN follows; otherwise treat %local as opaque text and
+    # let the integer-atom path fail with a useful error.
+    ld_t0,sp,0
+    addi_t0,t0,32
+    ld_t1,sp,8
+    la_br &eea_skip_local
+    blt_t1,t0
+    la_br &eea_skip_local
+    beq_t0,t1
+    ld_a3,t0,0
+    li_a2 TOK_LPAREN
+    la_br &eea_skip_local
+    bne_a3,a2
+    ld_a3,t0,24
+    la_br &eea_skip_local
+    beqz_a3
+
+    # Dispatch to the local-expansion path.
+    ld_a0,sp,0
+    ld_a1,sp,8
+    la_br &expand_local_into_pool
+    call
+
+    # Snapshot elp_mark / elp_after before recursing.
+    la_a0 &elp_after
+    ld_t0,a0,0
+    st_t0,sp,24
+    la_a0 &elp_mark
+    ld_t0,a0,0
+    st_t0,sp,32
+
+    # If pool was not extended (pool_used == mark) -> bad expression.
+    la_a0 &pool_used
+    ld_t0,a0,0
+    ld_t1,sp,32
+    la_br &err_bad_macro_header
+    beq_t0,t1
+
+    # eval_expr_range(expand_pool + mark, expand_pool + pool_used)
+    la_a0 &expand_pool_ptr
+    ld_a0,a0,0
+    ld_t1,sp,32
+    add_a0,a0,t1
+    la_a1 &expand_pool_ptr
+    ld_a1,a1,0
+    la_a2 &pool_used
+    ld_a2,a2,0
+    add_a1,a1,a2
+    la_br &eval_expr_range
+    call
+
+    la_a1 &eval_value
+    st_a0,a1,0
+
+    # restore pool_used = mark
+    la_a0 &pool_used
+    ld_t0,sp,32
+    st_t0,a0,0
+
+    # eval_after_pos = saved elp_after
+    la_a0 &eval_after_pos
+    ld_t0,sp,24
+    st_t0,a0,0
+
+    eret
+
+:eea_skip_local
+    # macro_ptr = find_macro(tok)
+    ld_a0,sp,0
+    la_br &find_macro
+    call
+    st_a0,sp,16
+
+    # if (macro_ptr == 0) -> integer atom branch
+    la_br &eea_int_atom
+    beqz_a0
+
+    # Paren-less 0-arg atom:
+    #   Take the macro-call branch if (tok+1 < limit AND (tok+1)->kind == TOK_LPAREN
+    #   AND (tok+1)->tight) OR macro->param_count == 0. Otherwise fall through
+    #   to int atom (unchanged).
+    ld_t0,sp,0
+    addi_t0,t0,32
+    ld_t1,sp,8
+    la_br &eea_check_zero_arg
+    blt_t1,t0
+    la_br &eea_check_zero_arg
+    beq_t0,t1
+    ld_t2,t0,0
+    li_a3 TOK_LPAREN
+    la_br &eea_check_zero_arg
+    bne_t2,a3
+    ld_t2,t0,24
+    la_br &eea_check_zero_arg
+    beqz_t2
+    la_br &eea_do_macro
+    b
+
+:eea_check_zero_arg
+    # No trailing LPAREN. Take the macro branch only if param_count == 0.
+    ld_t0,sp,16
+    ld_t1,t0,16
+    la_br &eea_int_atom
+    bnez_t1
+
+:eea_do_macro
+    # Macro call branch:
+    #   expand_macro_tokens(tok, limit, macro_ptr)
+    ld_a0,sp,0
+    ld_a1,sp,8
+    ld_a2,sp,16
+    la_br &expand_macro_tokens
+    call
+
+    # Snapshot emt outputs immediately.
+    la_a0 &emt_after_pos
+    ld_t0,a0,0
+    st_t0,sp,24
+    la_a0 &emt_mark
+    ld_t0,a0,0
+    st_t0,sp,32
+
+    # If pool was not extended (pool_used == mark) -> bad expression.
+    la_a0 &pool_used
+    ld_t0,a0,0
+    ld_t1,sp,32
+    la_br &err_bad_macro_header
+    beq_t0,t1
+
+    # eval_expr_range(expand_pool + mark, expand_pool + pool_used)
+    la_a0 &expand_pool_ptr
+    ld_a0,a0,0
+    ld_t1,sp,32
+    add_a0,a0,t1
+    la_a1 &expand_pool_ptr
+    ld_a1,a1,0
+    la_a2 &pool_used
+    ld_a2,a2,0
+    add_a1,a1,a2
+    la_br &eval_expr_range
+    call
+
+    # eval_value = result
+    la_a1 &eval_value
+    st_a0,a1,0
+
+    # restore pool_used = mark
+    la_a0 &pool_used
+    ld_t0,sp,32
+    st_t0,a0,0
+
+    # eval_after_pos = saved emt_after_pos
+    la_a0 &eval_after_pos
+    ld_t0,sp,24
+    st_t0,a0,0
+
+    eret
+
+:eea_int_atom
+    # parse_int_token(tok) -> i64
+    ld_a0,sp,0
+    la_br &parse_int_token
+    call
+    la_a1 &eval_value
+    st_a0,a1,0
+
+    # eval_after_pos = tok + 24
+    ld_t0,sp,0
+    addi_t0,t0,32
+    la_a0 &eval_after_pos
+    st_t0,a0,0
+
+    eret
+
+## eval_expr_range(a0=start_tok, a1=end_tok) -> a0 = i64 result (fatal on bad)
+## Main S-expression evaluator loop, driven by the explicit ExprFrame stack
+## in expr_frames[] / expr_frame_top — NOT by P1 recursion (eval_expr_atom
+## can re-enter eval_expr_range through expand_macro_tokens, and a P1
+## recursion would defeat the bounded frame budget). Enforces exactly one
+## top-level value and no trailing tokens.
+## Fatal on: unmatched parens, > 16 frames deep, > 16 args per frame,
+## bad atom, bad operator.
+## Reads/writes: expr_frames, expr_frame_top.
+##
+## Stack-local layout (enter_56):
+##   sp+16  pos              Token*
+##   sp+24  end              Token*
+##   sp+32  value            i64 (most recent atom or rparen result)
+##   sp+40  result           i64 (set when have_result transitions to 1)
+##   sp+48  have_value       0/1
+##   sp+56  have_result      0/1
+##   sp+64  entry_frame_top  i64 (snapshot at entry; restored on exit;
+##                                used as the local base for stack checks)
+:eval_expr_range
+    enter_56
+    st_a0,sp,0
+    st_a1,sp,8
+    li_t0 %0 %0
+    st_t0,sp,16
+    st_t0,sp,24
+    st_t0,sp,32
+    st_t0,sp,40
+    # entry_frame_top = expr_frame_top
+    la_a0 &expr_frame_top
+    ld_t0,a0,0
+    st_t0,sp,48
+
+:eer_loop
+    # If have_value, deliver it.
+    ld_t0,sp,32
+    la_br &eer_no_have_value
+    beqz_t0
+
+    # have_value: feed into top frame, or set result.
+    la_a0 &expr_frame_top
+    ld_t0,a0,0
+    ld_t1,sp,48
+    la_br &eer_set_result
+    beq_t0,t1
+    # frame = &expr_frames[frame_top - 1]
+    addi_t0,t0,neg1
+    li_a1 M1PP_EXPR_FRAME_SIZE
+    mul_t0,t0,a1
+    la_a0 &expr_frames_ptr
+    ld_a0,a0,0
+    add_a0,a0,t0
+    # if (frame->argc >= MAX_PARAMS) fatal
+    li_a1 M1PP_EXPR_ARGC_OFF
+    add_a1,a0,a1
+    ld_t1,a1,0
+    li_a2 M1PP_MAX_PARAMS
+    la_br &err_bad_macro_header
+    blt_a2,t1
+    la_br &err_bad_macro_header
+    beq_t1,a2
+    # frame->args[argc] = value
+    li_a2 M1PP_EXPR_ARGS_OFF
+    add_a3,a0,a2
+    shli_a2,t1,3
+    add_a3,a3,a2
+    ld_t2,sp,16
+    st_t2,a3,0
+    # frame->argc++
+    addi_t1,t1,1
+    st_t1,a1,0
+    # have_value = 0
+    li_t0 %0 %0
+    st_t0,sp,32
+    la_br &eer_loop
+    b
+
+:eer_set_result
+    # No frame open; this value is the top-level result.
+    ld_t0,sp,40
+    la_br &err_bad_macro_header
+    bnez_t0
+    ld_t0,sp,16
+    st_t0,sp,24
+    li_t0 %1 %0
+    st_t0,sp,40
+    li_t0 %0 %0
+    st_t0,sp,32
+    la_br &eer_loop
+    b
+
+:eer_no_have_value
+    # skip_expr_newlines(pos, end)
+    ld_a0,sp,0
+    ld_a1,sp,8
+    la_br &skip_expr_newlines
+    call
+    st_a0,sp,0
+
+    # if (pos >= end) break
+    ld_t0,sp,0
+    ld_t1,sp,8
+    la_br &eer_loop_done
+    beq_t0,t1
+
+    # Dispatch on token kind.
+    ld_t2,t0,0
+    li_a3 TOK_LPAREN
+    la_br &eer_lparen
+    beq_t2,a3
+    li_a3 TOK_RPAREN
+    la_br &eer_rparen
+    beq_t2,a3
+
+    # atom: eval_expr_atom(pos, end); value = eval_value; pos = eval_after_pos
+    ld_a0,sp,0
+    ld_a1,sp,8
+    la_br &eval_expr_atom
+    call
+    la_a0 &eval_value
+    ld_t0,a0,0
+    st_t0,sp,16
+    la_a0 &eval_after_pos
+    ld_t0,a0,0
+    st_t0,sp,0
+    li_t0 %1 %0
+    st_t0,sp,32
+    la_br &eer_loop
+    b
+
+:eer_lparen
+    # pos++
+    addi_t0,t0,32
+    st_t0,sp,0
+    # skip_expr_newlines
+    ld_a0,sp,0
+    ld_a1,sp,8
+    la_br &skip_expr_newlines
+    call
+    st_a0,sp,0
+    # if (pos >= end) fatal
+    ld_t0,sp,0
+    ld_t1,sp,8
+    la_br &err_bad_macro_header
+    beq_t0,t1
+    # op = expr_op_code(pos)
+    ld_a0,sp,0
+    la_br &expr_op_code
+    call
+    # if (op == EXPR_INVALID) fatal
+    li_t0 EXPR_INVALID
+    la_br &err_bad_macro_header
+    beq_a0,t0
+    # if (op == EXPR_STRLEN) handle inline — strlen's argument is a
+    # TOK_STRING atom, not a recursive expression. Yield text.len - 2.
+    li_t0 EXPR_STRLEN
+    la_br &eer_strlen
+    beq_a0,t0
+    # frame stack overflow check: if (expr_frame_top >= 16) fatal
+    # (the global expr_frames[] array has 16 slots, shared across recursive
+    # eval_expr_range calls)
+    la_a1 &expr_frame_top
+    ld_t0,a1,0
+    li_a2 M1PP_MAX_PARAMS
+    la_br &err_bad_macro_header
+    blt_a2,t0
+    la_br &err_bad_macro_header
+    beq_t0,a2
+    # frames[frame_top].op = op; frames[frame_top].argc = 0
+    li_a2 M1PP_EXPR_FRAME_SIZE
+    mul_t2,t0,a2
+    la_a3 &expr_frames_ptr
+    ld_a3,a3,0
+    add_a3,a3,t2
+    st_a0,a3,0
+    li_a2 M1PP_EXPR_ARGC_OFF
+    add_a2,a3,a2
+    li_t2 %0 %0
+    st_t2,a2,0
+    # frame_top++
+    addi_t0,t0,1
+    st_t0,a1,0
+    # pos++ (skip operator token)
+    ld_t0,sp,0
+    addi_t0,t0,32
+    st_t0,sp,0
+    la_br &eer_loop
+    b
+
+:eer_rparen
+    # if (frame_top <= entry_frame_top) fatal
+    la_a0 &expr_frame_top
+    ld_t0,a0,0
+    ld_t1,sp,48
+    la_br &err_bad_macro_header
+    beq_t0,t1
+    la_br &err_bad_macro_header
+    blt_t0,t1
+    # frame = &expr_frames[frame_top - 1]
+    addi_t0,t0,neg1
+    li_a1 M1PP_EXPR_FRAME_SIZE
+    mul_t0,t0,a1
+    la_a3 &expr_frames_ptr
+    ld_a3,a3,0
+    add_a3,a3,t0
+    # apply_expr_op(op, args, argc) -> a0
+    ld_a0,a3,0
+    li_a1 M1PP_EXPR_ARGS_OFF
+    add_a1,a3,a1
+    li_a2 M1PP_EXPR_ARGC_OFF
+    add_a2,a3,a2
+    ld_a2,a2,0
+    la_br &apply_expr_op
+    call
+    # value = result; frame_top--; pos++; have_value = 1
+    st_a0,sp,16
+    la_a1 &expr_frame_top
+    ld_t0,a1,0
+    addi_t0,t0,neg1
+    st_t0,a1,0
+    ld_t0,sp,0
+    addi_t0,t0,32
+    st_t0,sp,0
+    li_t0 %1 %0
+    st_t0,sp,32
+    la_br &eer_loop
+    b
+
+:eer_strlen
+    # (strlen "literal") — degenerate unary op whose argument is a
+    # TOK_STRING atom, not a recursive expression.
+    # pos++ past the "strlen" operator word.
+    ld_t0,sp,0
+    addi_t0,t0,32
+    st_t0,sp,0
+    # skip_expr_newlines(pos, end)
+    ld_a0,sp,0
+    ld_a1,sp,8
+    la_br &skip_expr_newlines
+    call
+    st_a0,sp,0
+    # if (pos >= end) fatal
+    ld_t0,sp,0
+    ld_t1,sp,8
+    la_br &err_bad_macro_header
+    beq_t0,t1
+    # if (pos->kind != TOK_STRING) fatal
+    ld_t2,t0,0
+    li_a3 TOK_STRING
+    la_br &err_bad_macro_header
+    bne_t2,a3
+    # if (pos->text.len < 2) fatal
+    ld_a1,t0,16
+    li_a2 %2 %0
+    la_br &err_bad_macro_header
+    blt_a1,a2
+    # if (pos->text.ptr[0] != '"') fatal — rejects single-quoted '..' hex
+    ld_a2,t0,8
+    lb_a3,a2,0
+    li_a0 %34 %0
+    la_br &err_bad_macro_header
+    bne_a3,a0
+    # value = pos->text.len - 2
+    addi_a1,a1,neg2
+    st_a1,sp,16
+    # pos++
+    addi_t0,t0,32
+    st_t0,sp,0
+    # skip_expr_newlines(pos, end)
+    ld_a0,sp,0
+    ld_a1,sp,8
+    la_br &skip_expr_newlines
+    call
+    st_a0,sp,0
+    # if (pos >= end) fatal
+    ld_t0,sp,0
+    ld_t1,sp,8
+    la_br &err_bad_macro_header
+    beq_t0,t1
+    # if (pos->kind != TOK_RPAREN) fatal
+    ld_t2,t0,0
+    li_a3 TOK_RPAREN
+    la_br &err_bad_macro_header
+    bne_t2,a3
+    # pos++
+    addi_t0,t0,32
+    st_t0,sp,0
+    # have_value = 1
+    li_t0 %1 %0
+    st_t0,sp,32
+    la_br &eer_loop
+    b
+
+:eer_loop_done
+    # frame_top must equal entry_frame_top
+    la_a0 &expr_frame_top
+    ld_t0,a0,0
+    ld_t1,sp,48
+    la_br &err_bad_macro_header
+    bne_t0,t1
+    # have_result must be 1
+    ld_t0,sp,40
+    la_br &err_bad_macro_header
+    beqz_t0
+    # pos must equal end
+    ld_t0,sp,0
+    ld_t1,sp,8
+    la_br &err_bad_macro_header
+    bne_t0,t1
+    # return result
+    ld_a0,sp,24
+    eret
+
+## ============================================================================
+## --- Hex emit for !@%$ ------------------------------------------------------
+## ============================================================================
+
+## emit_hex_value(a0=value_u64, a1=byte_count) -> void (fatal on overflow)
+## byte_count must be 1, 2, 4, or 8. Serialize value into (2 * byte_count)
+## uppercase hex chars, little-endian byte order (byte i at char indices
+## 2i, 2i+1) as bare hex digits. hex2pp's byte-stream parser groups every
+## two hex digits into one byte; no quoting or separators are needed.
+## Total emitted text length = 2 * byte_count; emitted as a TOK_WORD via
+## append_text + emit_token.
+:emit_hex_value
+    enter_0
+
+    # ehv_value = value; ehv_bytes = byte_count
+    la_a2 &ehv_value
+    st_a0,a2,0
+    la_a2 &ehv_bytes
+    st_a1,a2,0
+
+    # i = 0
+    li_t0 %0 %0
+:emit_hex_value_loop
+    # if (i == bytes) done
+    la_a1 &ehv_bytes
+    ld_t1,a1,0
+    la_br &emit_hex_value_emit
+    beq_t0,t1
+
+    # byte = ehv_value & 0xFF
+    la_a1 &ehv_value
+    ld_t2,a1,0
+    andi_a3,t2,255
+
+    # high = (byte >> 4) & 0x0F  (byte is already in a3)
+    shri_a2,a3,4
+    andi_a2,a2,15
+
+    # low = byte & 0x0F
+    andi_a3,a3,15
+
+    # scratch[2*i] = hex_chars[high]
+    la_a1 &hex_chars
+    add_a1,a1,a2
+    lb_a2,a1,0
+    la_a1 &ehv_scratch
+    shli_a3,t0,1
+    add_a1,a1,a3
+    sb_a2,a1,0
+
+    # scratch[2*i+1] = hex_chars[low]   (reload low from byte & 0x0F)
+    la_a1 &ehv_value
+    ld_t2,a1,0
+    andi_a3,t2,255
+    andi_a3,a3,15
+    la_a1 &hex_chars
+    add_a1,a1,a3
+    lb_a2,a1,0
+    la_a1 &ehv_scratch
+    shli_a3,t0,1
+    add_a1,a1,a3
+    addi_a1,a1,1
+    sb_a2,a1,0
+
+    # ehv_value >>= 8
+    la_a1 &ehv_value
+    ld_t2,a1,0
+    shri_t2,t2,8
+    st_t2,a1,0
+
+    # i++
+    addi_t0,t0,1
+    la_br &emit_hex_value_loop
+    b
+
+:emit_hex_value_emit
+    # text_ptr = append_text(&ehv_scratch, 2 * ehv_bytes)
+    la_a0 &ehv_scratch
+    la_a1 &ehv_bytes
+    ld_a1,a1,0
+    shli_a1,a1,1
+    la_br &append_text
+    call
+
+    # ehv_token.kind = TOK_WORD; ehv_token.text_ptr = text_ptr;
+    # ehv_token.text_len = 2 * ehv_bytes; ehv_token.tight = 0.
+    la_a2 &ehv_token
+    li_a3 TOK_WORD
+    st_a3,a2,0
+    st_a0,a2,8
+    la_a1 &ehv_bytes
+    ld_a1,a1,0
+    shli_a1,a1,1
+    st_a1,a2,16
+    li_a1 %0 %0
+    st_a1,a2,24
+
+    # emit_token(&ehv_token)
+    la_a0 &ehv_token
+    la_br &emit_token
+    call
+
+    eret
+
+## ============================================================================
+## --- Builtin dispatcher ( ! @ % $ %select %str %local ) --------------------
+## ============================================================================
+
+## expand_builtin_call(a0=stream_ptr, a1=builtin_tok) -> void (fatal on bad)
+## Requires builtin_tok+1 is TOK_LPAREN. Runs parse_args(lparen, stream->end),
+## then dispatches on builtin_tok->text:
+##
+##   "!" "@" "%" "$"
+##     require arg_count == 1
+##     eval_expr_range(arg_starts[0], arg_ends[0]) -> value
+##     stream->pos = call_end_pos; stream->line_start = 0
+##     emit_hex_value(value, 1 / 2 / 4 / 8 respectively)
+##
+##   "%select"
+##     require arg_count == 3
+##     eval_expr_range(cond_arg) -> value
+##     chosen = (value != 0) ? arg1 : arg2
+##     stream->pos = call_end_pos; stream->line_start = 0
+##     if chosen is empty, return (no stream push)
+##     else copy_span_to_pool(chosen) and push_pool_stream_from_mark(mark)
+##     The unchosen branch is NOT evaluated, validated, or expanded.
+##
+## Any other text under a builtin slot -> fatal "bad builtin".
+## expand_local_into_pool(a0=call_tok, a1=limit) -> writes elp_after, elp_mark
+## Resolve %local(NAME) against the current frame: assemble the lookup key
+## "<frame>_FRAME.<NAME>" in local_lookup_scratch, linear-search macros[]
+## for that name, and copy the matching body into the pool. Errors:
+##   - call_tok+1 missing / not tight LPAREN: bad_macro_header
+##   - parse_args fails: propagated
+##   - arg_count != 1, arg span != 1 token, arg kind != WORD: bad_macro_header
+##   - frame not active: local_outside_frame
+##   - assembled name >= 256 bytes: local_name_too_long
+##   - no matching macro: unknown_local
+##
+## On success, elp_mark = pool_used at entry, elp_after = call_end_pos
+## (Token* one past the call's `)`). Both expand_builtin_call's %local
+## branch and eval_expr_atom's %local branch consume those.
+:expand_local_into_pool
+    enter_0
+
+    # --- Validate (call_tok+1) is a tight LPAREN within the stream. ---
+    addi_t0,a0,32                  # lparen = call_tok + 32
+    la_br &err_bad_macro_header
+    blt_a1,t0
+    la_br &err_bad_macro_header
+    beq_t0,a1
+    ld_a2,t0,0
+    li_a3 TOK_LPAREN
+    la_br &err_bad_macro_header
+    bne_a2,a3
+    ld_a2,t0,24
+    la_br &err_bad_macro_header
+    beqz_a2
+
+    # --- parse_args(lparen, limit) ---
+    mov_a0,t0
+    la_br &parse_args
+    call
+
+    # --- Validate arg shape: arg_count == 1, single 32-byte token, WORD kind. ---
+    la_a0 &arg_count
+    ld_t0,a0,0
+    li_t1 %1 %0
+    la_br &err_bad_macro_header
+    bne_t0,t1
+
+    la_a0 &arg_starts_ptr
+    ld_a0,a0,0
+    ld_t0,a0,0                     # arg_tok = arg_starts[0]
+    la_a1 &arg_ends_ptr
+    ld_a1,a1,0
+    ld_t1,a1,0                     # arg_end = arg_ends[0]
+    sub_t2,t1,t0
+    li_a2 %32 %0
+    la_br &err_bad_macro_header
+    bne_t2,a2
+
+    ld_a3,t0,0                     # arg_tok->kind
+    li_a2 TOK_WORD
+    la_br &err_bad_macro_header
+    bne_a3,a2
+
+    # Stash arg.text.ptr / arg.text.len for the byte-copy loop below.
+    ld_a0,t0,8
+    la_a1 &elp_arg_ptr
+    st_a0,a1,0
+    ld_a0,t0,16
+    la_a1 &elp_arg_len
+    st_a0,a1,0
+
+    # --- frame_active? ---
+    la_a1 &frame_active
+    ld_a2,a1,0
+    la_br &err_local_outside_frame
+    beqz_a2
+
+    # --- name_len = current_frame_len + 7 + arg_len; must be < 256. ---
+    la_a1 &current_frame_len
+    ld_a2,a1,0
+    la_a1 &elp_arg_len
+    ld_a3,a1,0
+    add_t0,a2,a3
+    addi_t0,t0,7
+    la_a1 &elp_name_len
+    st_t0,a1,0
+    li_t1 %256 %0
+    la_br &err_local_name_too_long
+    blt_t1,t0
+    la_br &err_local_name_too_long
+    beq_t0,t1
+
+    # --- Build lookup name in local_lookup_scratch. ---
+    # First: copy current_frame_ptr[0..frame_len] -> scratch[0..]
+    la_a0 &current_frame_ptr
+    ld_t0,a0,0                     # frame_ptr
+    la_a0 &current_frame_len
+    ld_t1,a0,0                     # frame_len
+    la_t2 &local_lookup_scratch_ptr
+    ld_t2,t2,0                     # scratch_base
+    li_a3 %0 %0
+:elp_copy_frame
+    la_br &elp_copy_frame_done
+    beq_a3,t1
+    add_a0,t0,a3
+    lb_a0,a0,0
+    add_a1,t2,a3
+    sb_a0,a1,0
+    addi_a3,a3,1
+    la_br &elp_copy_frame
+    b
+:elp_copy_frame_done
+
+    # Advance scratch cursor to scratch + frame_len for the suffix copy.
+    add_t2,t2,t1
+
+    # Copy const_frame_suffix (7 bytes "_FRAME.") -> scratch[frame_len..]
+    la_a0 &const_frame_suffix
+    li_t1 %7 %0
+    li_a3 %0 %0
+:elp_copy_suffix
+    la_br &elp_copy_suffix_done
+    beq_a3,t1
+    add_a1,a0,a3
+    lb_a1,a1,0
+    add_t0,t2,a3
+    sb_a1,t0,0
+    addi_a3,a3,1
+    la_br &elp_copy_suffix
+    b
+:elp_copy_suffix_done
+
+    # Advance past suffix (7 bytes).
+    addi_t2,t2,7
+
+    # Copy arg bytes -> scratch[frame_len + 7 ..]
+    la_a0 &elp_arg_ptr
+    ld_t0,a0,0
+    la_a0 &elp_arg_len
+    ld_t1,a0,0
+    li_a3 %0 %0
+:elp_copy_arg
+    la_br &elp_copy_arg_done
+    beq_a3,t1
+    add_a0,t0,a3
+    lb_a0,a0,0
+    add_a1,t2,a3
+    sb_a0,a1,0
+    addi_a3,a3,1
+    la_br &elp_copy_arg
+    b
+:elp_copy_arg_done
+
+    # --- Linear search macros[] for an exact name match. ---
+    # m (a3) walks from macros_ptr to macros_end (each MACRO_RECORD_SIZE).
+    # Match criterion: m->name.len == name_len AND first name_len bytes of
+    # m->name.ptr equal local_lookup_scratch. Modeled on find_macro: keep
+    # m in a3, reload macros_end into t0 after each iteration, and use
+    # a0/a1/a2/t1/t2 as scratch within the inner byte-compare.
+    la_a3 &macros_ptr
+    ld_a3,a3,0
+    la_t0 &macros_end
+    ld_t0,t0,0
+:elp_search_loop
+    la_br &elp_unknown
+    beq_a3,t0
+
+    # m->name.len == name_len?
+    ld_t1,a3,8
+    la_a0 &elp_name_len
+    ld_a2,a0,0
+    la_br &elp_search_next
+    bne_t1,a2
+
+    # byte-compare m->name.ptr vs scratch for name_len bytes.
+    ld_t1,a3,0                     # name_ptr
+    la_a0 &local_lookup_scratch_ptr
+    ld_a1,a0,0                     # lookup_ptr
+    li_t2 %0 %0
+:elp_search_cmp
+    la_br &elp_search_match
+    beq_t2,a2
+    add_a0,t1,t2
+    lb_a0,a0,0
+    add_t0,a1,t2
+    lb_t0,t0,0
+    la_br &elp_search_next
+    bne_a0,t0
+    addi_t2,t2,1
+    la_br &elp_search_cmp
+    b
+
+:elp_search_next
+    li_t1 M1PP_MACRO_RECORD_SIZE
+    add_a3,a3,t1
+    la_t0 &macros_end
+    ld_t0,t0,0
+    la_br &elp_search_loop
+    b
+
+:elp_unknown
+    la_br &err_unknown_local
+    b
+
+:elp_search_match
+    # a3 = matched macro pointer. mark = pool_used; copy body span.
+    la_a0 &pool_used
+    ld_t0,a0,0
+    la_a1 &elp_mark
+    st_t0,a1,0
+
+    li_t0 M1PP_MACRO_BODY_START_OFF
+    add_t0,a3,t0
+    ld_a0,t0,0                     # body_start
+    li_t1 M1PP_MACRO_BODY_END_OFF
+    add_t1,a3,t1
+    ld_a1,t1,0                     # body_end
+    la_br &copy_span_to_pool
+    call
+
+    # elp_after = call_end_pos
+    la_a0 &call_end_pos
+    ld_t0,a0,0
+    la_a1 &elp_after
+    st_t0,a1,0
+
+    eret
+
+:expand_builtin_call
+    enter_0
+
+    # ebc_stream = stream_ptr;  also stash builtin_tok via a register reload path
+    la_a2 &ebc_stream
+    st_a0,a2,0
+
+    # lparen = builtin_tok + 24; if (lparen >= stream->end) fatal
+    addi_t0,a1,32
+    ld_t1,a0,8           # stream->end
+    la_br &err_bad_macro_header
+    beq_t0,t1
+    la_br &err_bad_macro_header
+    blt_t1,t0
+
+    # if (lparen->kind != TOK_LPAREN) fatal
+    ld_a3,t0,0
+    li_a2 TOK_LPAREN
+    la_br &err_bad_macro_header
+    bne_a3,a2
+
+    # parse_args(lparen, stream->end)
+    mov_a0,t0
+    la_a2 &ebc_stream
+    ld_a2,a2,0
+    ld_a1,a2,8           # stream->end
+    la_br &parse_args
+    call
+
+    # snapshot call_end_pos -> ebc_call_end_pos
+    la_a0 &call_end_pos
+    ld_t0,a0,0
+    la_a1 &ebc_call_end_pos
+    st_t0,a1,0
+
+    # dispatch on builtin_tok->text. a1 (builtin_tok) is gone after parse_args,
+    # but stream->pos still points at the builtin token (we don't advance it
+    # until the dispatched branch sets stream->pos = call_end_pos), so reload
+    # builtin_tok from stream->pos.
+    la_a0 &ebc_stream
+    ld_a0,a0,0
+    ld_t0,a0,16          # stream->pos -> builtin_tok
+
+    # if tok_eq_const(tok, "!", 1) -> bytes=1
+    mov_a0,t0
+    la_a1 &const_bang
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &ebc_arg_set_1
+    bnez_a0
+
+    # if tok_eq_const(tok, "@", 1) -> bytes=2
+    la_a0 &ebc_stream
+    ld_a0,a0,0
+    ld_a0,a0,16
+    la_a1 &const_at
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &ebc_arg_set_2
+    bnez_a0
+
+    # if tok_eq_const(tok, "%", 1) -> bytes=4
+    la_a0 &ebc_stream
+    ld_a0,a0,0
+    ld_a0,a0,16
+    la_a1 &const_pct
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &ebc_arg_set_4
+    bnez_a0
+
+    # if tok_eq_const(tok, "$", 1) -> bytes=8
+    la_a0 &ebc_stream
+    ld_a0,a0,0
+    ld_a0,a0,16
+    la_a1 &const_dlr
+    li_a2 %1 %0
+    la_br &tok_eq_const
+    call
+    la_br &ebc_arg_set_8
+    bnez_a0
+
+    # if tok_eq_const(tok, "%select", 7) -> select path
+    la_a0 &ebc_stream
+    ld_a0,a0,0
+    ld_a0,a0,16
+    la_a1 &const_select
+    li_a2 %7 %0
+    la_br &tok_eq_const
+    call
+    la_br &ebc_select
+    bnez_a0
+
+    # if tok_eq_const(tok, "%str", 4) -> str path
+    la_a0 &ebc_stream
+    ld_a0,a0,0
+    ld_a0,a0,16
+    la_a1 &const_str
+    li_a2 %4 %0
+    la_br &tok_eq_const
+    call
+    la_br &ebc_str
+    bnez_a0
+
+    # if tok_eq_const(tok, "%local", 6) -> local path
+    la_a0 &ebc_stream
+    ld_a0,a0,0
+    ld_a0,a0,16
+    la_a1 &const_local
+    li_a2 %6 %0
+    la_br &tok_eq_const
+    call
+    la_br &ebc_local
+    bnez_a0
+
+    # else: fatal
+    la_br &err_bad_macro_header
+    b
+
+:ebc_arg_set_1
+    li_a0 %1 %0
+    la_a1 &ebc_bytes
+    st_a0,a1,0
+    la_br &ebc_arg_path
+    b
+:ebc_arg_set_2
+    li_a0 %2 %0
+    la_a1 &ebc_bytes
+    st_a0,a1,0
+    la_br &ebc_arg_path
+    b
+:ebc_arg_set_4
+    li_a0 %4 %0
+    la_a1 &ebc_bytes
+    st_a0,a1,0
+    la_br &ebc_arg_path
+    b
+:ebc_arg_set_8
+    li_a0 %8 %0
+    la_a1 &ebc_bytes
+    st_a0,a1,0
+    la_br &ebc_arg_path
+    b
+
+:ebc_arg_path
+    # require arg_count == 1
+    la_a0 &arg_count
+    ld_t0,a0,0
+    li_t1 %1 %0
+    la_br &err_bad_macro_header
+    bne_t0,t1
+
+    # snapshot arg_starts[0], arg_ends[0]
+    la_a0 &arg_starts_ptr
+    ld_a0,a0,0
+    ld_t0,a0,0
+    la_a1 &ebc_arg0_start
+    st_t0,a1,0
+    la_a0 &arg_ends_ptr
+    ld_a0,a0,0
+    ld_t0,a0,0
+    la_a1 &ebc_arg0_end
+    st_t0,a1,0
+
+    # value = eval_expr_range(arg0_start, arg0_end)
+    la_a0 &ebc_arg0_start
+    ld_a0,a0,0
+    la_a1 &ebc_arg0_end
+    ld_a1,a1,0
+    la_br &eval_expr_range
+    call
+
+    # ebc_value = a0
+    la_a1 &ebc_value
+    st_a0,a1,0
+
+    # stream->pos = ebc_call_end_pos; stream->line_start = 0
+    la_a0 &ebc_stream
+    ld_a0,a0,0
+    la_a1 &ebc_call_end_pos
+    ld_t0,a1,0
+    st_t0,a0,16
+    li_t1 %0 %0
+    st_t1,a0,24
+
+    # emit_hex_value(ebc_value, ebc_bytes)
+    la_a0 &ebc_value
+    ld_a0,a0,0
+    la_a1 &ebc_bytes
+    ld_a1,a1,0
+    la_br &emit_hex_value
+    call
+
+    eret
+
+:ebc_select
+    # require arg_count == 3
+    la_a0 &arg_count
+    ld_t0,a0,0
+    li_t1 %3 %0
+    la_br &err_bad_macro_header
+    bne_t0,t1
+
+    # snapshot arg_starts[0..2] / arg_ends[0..2]
+    la_a0 &arg_starts_ptr
+    ld_a0,a0,0
+    ld_t0,a0,0
+    la_a1 &ebc_arg0_start
+    st_t0,a1,0
+    la_a0 &arg_starts_ptr
+    ld_a0,a0,0
+    ld_t0,a0,8
+    la_a1 &ebc_then_start
+    st_t0,a1,0
+    la_a0 &arg_starts_ptr
+    ld_a0,a0,0
+    ld_t0,a0,16
+    la_a1 &ebc_else_start
+    st_t0,a1,0
+
+    la_a0 &arg_ends_ptr
+    ld_a0,a0,0
+    ld_t0,a0,0
+    la_a1 &ebc_arg0_end
+    st_t0,a1,0
+    la_a0 &arg_ends_ptr
+    ld_a0,a0,0
+    ld_t0,a0,8
+    la_a1 &ebc_then_end
+    st_t0,a1,0
+    la_a0 &arg_ends_ptr
+    ld_a0,a0,0
+    ld_t0,a0,16
+    la_a1 &ebc_else_end
+    st_t0,a1,0
+
+    # value = eval_expr_range(arg0_start, arg0_end)
+    la_a0 &ebc_arg0_start
+    ld_a0,a0,0
+    la_a1 &ebc_arg0_end
+    ld_a1,a1,0
+    la_br &eval_expr_range
+    call
+
+    # if (value != 0) chosen = then; else chosen = else
+    la_br &ebc_select_then
+    bnez_a0
+
+    # chosen = else
+    la_a0 &ebc_else_start
+    ld_t0,a0,0
+    la_a1 &ebc_arg0_start
+    st_t0,a1,0
+    la_a0 &ebc_else_end
+    ld_t0,a0,0
+    la_a1 &ebc_arg0_end
+    st_t0,a1,0
+    la_br &ebc_select_after_pick
+    b
+
+:ebc_select_then
+    # chosen = then
+    la_a0 &ebc_then_start
+    ld_t0,a0,0
+    la_a1 &ebc_arg0_start
+    st_t0,a1,0
+    la_a0 &ebc_then_end
+    ld_t0,a0,0
+    la_a1 &ebc_arg0_end
+    st_t0,a1,0
+
+:ebc_select_after_pick
+    # stream->pos = ebc_call_end_pos; stream->line_start = 0
+    la_a0 &ebc_stream
+    ld_a0,a0,0
+    la_a1 &ebc_call_end_pos
+    ld_t0,a1,0
+    st_t0,a0,16
+    li_t1 %0 %0
+    st_t1,a0,24
+
+    # if (chosen_start == chosen_end) return
+    la_a0 &ebc_arg0_start
+    ld_t0,a0,0
+    la_a1 &ebc_arg0_end
+    ld_t1,a1,0
+    la_br &ebc_select_done
+    beq_t0,t1
+
+    # mark = pool_used
+    la_a0 &pool_used
+    ld_t0,a0,0
+    la_a1 &ebc_mark
+    st_t0,a1,0
+
+    # copy_span_to_pool(chosen_start, chosen_end)
+    la_a0 &ebc_arg0_start
+    ld_a0,a0,0
+    la_a1 &ebc_arg0_end
+    ld_a1,a1,0
+    la_br &copy_span_to_pool
+    call
+
+    # push_pool_stream_from_mark(mark)
+    la_a0 &ebc_mark
+    ld_a0,a0,0
+    la_br &push_pool_stream_from_mark
+    call
+
+:ebc_select_done
+    eret
+
+## %str(IDENT): stringify a single WORD argument into a TOK_STRING literal.
+## Validation: arg_count == 1, arg span length == 1 token, and that token's
+## kind is TOK_WORD. Output: a freshly-allocated text span built as
+## `"` + arg.text + `"` (len = arg.text.len + 2) and a synthesized TOK_STRING
+## pointing at it. Stream pos advances to call_end_pos; line_start = 0.
+:ebc_str
+    # require arg_count == 1
+    la_a0 &arg_count
+    ld_t0,a0,0
+    li_t1 %1 %0
+    la_br &err_bad_macro_header
+    bne_t0,t1
+
+    # snapshot arg_starts[0] / arg_ends[0]
+    la_a0 &arg_starts_ptr
+    ld_a0,a0,0
+    ld_t0,a0,0
+    la_a1 &ebc_arg0_start
+    st_t0,a1,0
+    la_a0 &arg_ends_ptr
+    ld_a0,a0,0
+    ld_t0,a0,0
+    la_a1 &ebc_arg0_end
+    st_t0,a1,0
+
+    # require arg0_end - arg0_start == 32 (exactly one token)
+    la_a0 &ebc_arg0_start
+    ld_t0,a0,0
+    la_a1 &ebc_arg0_end
+    ld_t1,a1,0
+    sub_t2,t1,t0
+    li_a2 %32 %0
+    la_br &err_bad_macro_header
+    bne_t2,a2
+
+    # require arg_tok->kind == TOK_WORD
+    ld_a3,t0,0
+    li_a2 TOK_WORD
+    la_br &err_bad_macro_header
+    bne_a3,a2
+
+    # orig_len = arg_tok->text.len; out_len = orig_len + 2
+    # fatal if out_len > 256 (scratch cap; text_buf cap checked by append_text)
+    ld_t1,t0,16
+    la_a0 &ebc_str_orig_len
+    st_t1,a0,0
+    addi_t2,t1,2
+    la_a0 &ebc_str_out_len
+    st_t2,a0,0
+    li_a1 %256 %0
+    la_br &err_text_overflow
+    blt_a1,t2
+
+    # scratch[0] = '"'
+    la_t2 &ebc_str_scratch_ptr
+    ld_t2,t2,0
+    li_a3 %34 %0
+    sb_a3,t2,0
+
+    # copy arg_tok->text bytes into scratch[1..1+orig_len)
+    #   src = arg_tok->text.ptr; i = 0
+    la_a0 &ebc_arg0_start
+    ld_a0,a0,0
+    ld_t0,a0,8
+    la_a1 &ebc_str_orig_len
+    ld_t1,a1,0
+    li_a0 %0 %0
+:ebc_str_copy_loop
+    la_br &ebc_str_copy_done
+    beq_a0,t1
+    add_a1,t0,a0
+    lb_a1,a1,0
+    addi_a2,a0,1
+    add_a2,t2,a2
+    sb_a1,a2,0
+    addi_a0,a0,1
+    la_br &ebc_str_copy_loop
+    b
+:ebc_str_copy_done
+
+    # scratch[1 + orig_len] = '"'
+    la_t2 &ebc_str_scratch_ptr
+    ld_t2,t2,0
+    la_a1 &ebc_str_orig_len
+    ld_a1,a1,0
+    addi_a1,a1,1
+    add_a0,t2,a1
+    li_a3 %34 %0
+    sb_a3,a0,0
+
+    # text_ptr = append_text(&scratch, out_len)
+    la_a0 &ebc_str_scratch_ptr
+    ld_a0,a0,0
+    la_a1 &ebc_str_out_len
+    ld_a1,a1,0
+    la_br &append_text
+    call
+
+    # ebc_str_token = { TOK_STRING, text_ptr, out_len, tight=0 }
+    la_a2 &ebc_str_token
+    li_a3 TOK_STRING
+    st_a3,a2,0
+    st_a0,a2,8
+    la_a1 &ebc_str_out_len
+    ld_a1,a1,0
+    st_a1,a2,16
+    li_a1 %0 %0
+    st_a1,a2,24
+
+    # stream->pos = ebc_call_end_pos; stream->line_start = 0
+    la_a0 &ebc_stream
+    ld_a0,a0,0
+    la_a1 &ebc_call_end_pos
+    ld_t0,a1,0
+    st_t0,a0,16
+    li_t1 %0 %0
+    st_t1,a0,24
+
+    # emit_token(&ebc_str_token)
+    la_a0 &ebc_str_token
+    la_br &emit_token
+    call
+
+    eret
+
+## emit_string_as_bytes(a0=tok_ptr) -> void (fatal on bad escape).
+## Decode the contents of a TOK_STRING (between the surrounding quotes)
+## and emit each byte as one TOK_WORD via emit_hex_value(byte, 1). The
+## lexer accepts both "..." and '...'; this routine just strips the
+## first/last byte of text and decodes the middle. Recognised escapes:
+##   \n \t \r \0 \\ \"     and \xNN (two hex digits, case-insensitive).
+## hex2pp's parse_byte_stream coalesces the resulting space-separated
+## hex bytes back into a contiguous byte sequence at link time.
+:emit_string_as_bytes
+    enter_0
+
+    # require tok->text.len >= 2
+    ld_a1,a0,16
+    li_a2 %2 %0
+    la_br &err_bad_escape
+    blt_a1,a2
+
+    # src = tok->text.ptr + 1; src_len = tok->text.len - 2
+    ld_a3,a0,8
+    addi_a3,a3,1
+    la_a0 &ebc_b_src_ptr
+    st_a3,a0,0
+    addi_a1,a1,neg2
+    la_a0 &ebc_b_src_len
+    st_a1,a0,0
+
+    # ebc_b_src_i = 0
+    li_a0 %0 %0
+    la_a1 &ebc_b_src_i
+    st_a0,a1,0
+
+:ebc_b_loop
+    # if (src_i == src_len) done
+    la_a0 &ebc_b_src_i
+    ld_t0,a0,0
+    la_a1 &ebc_b_src_len
+    ld_t1,a1,0
+    la_br &ebc_b_done
+    beq_t0,t1
+
+    # c = src_ptr[src_i];  src_i++
+    # P1 lacks lb_a3,a0,0 — bounce through a1 (mov_a1,a0; lb_a3,a1,0).
+    la_a0 &ebc_b_src_ptr
+    ld_a0,a0,0
+    add_a0,a0,t0
+    mov_a1,a0
+    lb_a3,a1,0
+    addi_t0,t0,1
+    la_a1 &ebc_b_src_i
+    st_t0,a1,0
+
+    # if (c == '\\') -> escape path
+    li_a2 %92 %0
+    la_br &ebc_b_escape
+    beq_a3,a2
+
+    # literal byte: emit_hex_value(c, 1) and reloop
+    mov_a0,a3
+    li_a1 %1 %0
+    la_br &emit_hex_value
+    call
+    la_br &ebc_b_loop
+    b
+
+:ebc_b_escape
+    # Read the escape character; require at least one byte left.
+    la_a0 &ebc_b_src_i
+    ld_t0,a0,0
+    la_a1 &ebc_b_src_len
+    ld_t1,a1,0
+    la_br &err_bad_escape
+    beq_t0,t1
+    la_a0 &ebc_b_src_ptr
+    ld_a0,a0,0
+    add_a0,a0,t0
+    mov_a1,a0
+    lb_a3,a1,0                     # a3 = e
+    addi_t0,t0,1
+    la_a1 &ebc_b_src_i
+    st_t0,a1,0
+
+    # Single-char escapes: dispatch via beq chain (matches the existing
+    # proc_check_<directive> pattern). Each branch loads the resulting
+    # byte into a3 and falls through to ebc_b_emit_one.
+    li_a2 %110 %0                  # 'n'
+    la_br &ebc_b_esc_n
+    beq_a3,a2
+    li_a2 %116 %0                  # 't'
+    la_br &ebc_b_esc_t
+    beq_a3,a2
+    li_a2 %114 %0                  # 'r'
+    la_br &ebc_b_esc_r
+    beq_a3,a2
+    li_a2 %48 %0                   # '0'
+    la_br &ebc_b_esc_zero
+    beq_a3,a2
+    li_a2 %92 %0                   # '\\'
+    la_br &ebc_b_esc_bs
+    beq_a3,a2
+    li_a2 %34 %0                   # '"'
+    la_br &ebc_b_esc_dq
+    beq_a3,a2
+    li_a2 %120 %0                  # 'x'
+    la_br &ebc_b_esc_hex
+    beq_a3,a2
+    la_br &err_bad_escape
+    b
+
+:ebc_b_esc_n
+    li_a3 %10 %0                   # 0x0A
+    la_br &ebc_b_emit_one
+    b
+:ebc_b_esc_t
+    li_a3 %9 %0                    # 0x09
+    la_br &ebc_b_emit_one
+    b
+:ebc_b_esc_r
+    li_a3 %13 %0                   # 0x0D
+    la_br &ebc_b_emit_one
+    b
+:ebc_b_esc_zero
+    li_a3 %0 %0                    # 0x00
+    la_br &ebc_b_emit_one
+    b
+:ebc_b_esc_bs
+    li_a3 %92 %0                   # 0x5C
+    la_br &ebc_b_emit_one
+    b
+:ebc_b_esc_dq
+    li_a3 %34 %0                   # 0x22
+    la_br &ebc_b_emit_one
+    b
+
+:ebc_b_emit_one
+    # Common tail for single-char escapes: emit_hex_value(a3, 1), reloop.
+    mov_a0,a3
+    li_a1 %1 %0
+    la_br &emit_hex_value
+    call
+    la_br &ebc_b_loop
+    b
+
+:ebc_b_esc_hex
+    # \xNN: require two hex chars at src[src_i], src[src_i+1].
+    la_a0 &ebc_b_src_i
+    ld_t0,a0,0
+    la_a1 &ebc_b_src_len
+    ld_t1,a1,0
+    sub_t2,t1,t0                   # remaining = src_len - src_i
+    li_a3 %2 %0
+    la_br &err_bad_escape
+    blt_t2,a3
+
+    # hi char: src[src_i]; decode via hex_digit_table[c]; fail if 0xFF.
+    la_a0 &ebc_b_src_ptr
+    ld_a0,a0,0
+    add_a0,a0,t0
+    lb_a0,a0,0                     # a0 = hi char
+    la_a1 &hex_digit_table
+    add_a1,a1,a0
+    lb_a2,a1,0                     # a2 = hi digit (or 0xFF)
+    li_a3 %255 %0
+    la_br &err_bad_escape
+    beq_a2,a3
+    # Stash hi digit into ebc_b_hex_hi for the (hi << 4) | lo combine
+    # below — the lo-digit lookup clobbers a2.
+    la_a0 &ebc_b_hex_hi
+    st_a2,a0,0
+
+    # advance past hi char
+    la_a0 &ebc_b_src_i
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+
+    # lo char: src[src_i]; decode via hex_digit_table[c]; fail if 0xFF.
+    la_a0 &ebc_b_src_ptr
+    ld_a0,a0,0
+    add_a0,a0,t0
+    lb_a0,a0,0                     # a0 = lo char
+    la_a1 &hex_digit_table
+    add_a1,a1,a0
+    lb_a2,a1,0                     # a2 = lo digit (or 0xFF)
+    li_a3 %255 %0
+    la_br &err_bad_escape
+    beq_a2,a3
+
+    # advance past lo char
+    la_a0 &ebc_b_src_i
+    ld_t0,a0,0
+    addi_t0,t0,1
+    st_t0,a0,0
+
+    # byte = (hi << 4) | lo. shli_a3,t0,4 puts hi<<4 in a3, then or.
+    la_a0 &ebc_b_hex_hi
+    ld_t0,a0,0
+    shli_a3,t0,4
+    or_a3,a3,a2
+
+    la_br &ebc_b_emit_one
+    b
+
+:ebc_b_done
+    eret
+
+## %local(NAME): emit-time variant. expand_builtin_call has already
+## parse_args'd the call (so arg_starts/arg_ends/arg_count/call_end_pos
+## are set), but expand_local_into_pool re-parses internally so it can
+## also be invoked from eval_expr_atom where parse_args wasn't called.
+## After the helper returns, advance the stream past the call and push
+## the body slice as a fresh stream for rescan.
+:ebc_local
+    # call_tok = stream->pos; limit = stream->end
+    la_a0 &ebc_stream
+    ld_a0,a0,0
+    ld_t0,a0,16                    # call_tok
+    ld_t1,a0,8                     # limit
+    mov_a0,t0
+    mov_a1,t1
+    la_br &expand_local_into_pool
+    call
+
+    # stream->pos = elp_after; stream->line_start = 0
+    la_a0 &ebc_stream
+    ld_a0,a0,0
+    la_a1 &elp_after
+    ld_t0,a1,0
+    st_t0,a0,16
+    li_t1 %0 %0
+    st_t1,a0,24
+
+    # push_pool_stream_from_mark(elp_mark)
+    la_a0 &elp_mark
+    ld_a0,a0,0
+    la_br &push_pool_stream_from_mark
+    call
+
+    eret
+
+## --- Error paths -------------------------------------------------------------
+## Each err_* loads a (msg, len) pair for fatal; fatal writes "m1pp: <msg>\n"
+## to stderr and exits 1. Error labels are branched to from range/overflow
+## checks throughout the code.
+
+:err_usage
+    la_a0 &msg_usage
+    la_br &fatal
+    b
+:err_open_input
+    la_a0 &msg_open_input
+    la_br &fatal
+    b
+:err_read
+    la_a0 &msg_read
+    la_br &fatal
+    b
+:err_input_too_big
+    la_a0 &msg_input_too_big
+    la_br &fatal
+    b
+:err_open_output
+    la_a0 &msg_open_output
+    la_br &fatal
+    b
+:err_write
+    la_a0 &msg_write
+    la_br &fatal
+    b
+:err_text_overflow
+    la_a0 &msg_text_overflow
+    la_br &fatal
+    b
+:err_token_overflow
+    la_a0 &msg_token_overflow
+    la_br &fatal
+    b
+:err_output_overflow
+    la_a0 &msg_output_overflow
+    la_br &fatal
+    b
+:err_unterminated_macro
+    la_a0 &msg_unterminated_macro
+    la_br &fatal
+    b
+:err_bad_macro_header
+    la_a0 &msg_bad_macro_header
+    la_br &fatal
+    b
+:err_too_many_macros
+    la_a0 &msg_too_many_macros
+    la_br &fatal
+    b
+:err_macro_body_overflow
+    la_a0 &msg_macro_body_overflow
+    la_br &fatal
+    b
+:err_unbalanced_braces
+    la_a0 &msg_unbalanced_braces
+    la_br &fatal
+    b
+:err_bad_directive
+    la_a0 &msg_bad_directive
+    la_br &fatal
+    b
+:err_unterminated_directive
+    la_a0 &msg_unterminated_directive
+    la_br &fatal
+    b
+:err_bad_escape
+    la_a0 &msg_bad_escape
+    la_br &fatal
+    b
+:err_bad_frame_header
+    la_a0 &msg_bad_frame_header
+    la_br &fatal
+    b
+:err_frame_already_active
+    la_a0 &msg_frame_already_active
+    la_br &fatal
+    b
+:err_frame_underflow
+    la_a0 &msg_frame_underflow
+    la_br &fatal
+    b
+:err_frame_not_closed
+    la_a0 &msg_frame_not_closed
+    la_br &fatal
+    b
+:err_local_outside_frame
+    la_a0 &msg_local_outside_frame
+    la_br &fatal
+    b
+:err_unknown_local
+    la_a0 &msg_unknown_local
+    la_br &fatal
+    b
+:err_local_name_too_long
+    la_a0 &msg_local_name_too_long
+    la_br &fatal
+    b
+
+## fatal(a0=msg_ptr): writes "m1pp: <msg>\n" to stderr and exits 1.
+## Length is computed inline via a strlen loop (messages are NUL-terminated).
+## Reached by unconditional branch from any err_* stub, so no frame is required.
+:fatal
+    # Stash msg_ptr; compute len inline into err_saved_len.
+    la_a1 &err_saved_msg
+    st_a0,a1,0
+    li_t0 %0 %0
+:fatal_strlen
+    add_t1,a0,t0
+    lb_t1,t1,0
+    la_br &fatal_strlen_done
+    beqz_t1
+    addi_t0,t0,1
+    la_br &fatal_strlen
+    b
+:fatal_strlen_done
+    la_a1 &err_saved_len
+    st_t0,a1,0
+
+    # write(2, "m1pp:", 5)
+    li_a0 sys_write
+    li_a1 %2 %0
+    la_a2 &msg_prefix
+    li_a3 %5 %0
+    syscall
+
+    # write(2, msg, len)
+    la_a0 &err_saved_msg
+    ld_a2,a0,0
+    la_a0 &err_saved_len
+    ld_a3,a0,0
+    li_a0 sys_write
+    li_a1 %2 %0
+    syscall
+
+    # write(2, "\n", 1)
+    li_a0 sys_write
+    li_a1 %2 %0
+    la_a2 &msg_newline
+    li_a3 %1 %0
+    syscall
+
+    # exit(1)
+    li_a0 sys_exit
+    li_a1 %1 %0
+    syscall
+
+## Sentinel: marks the boundary between executable text and rodata. Read by
+## scripts/disasm-elf.sh (via scripts/m1-symbols.py) to bound disassembly
+## so trailing strings don't decode as bogus instructions.
+:_text_end
+
+## --- Rodata: const tokens (for tok_eq_const) and fatal messages --------------
+
+:const_macro "%macro"
+:const_endm "%endm"
+:const_paste "##"
+:const_lparen "("
+:const_rparen ")"
+:const_comma ","
+:const_lbrace "{"
+:const_rbrace "}"
+:const_bang "!"
+:const_at "@"
+:const_pct "%"
+:const_dlr "$"
+:const_select "%select"
+:const_str "%str"
+:const_struct "%struct"
+:const_enum "%enum"
+:const_size "SIZE"
+:const_count "COUNT"
+:const_frame "%frame"
+:const_endframe "%endframe"
+:const_local "%local"
+:const_bytes "%bytes"
+## Suffix appended to the frame name when looking up <frame>_FRAME.<field>.
+:const_frame_suffix "_FRAME."
+
+## Operator strings for expr_op_code. Each is a raw byte literal; lengths
+## are passed separately to tok_eq_const. "<=" must be tested before "<"
+## so the longer match wins; same for ">=" before ">".
+:op_plus "+"
+:op_minus "-"
+:op_star "*"
+:op_slash "/"
+:op_percent "%"
+:op_shl "<<"
+:op_shr ">>"
+:op_amp "&"
+:op_bar "|"
+:op_caret "^"
+:op_tilde "~"
+:op_eq "="
+:op_ne "!="
+:op_lt "<"
+:op_le "<="
+:op_gt ">"
+:op_ge ">="
+:op_strlen "strlen"
+
+## Nibble-to-hex lookup table for emit_hex_value.
+:hex_chars "0123456789ABCDEF"
+
+## 256-byte hex-digit lookup table for %bytes(\xNN). Indexed by source
+## byte; value is the digit (0..15) for '0'..'9'/'a'..'f'/'A'..'F', or
+## 0xFF for any other input. The escape decoder reads two source bytes
+## and combines (hi << 4) | lo into the emitted byte; either lookup
+## returning 0xFF triggers err_bad_escape.
+:hex_digit_table
+## 0x00-0x1F: all invalid
+'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+## 0x20-0x2F: invalid
+'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+## 0x30-0x39 = '0'..'9' -> 0..9; 0x3A-0x3F invalid
+'00010203040506070809FFFFFFFFFFFF'
+## 0x40 invalid; 0x41-0x46 = 'A'..'F' -> 10..15; 0x47-0x5F invalid
+'FF0A0B0C0D0E0FFFFFFFFFFFFFFFFFFF'
+'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+## 0x60 invalid; 0x61-0x66 = 'a'..'f' -> 10..15; 0x67-0x7F invalid
+'FF0A0B0C0D0E0FFFFFFFFFFFFFFFFFFF'
+'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+## 0x80-0xFF: all invalid
+'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'
+
+## 256-byte char-class table for lex_loop / lex_word_scan. Indexed by the
+## source byte `c`; value is the class code dispatched by lex_loop:
+##   0  WORD (default; word_scan continues through this byte)
+##   1  SKIP (non-newline whitespace: 0x09 tab, 0x0B-0x0D vt/ff/cr, 0x20 sp)
+##   2  NEWLINE (0x0A)
+##   3  STRING (0x22 ", 0x27 ')
+##   4  HASH (0x23 #)
+##   5  COMMENT (0x3B ;)
+##   6  LPAREN (0x28 ()
+##   7  RPAREN (0x29 ))
+##   8  COMMA  (0x2C ,)
+##   9  LBRACE (0x7B {)
+##  10  RBRACE (0x7D })
+##  11  NUL (0x00 — lex_loop fall-through to lex_done)
+:lex_char_class
+## bytes 0x00-0x1F: NUL=11, \t=1, \n=2, \v/\f/\r=1, rest=0
+'0B000000000000000001020101010000'
+'00000000000000000000000000000000'
+## bytes 0x20-0x3F: sp=1, "=3, #=4, '=3, (=6, )=7, ,=8, ;=5
+'01000304000000030607000008000000'
+'00000000000000000000000500000000'
+## bytes 0x40-0x7F: {=9 (0x7B), }=10 (0x7D)
+'00000000000000000000000000000000'
+'00000000000000000000000000000000'
+'00000000000000000000000000000000'
+'000000000000000000000009000A0000'
+## bytes 0x80-0xFF: all 0 (word)
+'00000000000000000000000000000000'
+'00000000000000000000000000000000'
+'00000000000000000000000000000000'
+'00000000000000000000000000000000'
+'00000000000000000000000000000000'
+'00000000000000000000000000000000'
+'00000000000000000000000000000000'
+'00000000000000000000000000000000'
+
+## BSS pointer-slot init table (for p1_main's bss_init_loop).
+## Each entry: 8-byte slot ptr (&label + 4 pad) + 8-byte OFF_* constant.
+## Walked linearly; order is irrelevant.
+:bss_init_tbl
+&paste_scratch_ptr ZERO4 OFF_paste_scratch
+&local_label_scratch_ptr ZERO4 OFF_local_label_scratch
+&df_name_scratch_ptr ZERO4 OFF_df_name_scratch
+&ebc_str_scratch_ptr ZERO4 OFF_ebc_str_scratch
+&arg_starts_ptr ZERO4 OFF_arg_starts
+&arg_ends_ptr ZERO4 OFF_arg_ends
+&input_buf_ptr ZERO4 OFF_input_buf
+&output_buf_ptr ZERO4 OFF_output_buf
+&text_buf_ptr ZERO4 OFF_text_buf
+&source_tokens_ptr ZERO4 OFF_source_tokens
+&macros_ptr ZERO4 OFF_macros
+&macro_body_tokens_ptr ZERO4 OFF_macro_body_tokens
+&streams_ptr ZERO4 OFF_streams
+&expand_pool_ptr ZERO4 OFF_expand_pool
+&expr_frames_ptr ZERO4 OFF_expr_frames
+&local_lookup_scratch_ptr ZERO4 OFF_local_lookup_scratch
+&macro_body_param_idx_ptr ZERO4 OFF_macro_body_param_idx
+&macro_body_is_local_label_ptr ZERO4 OFF_macro_body_is_local_label
+:bss_init_tbl_end
+
+:msg_prefix "m1pp: "
+:msg_newline "
+"
+## All err_* messages below are NUL-terminated (trailing '00'); fatal uses an
+## inline strlen loop rather than a caller-supplied length.
+:msg_usage "usage: m1pp input.M1 output.M1" '00'
+:msg_open_input "failed to open input file" '00'
+:msg_read "failed to read input" '00'
+:msg_input_too_big "input file too large" '00'
+:msg_open_output "failed to open output file" '00'
+:msg_write "failed to write output" '00'
+:msg_text_overflow "text buffer overflow" '00'
+:msg_token_overflow "token buffer overflow" '00'
+:msg_output_overflow "output buffer overflow" '00'
+:msg_unterminated_macro "unterminated %macro definition" '00'
+:msg_bad_macro_header "bad macro header" '00'
+:msg_too_many_macros "too many macros" '00'
+:msg_macro_body_overflow "macro body overflow" '00'
+:msg_unbalanced_braces "unbalanced braces" '00'
+:msg_bad_directive "bad %struct/%enum directive" '00'
+:msg_unterminated_directive "unterminated %struct/%enum directive" '00'
+:msg_bad_escape "bad escape in %bytes" '00'
+:msg_bad_frame_header "bad frame header" '00'
+:msg_frame_already_active "frame already active" '00'
+:msg_frame_underflow "frame underflow" '00'
+:msg_frame_not_closed "frame not closed" '00'
+:msg_local_outside_frame "local outside frame" '00'
+:msg_unknown_local "unknown local" '00'
+:msg_local_name_too_long "local name too long" '00'
+
+## --- BSS ---------------------------------------------------------------------
+## Placed before :ELF_end so filesz/memsz (which this ELF header sets equal)
+## covers the whole zero-initialized region. Bloats the file by the BSS size,
+## but avoids a custom ELF header.
+##
+## Layout: scalars (pointers, counters, lexer/processor state), then the
+## four arenas — input_buf, output_buf, text_buf, source_tokens — whose
+## sizes match the CAP constants above.
+
+## Scalars (each 8 bytes).
+:input_fd
+ZERO8
+:input_len
+ZERO8
+:output_fd
+ZERO8
+:output_used
+ZERO8
+:output_written
+ZERO8
+:output_need_space
+ZERO8
+:input_path
+ZERO8
+:output_path
+ZERO8
+:text_used
+ZERO8
+:source_end
+ZERO8
+:lex_ptr
+ZERO8
+:lex_start
+ZERO8
+:lex_quote
+ZERO8
+:lex_punct_kind
+ZERO8
+:lex_saw_separator
+ZERO8
+:proc_pos
+ZERO8
+:proc_line_start
+ZERO8
+## proc_has_paren — set per iteration of proc_loop to 1 when the next
+## token is a tight TOK_LPAREN (i.e. the current token is a paren-call
+## form). Read by directive/builtin sub-handlers that gate on paren form
+## (%select, %str, %bytes, %local, !@$% arith, user-macro paren call).
+:proc_has_paren
+ZERO8
+:macros_end
+ZERO8
+:macro_body_end
+ZERO8
+:def_m_ptr
+ZERO8
+:def_param_ptr
+ZERO8
+:def_body_line_start
+ZERO8
+## def_body_meta_idx — slot index of the body token currently being copied
+## by def_body_copy, i.e. (macro_body_end - macro_body_tokens) / 32. Used
+## as the parallel-array index for macro_body_param_idx[] / _is_local_label[]
+## across the find_param call, which clobbers caller-saved registers.
+:def_body_meta_idx
+ZERO8
+:pf_stream_end
+ZERO8
+
+## --- Frame state -------------------------------------------------------------
+## Single-slot "current frame" used by %local. current_frame_ptr/_len point
+## into stable text memory (input_buf or text_buf), borrowed from the WORD
+## token that named the frame. frame_active is 0 / 1.
+## elp_after / elp_mark are expand_local_into_pool's outputs (mirroring
+## emt_after_pos / emt_mark for expand_macro_tokens).
+:current_frame_ptr
+ZERO8
+:current_frame_len
+ZERO8
+:frame_active
+ZERO8
+:elp_after
+ZERO8
+:elp_mark
+ZERO8
+:elp_arg_ptr
+ZERO8
+:elp_arg_len
+ZERO8
+:elp_name_len
+ZERO8
+:err_saved_msg
+ZERO8
+:err_saved_len
+ZERO8
+
+## Stream / pool / arg / expression scalars. Each is one u64 (ZERO8).
+## pool_used      — byte offset into expand_pool (i.e. next write slot).
+## stream_top     — stream stack depth in bytes (count × 40; 0 == empty).
+## arg_count      — number of args produced by the most recent parse_args.
+## call_end_pos   — Token* one past the ')' of that call.
+## expr_frame_top — ExprFrame stack depth inside eval_expr_range.
+## emt_after_pos, emt_mark — expand_macro_tokens output slots (Token* and
+##                           byte offset into expand_pool).
+## eval_after_pos, eval_value — eval_expr_atom output slots (Token* and i64).
+##                              Callers MUST snapshot these before any nested
+##                              eval_* call that could overwrite them.
+:pool_used
+ZERO8
+:stream_top
+ZERO8
+:arg_count
+ZERO8
+:call_end_pos
+ZERO8
+:expr_frame_top
+ZERO8
+:emt_after_pos
+ZERO8
+:emt_mark
+ZERO8
+:eval_after_pos
+ZERO8
+:eval_value
+ZERO8
+
+## Paste-pass spill slots. Both append_pasted_token and paste_pool_range
+## call other functions, so all locals must round-trip through BSS
+## across the call.
+##   paste_dst_save  — dst Token* spilled across append_text
+##   paste_left_ptr/_len, paste_right_ptr/_len — operand spans for the
+##                       byte-copy loops in append_pasted_token
+##   paste_total_len — left.len + right.len, reused after append_text
+##   paste_start     — expand_pool + mark; needed to detect "## is first"
+##                     after registers are clobbered by append_pasted_token
+##   paste_in        — current read cursor (Token*)
+##   paste_out       — current write cursor (Token*)
+##   paste_end       — exclusive end (Token*), = expand_pool + pool_used
+:paste_dst_save
+ZERO8
+:paste_left_ptr
+ZERO8
+:paste_left_len
+ZERO8
+:paste_right_ptr
+ZERO8
+:paste_right_len
+ZERO8
+:paste_total_len
+ZERO8
+:paste_start
+ZERO8
+:paste_in
+ZERO8
+:paste_out
+ZERO8
+:paste_end
+ZERO8
+
+## paste_scratch — 256-byte working buffer for append_pasted_token.
+## We assemble left.text ++ right.text here, then call
+## append_text(&paste_scratch, total_len) to copy into the durable
+## text_buf arena. 256 bytes is M0's quoted-literal cap.
+
+## parse_args + expand_macro_tokens + find_param spill slots (P1 has
+## no callee-save spill on enter, and find_param's inner byte compare
+## needs every caller-saved register; parse_args + expand_macro_tokens
+## carry state across iterations and nested calls). One u64 each (ZERO8).
+:pa_pos
+ZERO8
+:pa_arg_start
+ZERO8
+:pa_depth
+ZERO8
+:pa_arg_index
+ZERO8
+:pa_limit
+ZERO8
+:pa_brace_depth
+ZERO8
+## args_have_paste — sticky 0/1 set by parse_args when the call's argument
+## span contains TOK_PASTE. expand_macro_tokens snapshots it into
+## emt_saw_arg_paste right after parse_args, then ORs it with
+## macro->has_paste to decide whether to run paste_pool_range. Lets us
+## skip the pool sweep when neither body nor args contribute a `##`.
+:args_have_paste
+ZERO8
+:emt_call_tok
+ZERO8
+:emt_limit
+ZERO8
+:emt_macro
+ZERO8
+:emt_saw_arg_paste
+ZERO8
+## emt_cached_param_idx — body token's param index (0 = not a param) read
+## once from macro_body_param_idx[] at the top of emt_loop, then reused in
+## emt_do_substitute_paste / _plain instead of re-running find_param.
+:emt_cached_param_idx
+ZERO8
+:emt_body_pos
+ZERO8
+:emt_body_end
+ZERO8
+:emt_body_start
+ZERO8
+
+## Local-label rewrite. next_expansion_id is the monotonic counter
+## (never reset); emt_expansion_id snapshots it at the start of each
+## expand_macro_tokens call so nested-call BSS reuse is safe.
+## ll_* slots hold body-token span + derived sizes while building the
+## renamed text in local_label_scratch.
+:next_expansion_id
+ZERO8
+:emt_expansion_id
+ZERO8
+:ll_src_ptr
+ZERO8
+:ll_src_len
+ZERO8
+:ll_tail_len
+ZERO8
+:ll_digit_count
+ZERO8
+:ll_digit_cursor
+ZERO8
+:ll_total_len
+ZERO8
+
+## local_label_digits: 24-byte reverse-fill scratch for the decimal
+## rendering of emt_expansion_id (fits any u64 value).
+:local_label_digits
+ZERO8 ZERO8 ZERO8
+
+## local_label_scratch: 128-byte working buffer for the renamed text
+## (sigil + tail + "__" + digits) before it's copied into text_buf via
+## append_text. Caps the combined tail + digit length at ~125 bytes,
+## which is ample for any realistic local-label name.
+
+## %struct / %enum scratch. define_fielded calls append_text twice
+## per synthesized macro, so every piece of state that must survive a call
+## lives here rather than in a register.
+##   df_stride               — 8 for %struct, 1 for %enum
+##   df_total_name_ptr/_len  — "SIZE" (4) for struct, "COUNT" (5) for enum
+##   df_base_ptr/_len        — directive's NAME token span
+##   df_index                — running field index, 0..N
+##   df_suffix_ptr/_len      — current synthesized field suffix
+##   df_value                — index * stride for this macro's body
+##   df_name_len             — base_len + 1 + suffix_len
+##   df_digit_count/_cursor  — df_render_decimal output
+:df_stride
+ZERO8
+:df_total_name_ptr
+ZERO8
+:df_total_name_len
+ZERO8
+:df_base_ptr
+ZERO8
+:df_base_len
+ZERO8
+:df_index
+ZERO8
+:df_suffix_ptr
+ZERO8
+:df_suffix_len
+ZERO8
+:df_value
+ZERO8
+:df_name_len
+ZERO8
+:df_digit_count
+ZERO8
+:df_digit_cursor
+ZERO8
+
+## df_name_scratch: 256-byte working buffer for "BASE.SUFFIX" before
+## append_text copies it to text_buf. 256 B matches paste_scratch /
+## ebc_str_scratch; df_emit_field asserts nothing explicit, but realistic
+## struct/enum names stay well under 128 chars.
+
+## df_digit_scratch: 24-byte reverse-fill buffer for the decimal rendering
+## of df_value (any u64 fits).
+:df_digit_scratch
+ZERO8 ZERO8 ZERO8
+
+:fp_macro
+ZERO8
+:fp_tok
+ZERO8
+:fp_pcount
+ZERO8
+:fp_idx
+ZERO8
+
+## Expression-evaluator scratch slots. expr_op_code spills its tok
+## argument to eoc_tok across tok_eq_const calls. apply_expr_op spills
+## op/args/argc and uses acc/i as the accumulator and loop induction var
+## inside the variadic folds.
+:eoc_tok
+ZERO8
+:aeo_op
+ZERO8
+:aeo_args
+ZERO8
+:aeo_argc
+ZERO8
+:aeo_acc
+ZERO8
+:aeo_i
+ZERO8
+
+## Builtin scratch.
+## emit_hex_value: ehv_value/bytes hold the args; ehv_scratch is a 24-byte
+## buffer (max 16 chars used: 16 hex chars for an 8-byte $-emit; rounded
+## up to keep the next slot 8-byte aligned); ehv_token is a synthesized
+## 32-byte Token { kind, text_ptr, text_len, tight }.
+:ehv_value
+ZERO8
+:ehv_bytes
+ZERO8
+:ehv_scratch
+ZERO8 ZERO8 ZERO8
+:ehv_token
+ZERO8 ZERO8 ZERO8 ZERO8
+
+## expand_builtin_call: snapshots the stream pointer, the post-call resume
+## position, the byte count for !@%$, the eval_expr_range result, the chosen
+## arg span (start/end), the unchosen-side spans for %select, and the
+## pool mark used to push the chosen-stream slice.
+:ebc_stream
+ZERO8
+:ebc_call_end_pos
+ZERO8
+:ebc_bytes
+ZERO8
+:ebc_value
+ZERO8
+:ebc_arg0_start
+ZERO8
+:ebc_arg0_end
+ZERO8
+:ebc_then_start
+ZERO8
+:ebc_then_end
+ZERO8
+:ebc_else_start
+ZERO8
+:ebc_else_end
+ZERO8
+:ebc_mark
+ZERO8
+
+## %str builtin scratch. ebc_str_orig_len / ebc_str_out_len spill the
+## argument text length and its +2 output length across append_text;
+## ebc_str_token is the synthesized TOK_STRING { kind, text_ptr, text_len,
+## tight } handed to emit_token; ebc_str_scratch is a 256-byte assembly
+## buffer (matches paste_scratch / M0's quoted-literal cap).
+:ebc_str_orig_len
+ZERO8
+:ebc_str_out_len
+ZERO8
+:ebc_str_token
+ZERO8 ZERO8 ZERO8 ZERO8
+
+## %bytes builtin scratch. ebc_b_src_ptr/_len/_i walk the input string
+## across emit_hex_value calls (which clobber every caller-saved reg).
+## ebc_b_hex_hi spills the high nibble across the second hex_digit_table
+## lookup for the low nibble. Each source byte emits independently via
+## emit_hex_value(byte, 1); hex2pp's parse_byte_stream coalesces the
+## resulting space-separated runs back into a contiguous byte stream.
+:ebc_b_src_ptr
+ZERO8
+:ebc_b_src_len
+ZERO8
+:ebc_b_src_i
+ZERO8
+:ebc_b_hex_hi
+ZERO8
+
+## arg_starts[16] / arg_ends[16]: 16 × 8 = 128 bytes each, i.e. 4 ZERO32.
+## Written by parse_args; read by expand_macro_tokens and expand_builtin_call.
+
+## input_buf: 8 KB (M1PP_INPUT_CAP)
+
+## output_buf: 8 KB (M1PP_OUTPUT_CAP)
+
+## text_buf: 1 MB (M1PP_TEXT_CAP)
+
+## source_tokens (M1PP_TOKENS_END)
+
+## macros: 32 records × 296 bytes = 9472 bytes (M1PP_MACROS_CAP).
+## 37 lines × 256 bytes = 9472. Each line is 8 × ZERO32 = 256 bytes.
+
+## macro_body_tokens: 256 slots × 24 bytes = 6 KB (M1PP_MACRO_BODY_CAP).
+## 24 lines × 256 bytes = 6144. Source tokens are copied in 24 bytes at a
+## time as macro bodies are recorded.
+
+## streams: 16 Stream records × 40 bytes = 640 bytes (M1PP_STREAM_STACK_CAP).
+## 20 ZERO32 = 2 lines of 8 + 1 line of 4.
+
+## expand_pool: 256 Token slots × 24 bytes = 6144 bytes (M1PP_EXPAND_CAP).
+## 24 lines × 8 ZERO32 = 192 ZERO32.
+
+## expr_frames: 16 × 144 bytes = 2304 bytes (M1PP_EXPR_FRAMES_CAP).
+## 9 lines × 8 ZERO32 = 72 ZERO32.
+
+## --- BSS pointer slots (set by p1_main; one per BSS buffer) -----------------
+:paste_scratch_ptr
+ZERO8
+:local_label_scratch_ptr
+ZERO8
+:df_name_scratch_ptr
+ZERO8
+:ebc_str_scratch_ptr
+ZERO8
+:arg_starts_ptr
+ZERO8
+:arg_ends_ptr
+ZERO8
+:input_buf_ptr
+ZERO8
+:output_buf_ptr
+ZERO8
+:text_buf_ptr
+ZERO8
+:source_tokens_ptr
+ZERO8
+:macros_ptr
+ZERO8
+:macro_body_tokens_ptr
+ZERO8
+:streams_ptr
+ZERO8
+:expand_pool_ptr
+ZERO8
+:expr_frames_ptr
+ZERO8
+:local_lookup_scratch_ptr
+ZERO8
+:macro_body_param_idx_ptr
+ZERO8
+:macro_body_is_local_label_ptr
+ZERO8
+
+:ELF_end

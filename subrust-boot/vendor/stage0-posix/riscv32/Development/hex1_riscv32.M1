@@ -1,0 +1,535 @@
+## Copyright (C) 2021 Andrius Štikonas
+## This file is part of stage0.
+##
+## stage0 is free software: you can redistribute it and/or modify
+## it under the terms of the GNU General Public License as published by
+## the Free Software Foundation, either version 3 of the License, or
+## (at your option) any later version.
+##
+## stage0 is distributed in the hope that it will be useful,
+## but WITHOUT ANY WARRANTY; without even the implied warranty of
+## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+## GNU General Public License for more details.
+##
+## You should have received a copy of the GNU General Public License
+## along with stage0.  If not, see <http://www.gnu.org/licenses/>.
+
+; Where the ELF Header is going to hit
+; Simply jump to _start
+; Our main function
+:_start
+
+; Register use:
+; s2: input fd
+; s3: output fd
+; s4: toggle
+; s5: hold
+; s6: ip
+; s7: tempword
+; s8: shiftregister
+
+    rd_a2 rs1_sp !8 lw                ; Input file name
+
+    ; Initialize globals
+    rd_s4 !-1 addi                    ; Toggle
+    rd_s5 addi                        ; Hold
+    rd_s6 addi                        ; Instruction Pointer
+
+    ; Open input file and store FD in s2
+    rd_a7 !56 addi                    ; sys_openat
+    rd_a0 !-100 addi                  ; AT_FDCWD
+    rd_a1 rs1_a2 mv                   ; file name
+    rd_a2 addi                        ; read only
+    ecall                             ; syscall
+    rs1_a0 @Fail bltz                 ; Error opening file
+    rd_s2 rs1_a0 mv                   ; Save fd in for later
+
+    ; Set default FD for output file to stdout
+    rd_s3 !1 addi
+
+    ; If we only have 2 arguments, don't use the third (it's not set)
+    rd_t0 !2 addi
+    rd_a0 rs1_sp lw                   ; Get number of the args
+    rs1_a0 rs2_t0 @Fail blt           ; No input file provided
+    rs1_a0 rs2_t0 @after_open beq     ; No output file provided. Use stdout
+
+    ; Open output file and store the FD in s3
+    rd_a7 !56 addi                    ; sys_openat
+    rd_a0 !-100 addi                  ; AT_FDCWD
+    rd_a1 rs1_sp !12 lw               ; Output file (argument 3)
+    rd_a2 !577 addi                   ; octal 00001101
+    ; O_TRUNC   00001000
+    ; O_CREAT   00000100
+    ; O_WRONLY  00000001
+    ; OCTAL!
+    rd_a3 !448 addi                   ; Set read, write, execute permission on user
+    ; S_IRWXU  00700
+    ; OCTAL!
+    ecall                             ; syscall
+    rd_s3 rs1_a0 mv                   ; Save fd in for later
+
+:after_open
+    rd_ra $First_pass jal             ; First pass
+
+    ; Rewind input file
+    rd_a7 !62 addi                    ; sys_llseek
+    rd_a0 rs1_s2 mv                   ; Input file descriptor
+    rd_a1 mv                          ; Set offset to zero
+    rd_a2 mv                          ; Set offset to zero
+    rd_a4 mv                          ; Set result pointer to zero
+    rd_a4 mv                          ; Set whence to zero
+    ecall                             ; syscall
+
+    ; Initialize globals
+    rd_s4 !-1 addi                    ; Toggle
+    rd_s5 addi                        ; Hold
+    rd_s6 addi                        ; Instruction Pointer
+    rd_s7 addi                        ; tempword
+    rd_s8 addi                        ; Shift register
+
+    rd_ra $Second_pass jal            ; Now do the second pass
+
+    $Done jal                         ; We are done
+
+; First pass loop to determine addresses of labels
+:First_pass
+    rd_sp rs1_sp !-4 addi             ; Allocate stack
+    rs1_sp rs2_ra sw                  ; protect ra
+
+:First_pass_loop
+    rd_ra $Read_byte jal              ; Get another byte
+
+    ; Deal with EOF
+    rd_t1 !-4 addi
+    rs1_a0 rs2_t1 @First_pass_done beq
+
+    ; Check for :
+    rd_t1 !0x3A addi
+    rs1_a0 rs2_t1 @First_pass_0 bne
+    rd_ra $StoreLabel jal             ; Store this label
+
+:First_pass_0
+    ; Check for !
+    rd_t1 !0x21 addi
+    rs1_a0 rs2_t1 @Throwaway_token beq
+
+    ; Check for @
+    rd_t1 !0x40 addi
+    rs1_a0 rs2_t1 @Throwaway_token beq
+
+    ; Check for $
+    rd_t1 !0x24 addi
+    rs1_a0 rs2_t1 @Throwaway_token beq
+
+    ; Check for ~
+    rd_t1 !0x7E addi
+    rs1_a0 rs2_t1 @Throwaway_token beq
+
+    rd_a1 !-1 addi                    ; write = false
+    rd_ra $DoByte jal                 ; Deal with everything else
+
+    rd_t1 !-4 addi                    ; Deal with EOF
+    rs1_a0 rs2_t1 @First_pass_done beq
+
+    $First_pass_loop jal              ; Keep looping
+
+:Throwaway_token
+    ; Deal with Pointer to label
+    rd_ra $Read_byte jal              ; Drop the char
+    $First_pass_loop jal              ; Loop again
+
+:First_pass_done
+    rd_ra rs1_sp lw                   ; restore ra
+    rd_sp rs1_sp !4 addi              ; deallocate stack
+    rs1_ra jalr                       ; return
+
+:Second_pass
+    rd_sp rs1_sp !-4 addi             ; Allocate stack
+    rs1_sp rs2_ra sw                  ; protect ra
+
+:Second_pass_loop
+    rd_ra $Read_byte jal              ; Read another byte
+
+    ; Deal with EOF
+    rd_t1 !-4 addi                    ; Deal with EOF
+    rs1_a0 rs2_t1 @Second_pass_done beq
+
+    ; Drop the label
+    rd_t1 !0x3A addi
+    rs1_a0 rs2_t1 @Second_pass_0 bne
+
+    rd_ra $Read_byte jal              ; Read the label
+    $Second_pass_loop jal             ; Continue looping
+
+:Second_pass_0
+    ; Check for !
+    rd_t1 !0x21 addi
+    rs1_a0 rs2_t1 @UpdateShiftRegister beq
+
+    ; Check for @
+    rd_t1 !0x40 addi
+    rs1_a0 rs2_t1 @UpdateShiftRegister beq
+
+    ; Check for $
+    rd_t1 !0x24 addi
+    rs1_a0 rs2_t1 @UpdateShiftRegister beq
+
+    ; Check for ~
+    rd_t1 !0x7E addi
+    rs1_a0 rs2_t1 @UpdateShiftRegister beq
+
+    ; Deal with everything else
+    rd_a1 mv                          ; write = true
+    rd_ra $DoByte jal                 ; Process our char
+
+    # Deal with EOF
+    rd_t1 !-4 addi
+    rs1_a0 rs2_t1 @Second_pass_done beq ; We are done
+
+    $Second_pass_loop jal             ; continue looping
+
+:UpdateShiftRegister
+    rd_a1 rs1_a0 mv                   ; Store label prefix
+    rd_ra $Get_table_target jal       ; Get target
+    rd_a0 rs1_a0 lw                   ; Dereference pointer
+    rd_a0 rs1_a0 rs2_s6 sub           ; target - ip
+
+    ; Check for !
+    rd_t1 !0x21 addi
+    rs1_a1 rs2_t1 @UpdateShiftRegister_I beq
+
+    ; Check for @
+    rd_t1 !0x40 addi
+    rs1_a1 rs2_t1 @UpdateShiftRegister_B beq
+
+    ; Check for $
+    rd_t1 !0x24 addi
+    rs1_a1 rs2_t1 @UpdateShiftRegister_J beq
+
+    ; Check for ~
+    rd_t1 !0x7E addi
+    rs1_a1 rs2_t1 @UpdateShiftRegister_U beq
+
+    $Second_pass_loop jal             ; continue looping
+
+:UpdateShiftRegister_I
+    ; Corresponds to RISC-V I format
+    rd_a0 rs1_a0 !4 addi              ; add 4 due to this being 2nd part of auipc combo
+
+    rd_t1 ~0xFFF lui                  ; load higher bits
+    rd_t1 rs1_t1 !0xFFF addi
+    rd_t1 rs1_a0 rs2_t1 and           ; (value & 0xfff)
+    rd_s7 rs1_t1 rs2_x20 slli         ; tempword = (value & 0xfff) << 20
+    rd_s8 rs1_s8 rs2_s7 xor           ; shiftregister = shiftregister ^ tempword
+
+    $Second_pass_loop jal             ; continue looping
+
+:UpdateShiftRegister_B
+    ; Corresponds to RISC-V B format
+
+    ; tempword = ((value & 0x1e) << 7)            ; imm[4:1]
+    ;          | ((value & 0x7e0) << (31 - 11))   ; imm[10:5]
+    ;          | ((value & 0x800) >> 4)           ; imm[11]
+    ;          | ((value & 0x1000) << (31 - 12))  ; imm[12]
+
+    rd_t1 !0x1E addi
+    rd_t1 rs1_a0 rs2_t1 and           ; value & 0x1e
+    rd_t0 rs1_t1 rs2_x7 slli          ; tempword = (value & 0x1e) << 7
+
+    rd_t1 !0x7E0 addi
+    rd_t1 rs1_a0 rs2_t1 and           ; value & 0x7e0
+    rd_t1 rs1_t1 rs2_x20 slli         ; (value & 0x7e0) << (31 - 11)
+    rd_t0 rs1_t0 rs2_t1 or            ; logical or with the previous expression
+
+    rd_t1 ~0x800 lui                  ; load higher bits
+    rd_t1 rs1_t1 !0x800 addi
+    rd_t1 rs1_a0 rs2_t1 and           ; value & 0x800
+    rd_t1 rs1_t1 rs2_x4 srli          ; (value & 0x800) >> 4
+    rd_t0 rs1_t0 rs2_t1 or            ; logical or with the previous expression
+
+    rd_t1 ~0x1000 lui                 ; load higher bits
+    rd_t1 rs1_a0 rs2_t1 and           ; value & 0x1000
+    rd_t1 rs1_t1 rs2_x19 slli         ; (value & 0x1000) << (31 - 12)
+    rd_s7 rs1_t0 rs2_t1 or            ; logical or with the previous expression
+
+    rd_s8 rs1_s8 rs2_s7 xor           ; shiftregister = shiftregister ^ tempword
+
+    $Second_pass_loop jal             ; continue looping
+
+:UpdateShiftRegister_J
+    ; Corresponds to RISC-V J format
+
+    ; tempword = ((value & 0x7fe) << (30 - 10))    ; imm[10:1]
+    ;          | ((value & 0x800) << (20 - 11))    ; imm[11]
+    ;          | ((value & 0xff000))               ; imm[19:12]
+    ;          | ((value & 0x100000) << (31 - 20)) ; imm[20]
+
+    rd_t1 !0x7FE addi
+    rd_t1 rs1_a0 rs2_t1 and           ; value & 0x7fe
+    rd_t0 rs1_t1 rs2_x20 slli         ; tempword = (value & 0x7fe) << 20
+
+    rd_t1 ~0x800 lui                  ; load higher bits
+    rd_t1 rs1_t1 !0x800 addi
+    rd_t1 rs1_a0 rs2_t1 and           ; value & 0x800
+    rd_t1 rs1_t1 rs2_x9 slli          ; (value & 0x800) << (20 - 11)
+    rd_t0 rs1_t0 rs2_t1 or            ; logical or with the previous expression
+
+    rd_t1 ~0xFF000 lui                ; load higher bits
+    rd_t1 rs1_a0 rs2_t1 and           ; value & 0xff000
+    rd_t0 rs1_t0 rs2_t1 or            ; logical or with the previous expression
+
+    rd_t1 ~0x100000 lui               ; load higher bits
+    rd_t1 rs1_a0 rs2_t1 and           ; value & 0x100000
+    rd_t1 rs1_t1 rs2_x11 slli         ; (value & 0x100000) << (31 - 20)
+    rd_s7 rs1_t0 rs2_t1 or            ; logical or with the previous expression
+
+    rd_s8 rs1_s8 rs2_s7 xor           ; shiftregister = shiftregister ^ tempword
+
+    $Second_pass_loop jal             ; continue looping
+
+:UpdateShiftRegister_U
+    ; Corresponds to RISC-V U format
+    ; if value is 0x800 or more we have to add 11-th bit (0x1000) to compensate for signed extension
+
+    rd_t0 ~0x800 lui                  ; load higher bits
+    rd_t0 rs1_t0 !0x800 addi
+    rd_t1 ~0xFFF lui                  ; load higher bits
+    rd_t1 rs1_t1 !0xFFF addi
+
+    ; We are outside 31-bit that ~ can normally load
+    rd_t2 ~0x100000 lui               ; load 0xfffff000
+    rd_t2 rs1_t2 !-1 addi             ; load 0xfffff000
+    rd_t2 rs1_t2 rs2_x12 slli         ; load 0xfffff000
+    rd_t1 rs1_a0 rs2_t1 and           ; value & 0xfff
+    rd_s7 rs1_a0 rs2_t2 and           ; value & 0xfffff000
+    rs1_t1 rs2_t0 @UpdateShiftRegister_U_small blt
+
+    # Deal with sign extension: add 0x1000
+    rd_t0 ~0x1000 lui                 ; load higher bits
+    rd_s7 rs1_t0 rs2_s7 add           ; (value & 0xfffff000) + 0x1000
+
+:UpdateShiftRegister_U_small
+    rd_s8 rs1_s8 rs2_s7 xor           ; shiftregister = shiftregister ^ tempword
+
+    $Second_pass_loop jal             ; continue looping
+
+:Second_pass_done
+    rd_ra rs1_sp lw                   ; restore ra
+    rd_sp rs1_sp !4 addi              ; Deallocate stack
+    rs1_ra jalr                       ; return
+
+
+; DoByte function
+; Receives:
+;   character in a0
+;   bool write in a1
+; Does not return anything
+:DoByte
+    rd_sp rs1_sp !-4 addi             ; Allocate stack
+    rs1_sp rs2_ra sw                  ; protect ra
+
+    rd_ra $hex jal                    ; Process hex, store it in a6
+
+    rs1_a6 @DoByte_Done bltz          ; Deal with EOF and unrecognized characters
+
+    rs1_s4 @DoByte_NotToggle bnez     ; Check if toggle is set
+
+    ; toggle = true
+    rs1_a1 @DoByte_1 bnez             ; check if we have to write
+
+    ; write = true
+    ; We calculate (hold * 16) + hex(c) ^ sr_nextb()
+    ; First, calculate new shiftregister
+    rd_t0 !0xFF addi
+    rd_t0 rs1_s8 rs2_t0 and           ; sr_nextb = shiftregister & 0xff
+    rd_s8 rs1_s8 rs2_x8 srli          ; shiftregister >> 8
+
+    rd_t0 rs1_t0 rs2_a6 xor           ; hex(c) ^ sr_nextb
+    rd_t1 rs1_s5 rs2_x4 slli          ; hold << 4
+    rd_a0 rs1_t0 rs2_t1 add           ; (hold << 4) + hex(c) ^ sr_nextb()
+    rd_ra $fputc jal                  ; print it
+    rs1_a0 @Fail beqz                 ; Fail if nothing was written
+
+:DoByte_1
+    rd_s6 rs1_s6 !1 addi              ; Increment IP
+    rd_s5 mv                          ; hold = 0
+    $DoByte_FlipToggle jal            ; return
+
+:DoByte_NotToggle
+    rd_s5 rs1_a6 mv                   ; hold = hex(c)
+
+:DoByte_FlipToggle
+    rd_s4 rs1_s4 not                  ; Flip the toggle
+
+:DoByte_Done
+    rd_ra rs1_sp lw                   ; restore ra
+    rd_sp rs1_sp !4 addi              ; Deallocate stack
+    rs1_ra jalr                       ; return
+
+; Convert ASCII hex characters into binary representation, e.g. 'a' -> 0xA
+; Receives:
+;   character in a0
+; Returns:
+;   a6 with character's hex value.
+:hex
+    rd_sp rs1_sp !-8 addi             ; Allocate stack
+    rs1_sp rs2_ra sw                  ; protect ra
+    rs1_sp rs2_a1 @4 sw               ; protect a1
+
+    ; Deal with EOF
+    rd_t1 !-4 addi
+    rs1_a0 rs2_t1 @hex_return beq
+
+    ; deal with line comments starting with #
+    rd_t1 !0x23 addi
+    rs1_a0 rs2_t1 @ascii_comment beq  ; a0 eq to '#'
+
+    ; deal with line comments starting with ;
+    rd_t1 !0x3B addi
+    rs1_a0 rs2_t1 @ascii_comment beq  ; a0 eq to ';'
+
+    ; deal all ascii less than 0
+    rd_t1 !0x30 addi
+    rs1_a0 rs2_t1 @ascii_other blt
+
+    ; deal with 0-9
+    rd_t1 !0x3A addi
+    rs1_a0 rs2_t1 @ascii_num blt
+
+    ; deal with all ascii less than A
+    rd_t1 !0x41 addi
+    rs1_a0 rs2_t1 @ascii_other blt
+
+    ; deal with A-F
+    rd_t1 !0x47 addi
+    rs1_a0 rs2_t1 @ascii_high blt
+
+    ; deal with all ascii less than a
+    rd_t1 !0x61 addi
+    rs1_a0 rs2_t1 @ascii_other blt
+
+    ; deal with a-f
+    rd_t1 !0x67 addi
+    rs1_a0 rs2_t1 @ascii_low blt
+
+    ; The rest that remains needs to be ignored
+    $ascii_other jal
+
+:ascii_num
+    rd_t1 !0x30 addi                  ; '0' -> 0
+    rd_a6 rs1_a0 rs2_t1 sub
+    $hex_return jal                   ; return
+:ascii_low
+    rd_t1 !0x57 addi                  ; 'a' -> 0xA
+    rd_a6 rs1_a0 rs2_t1 sub
+    $hex_return jal                   ; return
+:ascii_high
+    rd_t1 !0x37 addi                  ; 'A' -> 0xA
+    rd_a6 rs1_a0 rs2_t1 sub
+    $hex_return jal                   ; return
+:ascii_other
+    rd_a6 !-1 addi                    ; Return -1
+    $hex_return jal                   ; return
+:ascii_comment                        ; Read the comment until newline
+    rd_ra $Read_byte jal
+    rd_t1 !0xD addi                   ; CR
+    rs1_a0 rs2_t1 @ascii_comment_cr beq
+    rd_t1 !0xA addi                   ; LF
+    rs1_a0 rs2_t1 @ascii_comment bne  ; Keep reading comment
+:ascii_comment_cr
+    rd_a6 !-1 addi                    ; Return -1
+:hex_return
+    rd_ra rs1_sp lw                   ; restore ra
+    rd_a1 rs1_sp !4 lw                ; restore a1
+    rd_sp rs1_sp !8 addi              ; Deallocate stack
+    rs1_ra jalr                       ; return
+
+; Read byte into a0
+:Read_byte
+    rd_sp rs1_sp !-8 addi             ; Allocate stack
+    rs1_sp rs2_a1 @4 sw               ; protect a1
+
+    rd_a7 !63 addi                    ; sys_read
+    rd_a0 rs1_s2 mv                   ; File descriptor
+    rd_a1 rs1_sp mv                   ; Get stack address for buffer
+    nop                               ; no-op
+    rd_a2 !1 addi                     ; Size of what we want to read
+    ecall                             ; syscall
+
+    rs1_a0 @Read_byte_1 beqz          ; Deal with EOF
+    rd_a0 rs1_a1 lb                   ; Dereference pointer
+
+    $Read_byte_done jal               ; return
+
+:Read_byte_1
+    rd_a0 !-4 addi                    ; Put EOF in a0
+:Read_byte_done
+    rd_a1 rs1_sp !4 lw                ; restore a1
+    rd_sp rs1_sp !8 addi              ; Deallocate stack
+    rs1_ra jalr                       ; return
+
+; Reads a byte and calculates table address
+; Returns a pointer in a0
+:Get_table_target
+    rd_sp rs1_sp !-4 addi             ; Allocate stack
+    rs1_sp rs2_ra sw                  ; protect ra
+
+    rd_ra $Read_byte jal              ; Get single char label
+    rd_a0 rs1_a0 rs2_x2 slli          ; Each label in table takes 4 bytes to store
+    rd_t0 ~table auipc                ; Load address of table
+    rd_t0 rs1_t0 !table addi          ; into register t0
+    rd_a0 rs1_a0 rs2_t0 add           ; Calculate offset
+
+    rd_ra rs1_sp lw                   ; restore ra
+    rd_sp rs1_sp !4 addi              ; Deallocate stack
+    rs1_ra jalr                       ; return
+
+:StoreLabel
+    rd_sp rs1_sp !-4 addi             ; Allocate stack
+    rs1_sp rs2_ra sw                  ; protect ra
+
+    rd_ra $Get_table_target jal
+    rs1_a0 rs2_s6 sw                  ; Store ip into table target
+
+    rd_ra rs1_sp lw                   ; restore ra
+    rd_sp rs1_sp !4 addi              ; Deallocate stack
+    rs1_ra jalr                       ; return
+
+; fputc function
+; Receives CHAR in a0
+; Writes and returns number of bytes written in a0
+:fputc
+    rd_sp rs1_sp !-16 addi            ; allocate stack
+    rs1_sp rs2_a0 sw                  ; protect a0
+    rs1_sp rs2_ra @4 sw               ; protect ra
+    rs1_sp rs2_a1 @8 sw               ; protect a1
+    rs1_sp rs2_a2 @12 sw              ; protect a2
+
+    rd_a7 !64 addi                    ; sys_write
+    rd_a0 rs1_s3 mv                   ; write to output
+    rd_a1 rs1_sp mv                   ; Get stack address
+    rd_a2 !1 addi                     ; write 1 character
+    ecall                             ; syscall
+
+    rd_ra rs1_sp !4 lw                ; restore ra
+    rd_a1 rs1_sp !8 lw                ; restore a1
+    rd_a2 rs1_sp !12 lw               ; restore a2
+    rd_sp rs1_sp !16 addi             ; deallocate stack
+    rs1_ra jalr                       ; return
+
+:Done
+    ; Terminate program with 0 return code
+    rd_a7 !93 addi                    ; sys_exit
+    rd_a0 mv                          ; Return code 0
+    ecall                             ; exit(0)
+:Fail
+    ; Terminate program with 1 return code
+    rd_a7 !93 addi                    ; sys_exit
+    rd_a0 !1 addi                     ; Return code 1
+    ecall                             ; exit(1)
+# PROGRAM END
+
+:table
+    %0
+
+:ELF_end

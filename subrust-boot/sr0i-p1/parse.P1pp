@@ -1,0 +1,443 @@
+# parse.P1pp — SR-seed parser in P1pp, faithful port of sr0i.c's parser.
+# Component of a C-free sr0i. Cat AFTER lex.P1pp (shares g_src/g_tok + lex()).
+# STEP 2a: node builders + expression parser (primary/unary/binary precedence).
+# Blocks/if/statements/program land in 2b/2c (p_primary traps on them).
+#
+# Node arena: 7-word records [kind,a,b,c,d,e,link] at g_node + k*56.
+# field offsets: kind 0, a 8, b 16, c 24, d 32, e 40, link 48. NIL = -1.
+# All helpers prefixed p_ (libp1pp shadows unprefixed names).
+
+:g_node   $(0)
+:g_noden  $(0)
+:g_ppos   $(0)
+
+# ---- p_mk(kind=a0) -> node index (a0) -------------------------------------
+%fn(p_mk, 0, {
+    %la(t0, &g_noden) %ld(t1, t0, 0)         # k
+    %la(t2, &g_node) %ld(t2, t2, 0)          # base
+    %li(a1, 56) %mul(a1, t1, a1) %add(t2, t2, a1)   # &node[k]
+    %st(a0, t2, 0)                           # kind
+    %li(a1, -1)
+    %st(a1, t2, 8) %st(a1, t2, 16) %st(a1, t2, 24) %st(a1, t2, 32) %st(a1, t2, 40) %st(a1, t2, 48)
+    %addi(a1, t1, 1) %st(a1, t0, 0)          # noden = k+1
+    %mov(a0, t1)                             # return k
+})
+
+# ---- p_nset(n=a0, off=a1, val=a2) : node[n] field = val -------------------
+%fn(p_nset, 0, {
+    %la(t0, &g_node) %ld(t0, t0, 0)
+    %li(t1, 56) %mul(t1, a0, t1) %add(t0, t0, t1) %add(t0, t0, a1)
+    %st(a2, t0, 0)
+})
+
+# ---- token cursor ---------------------------------------------------------
+%fn(p_cur, 0, {
+    %la(t0, &g_ppos) %ld(t1, t0, 0)
+    %la(t0, &g_tok) %ld(t0, t0, 0)
+    %shli(t1, t1, 5) %add(t0, t0, t1)
+    %ld(a0, t0, 0)
+})
+%fn(p_cur1, 0, {
+    %la(t0, &g_ppos) %ld(t1, t0, 0) %addi(t1, t1, 1)
+    %la(t0, &g_tok) %ld(t0, t0, 0)
+    %shli(t1, t1, 5) %add(t0, t0, t1)
+    %ld(a0, t0, 0)
+})
+%fn(p_bump, 0, {
+    %la(t0, &g_ppos) %ld(t1, t0, 0) %addi(t1, t1, 1) %st(t1, t0, 0)
+})
+%fn(p_pos, 0, {
+    %la(t0, &g_ppos) %ld(a0, t0, 0)
+})
+%fn(p_expect, 16, {
+    %st(s0, sp, 0)
+    %mov(s0, a0)
+    %call(&p_cur) %beq(a0, s0, &.ok)
+    %li(a0, 3) %call(&sys_exit)
+:.ok
+    %call(&p_bump)
+    %ld(s0, sp, 0)
+})
+
+# ---- p_binop(tok=a0) -> op id (0 if none) ---------------------------------
+%fn(p_binop, 0, {
+    %li(t0, 31) %bne(a0, t0, &.b2)  %li(a0, 7)  %b(&.d)   # || -> OR
+:.b2  %li(t0, 29) %bne(a0, t0, &.b3)  %li(a0, 6)  %b(&.d)   # && -> AND
+:.b3  %li(t0, 36) %bne(a0, t0, &.b4)  %li(a0, 13) %b(&.d)   # == -> EQ
+:.b4  %li(t0, 37) %bne(a0, t0, &.b5)  %li(a0, 14) %b(&.d)   # != -> NE
+:.b5  %li(t0, 38) %bne(a0, t0, &.b6)  %li(a0, 15) %b(&.d)   # <  -> LT
+:.b6  %li(t0, 39) %bne(a0, t0, &.b7)  %li(a0, 16) %b(&.d)   # <= -> LE
+:.b7  %li(t0, 40) %bne(a0, t0, &.b8)  %li(a0, 17) %b(&.d)   # >  -> GT
+:.b8  %li(t0, 41) %bne(a0, t0, &.b9)  %li(a0, 18) %b(&.d)   # >= -> GE
+:.b9  %li(t0, 30) %bne(a0, t0, &.b10) %li(a0, 9)  %b(&.d)   # |  -> BOR
+:.b10 %li(t0, 32) %bne(a0, t0, &.b11) %li(a0, 10) %b(&.d)   # ^  -> BXOR
+:.b11 %li(t0, 28) %bne(a0, t0, &.b12) %li(a0, 8)  %b(&.d)   # &  -> BAND
+:.b12 %li(t0, 33) %bne(a0, t0, &.b13) %li(a0, 11) %b(&.d)   # << -> SHL
+:.b13 %li(t0, 34) %bne(a0, t0, &.b14) %li(a0, 12) %b(&.d)   # >> -> SHR
+:.b14 %li(t0, 23) %bne(a0, t0, &.b15) %li(a0, 1)  %b(&.d)   # +  -> ADD
+:.b15 %li(t0, 24) %bne(a0, t0, &.b16) %li(a0, 2)  %b(&.d)   # -  -> SUB
+:.b16 %li(t0, 25) %bne(a0, t0, &.b17) %li(a0, 3)  %b(&.d)   # *  -> MUL
+:.b17 %li(t0, 26) %bne(a0, t0, &.b18) %li(a0, 4)  %b(&.d)   # /  -> DIV
+:.b18 %li(t0, 27) %bne(a0, t0, &.b0)  %li(a0, 5)  %b(&.d)   # %  -> REM
+:.b0  %li(a0, 0)
+:.d
+})
+
+# ---- p_binprec(tok=a0) -> precedence (0 if none) --------------------------
+%fn(p_binprec, 0, {
+    %li(t0, 31) %beq(a0, t0, &.q1)
+    %li(t0, 29) %beq(a0, t0, &.q2)
+    %addi(t0, a0, -36) %li(t1, 6) %bltu(t0, t1, &.q3)   # 36..41
+    %li(t0, 30) %beq(a0, t0, &.q4)
+    %li(t0, 32) %beq(a0, t0, &.q5)
+    %li(t0, 28) %beq(a0, t0, &.q6)
+    %addi(t0, a0, -33) %li(t1, 2) %bltu(t0, t1, &.q7)   # 33,34
+    %addi(t0, a0, -23) %li(t1, 2) %bltu(t0, t1, &.q8)   # 23,24
+    %addi(t0, a0, -25) %li(t1, 3) %bltu(t0, t1, &.q9)   # 25,26,27
+    %li(a0, 0) %b(&.qd)
+:.q1 %li(a0,1) %b(&.qd)
+:.q2 %li(a0,2) %b(&.qd)
+:.q3 %li(a0,3) %b(&.qd)
+:.q4 %li(a0,4) %b(&.qd)
+:.q5 %li(a0,5) %b(&.qd)
+:.q6 %li(a0,6) %b(&.qd)
+:.q7 %li(a0,7) %b(&.qd)
+:.q8 %li(a0,8) %b(&.qd)
+:.q9 %li(a0,9)
+:.qd
+})
+
+# ---- p_primary() -> node (a0) : 2a subset ---------------------------------
+%fn(p_primary, 48, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16) %st(s3, sp, 24)
+    %call(&p_cur) %mov(s0, a0)               # k
+    %li(t0, 2) %beq(s0, t0, &.pint)
+    %li(t0, 12) %beq(s0, t0, &.pbt)
+    %li(t0, 13) %beq(s0, t0, &.pbf)
+    %li(t0, 1) %beq(s0, t0, &.pid)
+    %li(t0, 14) %beq(s0, t0, &.plp)
+    %li(t0, 16) %beq(s0, t0, &.plb)          # T_LB -> block
+    %li(t0, 6) %beq(s0, t0, &.pif)           # T_KW_IF
+    %li(a0, 6) %call(&sys_exit)              # other -> trap
+:.pint
+    %li(a0, 1) %call(&p_mk) %mov(s1, a0)
+    %call(&p_pos) %mov(a2, a0) %mov(a0, s1) %li(a1, 8) %call(&p_nset)
+    %call(&p_bump) %mov(a0, s1) %b(&.pret)
+:.pbt
+    %li(a0, 2) %call(&p_mk) %mov(s1, a0)
+    %mov(a0, s1) %li(a1, 8) %li(a2, 1) %call(&p_nset)
+    %call(&p_bump) %mov(a0, s1) %b(&.pret)
+:.pbf
+    %li(a0, 2) %call(&p_mk) %mov(s1, a0)
+    %mov(a0, s1) %li(a1, 8) %li(a2, 0) %call(&p_nset)
+    %call(&p_bump) %mov(a0, s1) %b(&.pret)
+:.pid
+    %call(&p_cur1) %li(t0, 14) %beq(a0, t0, &.pcall)
+    %li(a0, 3) %call(&p_mk) %mov(s1, a0)
+    %call(&p_pos) %mov(a2, a0) %mov(a0, s1) %li(a1, 8) %call(&p_nset)
+    %call(&p_bump) %mov(a0, s1) %b(&.pret)
+:.pcall
+    %call(&p_pos) %st(a0, sp, 40)            # name token -> frame
+    %call(&p_bump) %call(&p_bump)            # skip name, (
+    %li(a0, 4) %call(&p_mk) %st(a0, sp, 32)  # n -> frame
+    %ld(a2, sp, 40) %ld(a0, sp, 32) %li(a1, 8) %call(&p_nset)   # nd_a[n]=name
+    %li(s1, -1) %li(s2, -1)                  # first, last = NIL
+:.call_lp
+    %call(&p_cur) %li(t0, 15) %beq(a0, t0, &.call_end)   # ) ?
+    %li(a0, 1) %call(&p_expr) %mov(s3, a0)   # arg
+    %li(t0, -1) %bne(s1, t0, &.call_chain)
+    %mov(s1, s3) %b(&.call_last)             # first = arg
+:.call_chain
+    %mov(a0, s2) %li(a1, 48) %mov(a2, s3) %call(&p_nset)   # nd_link[last]=arg
+:.call_last
+    %mov(s2, s3)                             # last = arg
+    %call(&p_cur) %li(t0, 15) %beq(a0, t0, &.call_lp)      # ) -> loop ends next
+    %li(a0, 18) %call(&p_expect)             # expect ,
+    %b(&.call_lp)
+:.call_end
+    %call(&p_bump)                           # skip )
+    %ld(a0, sp, 32) %li(a1, 16) %mov(a2, s1) %call(&p_nset)   # nd_b[n]=first
+    %ld(a0, sp, 32) %b(&.pret)
+:.plp
+    %call(&p_bump)                           # skip (
+    %li(a0, 1) %call(&p_expr) %mov(s1, a0)
+    %li(a0, 15) %call(&p_expect)             # )
+    %mov(a0, s1)
+    %b(&.pret)
+:.plb
+    %call(&p_block)                          # { ... }
+    %b(&.pret)
+:.pif
+    %call(&p_bump)                           # if
+    %li(a0, 1) %call(&p_expr) %st(a0, sp, 32)   # cond
+    %call(&p_block) %st(a0, sp, 40)          # then
+    %li(s1, -1)                              # els = NIL
+    %call(&p_cur) %li(t0, 7) %bne(a0, t0, &.pif_done)   # KW_ELSE ?
+    %call(&p_bump)
+    %call(&p_cur) %li(t0, 6) %bne(a0, t0, &.pif_eb)     # else if ?
+    %call(&p_primary) %mov(s1, a0) %b(&.pif_done)       # els = the else-if
+:.pif_eb
+    %call(&p_block) %mov(s1, a0)             # els = else block
+:.pif_done
+    %li(a0, 7) %call(&p_mk) %mov(s2, a0)     # n = N_IF
+    %mov(a0, s2) %li(a1, 32) %ld(a2, sp, 32) %call(&p_nset)   # nd_d = cond
+    %mov(a0, s2) %li(a1, 40) %ld(a2, sp, 40) %call(&p_nset)   # nd_e = then
+    %mov(a0, s2) %li(a1, 16) %mov(a2, s1) %call(&p_nset)      # nd_b = els
+    %mov(a0, s2)
+:.pret
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16) %ld(s3, sp, 24)
+})
+
+# ---- p_unary() -> node (a0) -----------------------------------------------
+%fn(p_unary, 32, {
+    %st(s0, sp, 0) %st(s1, sp, 8)
+    %call(&p_cur) %li(t0, 35) %bne(a0, t0, &.notbang)   # !
+    %call(&p_bump)
+    %call(&p_unary) %mov(s0, a0)             # operand
+    %li(a0, 5) %call(&p_mk) %mov(s1, a0)     # N_UNARY
+    %mov(a0, s1) %li(a1, 8) %li(a2, 0) %call(&p_nset)      # nd_a=0
+    %mov(a0, s1) %li(a1, 40) %mov(a2, s0) %call(&p_nset)   # nd_e=operand
+    %mov(a0, s1) %b(&.uret)
+:.notbang
+    %call(&p_primary)
+:.uret
+    %ld(s0, sp, 0) %ld(s1, sp, 8)
+})
+
+# ---- p_expr(min=a0) -> node (a0) : precedence climbing --------------------
+%fn(p_expr, 48, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16) %st(s3, sp, 24)
+    %mov(s0, a0)                             # min
+    %call(&p_unary) %mov(s1, a0)             # lhs
+:.eloop
+    %call(&p_cur) %mov(s2, a0)               # k
+    %mov(a0, s2) %call(&p_binop) %mov(s3, a0)   # op
+    %beqz(s3, &.edone)
+    %mov(a0, s2) %call(&p_binprec)           # prec
+    %bltu(a0, s0, &.edone)                   # prec < min
+    %mov(s2, a0)                             # s2 = prec
+    %call(&p_bump)
+    %addi(a0, s2, 1) %call(&p_expr) %st(a0, sp, 32)   # rhs -> frame
+    %li(a0, 6) %call(&p_mk) %mov(s2, a0)     # n = N_BIN
+    %mov(a0, s2) %li(a1, 8) %mov(a2, s3) %call(&p_nset)    # nd_a=op
+    %mov(a0, s2) %li(a1, 32) %mov(a2, s1) %call(&p_nset)   # nd_d=lhs
+    %ld(a2, sp, 32) %mov(a0, s2) %li(a1, 40) %call(&p_nset) # nd_e=rhs
+    %mov(s1, s2)                             # lhs = n
+    %b(&.eloop)
+:.edone
+    %mov(a0, s1)
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16) %ld(s3, sp, 24)
+})
+
+# ---- p_skip_type() : consume a type (u64|bool|() = 1-2 tokens) -------------
+%fn(p_skip_type, 0, {
+    %call(&p_cur) %li(t0, 14) %bne(a0, t0, &.plain)   # ( -> ()
+    %call(&p_bump) %li(a0, 15) %call(&p_expect) %b(&.d)
+:.plain
+    %call(&p_bump)
+:.d
+})
+
+# ---- p_assignop(tok=a0) -> op (0 for =, NIL if not an assign) --------------
+%fn(p_assignop, 0, {
+    %li(t0, 22) %bne(a0, t0, &.g2)  %li(a0, 0)  %b(&.gd)   # =   -> 0
+:.g2  %li(t0, 42) %bne(a0, t0, &.g3)  %li(a0, 1)  %b(&.gd)   # +=  -> ADD
+:.g3  %li(t0, 43) %bne(a0, t0, &.g4)  %li(a0, 2)  %b(&.gd)   # -=  -> SUB
+:.g4  %li(t0, 44) %bne(a0, t0, &.g5)  %li(a0, 3)  %b(&.gd)   # *=  -> MUL
+:.g5  %li(t0, 45) %bne(a0, t0, &.g6)  %li(a0, 4)  %b(&.gd)   # /=  -> DIV
+:.g6  %li(t0, 46) %bne(a0, t0, &.g7)  %li(a0, 5)  %b(&.gd)   # %=  -> REM
+:.g7  %li(t0, 47) %bne(a0, t0, &.g8)  %li(a0, 8)  %b(&.gd)   # &=  -> BAND
+:.g8  %li(t0, 48) %bne(a0, t0, &.g9)  %li(a0, 9)  %b(&.gd)   # |=  -> BOR
+:.g9  %li(t0, 49) %bne(a0, t0, &.g10) %li(a0, 10) %b(&.gd)   # ^=  -> BXOR
+:.g10 %li(t0, 50) %bne(a0, t0, &.g11) %li(a0, 11) %b(&.gd)   # <<= -> SHL
+:.g11 %li(t0, 51) %bne(a0, t0, &.gn)  %li(a0, 12) %b(&.gd)   # >>= -> SHR
+:.gn  %li(a0, -1)
+:.gd
+})
+
+# ---- p_nget(n=a0, off=a1) -> node[n] field ---------------------------------
+%fn(p_nget, 0, {
+    %la(t0, &g_node) %ld(t0, t0, 0)
+    %li(t1, 56) %mul(t1, a0, t1) %add(t0, t0, t1) %add(t0, t0, a1)
+    %ld(a0, t0, 0)
+})
+
+# ---- p_block() -> node (a0) : parse { statements... } ---------------------
+# s0=n(block) s1=first s2=last s3=tail. Per-stmt scratch in frame[32/40/48/56];
+# frame[48] holds the current statement node across field stores (see .b_chain).
+%fn(p_block, 64, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16) %st(s3, sp, 24)
+    %li(a0, 16) %call(&p_expect)             # {
+    %li(a0, 8) %call(&p_mk) %mov(s0, a0)     # n = N_BLOCK
+    %li(s1, -1) %li(s2, -1) %li(s3, -1)      # first, last, tail = NIL
+:.bloop
+    %call(&p_cur) %li(t0, 17) %beq(a0, t0, &.bend)   # }
+    %mov(t2, a0)                             # k = cur
+    %li(t0, 19) %beq(t2, t0, &.b_semi)
+    %li(t0, 4)  %beq(t2, t0, &.b_let)
+    %li(t0, 8)  %beq(t2, t0, &.b_while)
+    %li(t0, 9)  %beq(t2, t0, &.b_loop)
+    %li(t0, 10) %beq(t2, t0, &.b_break)
+    %li(t0, 11) %beq(t2, t0, &.b_cont)
+    %b(&.b_other)
+:.b_semi
+    %call(&p_bump) %b(&.bloop)
+:.b_let
+    %call(&p_bump)                           # let
+    %call(&p_cur) %li(t0, 5) %bne(a0, t0, &.let1) %call(&p_bump)   # opt mut
+:.let1
+    %call(&p_pos) %st(a0, sp, 32)            # name
+    %li(a0, 1) %call(&p_expect)              # IDENT
+    %call(&p_cur) %li(t0, 20) %bne(a0, t0, &.let2) %call(&p_bump) %call(&p_skip_type)   # opt :type
+:.let2
+    %li(a0, 22) %call(&p_expect)             # =
+    %li(a0, 1) %call(&p_expr) %st(a0, sp, 40)   # init
+    %li(a0, 19) %call(&p_expect)             # ;
+    %li(a0, 9) %call(&p_mk) %st(a0, sp, 48)  # s = N_LET
+    %ld(a0, sp, 48) %li(a1, 8)  %ld(a2, sp, 32) %call(&p_nset)   # nd_a = name
+    %ld(a0, sp, 48) %li(a1, 40) %ld(a2, sp, 40) %call(&p_nset)   # nd_e = init
+    %b(&.b_chain)
+:.b_while
+    %call(&p_bump)
+    %li(a0, 1) %call(&p_expr) %st(a0, sp, 32)   # cond
+    %call(&p_block) %st(a0, sp, 40)          # body
+    %li(a0, 11) %call(&p_mk) %st(a0, sp, 48)
+    %ld(a0, sp, 48) %li(a1, 32) %ld(a2, sp, 32) %call(&p_nset)   # nd_d = cond
+    %ld(a0, sp, 48) %li(a1, 40) %ld(a2, sp, 40) %call(&p_nset)   # nd_e = body
+    %b(&.b_chain)
+:.b_loop
+    %call(&p_bump)
+    %call(&p_block) %st(a0, sp, 40)          # body
+    %li(a0, 12) %call(&p_mk) %st(a0, sp, 48)
+    %ld(a0, sp, 48) %li(a1, 40) %ld(a2, sp, 40) %call(&p_nset)   # nd_e = body
+    %b(&.b_chain)
+:.b_break
+    %call(&p_bump) %li(a0, 19) %call(&p_expect)
+    %li(a0, 13) %call(&p_mk) %st(a0, sp, 48)
+    %b(&.b_chain)
+:.b_cont
+    %call(&p_bump) %li(a0, 19) %call(&p_expect)
+    %li(a0, 14) %call(&p_mk) %st(a0, sp, 48)
+    %b(&.b_chain)
+:.b_other
+    %call(&p_cur) %mov(t2, a0)               # k
+    %li(t0, 6)  %beq(t2, t0, &.b_bl)         # IF -> blocklike
+    %li(t0, 16) %beq(t2, t0, &.b_bl)         # LB -> blocklike
+    # not blocklike
+    %li(a0, 1) %call(&p_expr) %st(a0, sp, 32)   # e
+    %call(&p_cur) %call(&p_assignop) %st(a0, sp, 40)   # ak
+    %li(t0, -1) %ld(t1, sp, 40) %beq(t1, t0, &.b_nasg)   # ak == NIL ?
+    %call(&p_bump)                           # assign op
+    %li(a0, 1) %call(&p_expr) %st(a0, sp, 56)   # val
+    %li(a0, 19) %call(&p_expect)             # ;
+    %li(a0, 10) %call(&p_mk) %st(a0, sp, 48) # s = N_ASSIGN
+    %ld(a0, sp, 48) %li(a1, 8) %ld(a2, sp, 40) %call(&p_nset)    # nd_a = ak
+    %ld(a0, sp, 32) %li(a1, 8) %call(&p_nget) %mov(t2, a0)       # nd_a[e] (place name)
+    %ld(a0, sp, 48) %li(a1, 32) %mov(a2, t2) %call(&p_nset)      # nd_d = nd_a[e]
+    %ld(a0, sp, 48) %li(a1, 40) %ld(a2, sp, 56) %call(&p_nset)   # nd_e = val
+    %b(&.b_chain)
+:.b_nasg
+    %call(&p_cur) %li(t0, 19) %beq(a0, t0, &.b_exprstmt)   # SEMI
+    %call(&p_cur) %li(t0, 17) %beq(a0, t0, &.b_tail)       # RB
+    %li(a0, 5) %call(&sys_exit)              # expected ; or }
+:.b_exprstmt
+    %call(&p_bump)
+    %li(a0, 15) %call(&p_mk) %st(a0, sp, 48) # s = N_EXPR
+    %ld(a0, sp, 48) %li(a1, 40) %ld(a2, sp, 32) %call(&p_nset)   # nd_e = e
+    %b(&.b_chain)
+:.b_tail
+    %ld(a0, sp, 32) %mov(s3, a0) %b(&.bloop) # tail = e
+:.b_bl
+    %li(a0, 1) %call(&p_expr) %st(a0, sp, 32)   # e (if/block)
+    %call(&p_cur) %li(t0, 17) %beq(a0, t0, &.b_bltail)      # RB -> tail
+    %li(a0, 15) %call(&p_mk) %st(a0, sp, 48) # s = N_EXPR
+    %ld(a0, sp, 48) %li(a1, 40) %ld(a2, sp, 32) %call(&p_nset)
+    %b(&.b_chain)
+:.b_bltail
+    %ld(a0, sp, 32) %mov(s3, a0) %b(&.bloop)
+:.b_chain
+    %li(t0, -1) %bne(s1, t0, &.b_chain2)
+    %ld(a0, sp, 48) %mov(s1, a0) %b(&.b_chain3)   # first = s
+:.b_chain2
+    %mov(a0, s2) %li(a1, 48) %ld(a2, sp, 48) %call(&p_nset)   # nd_link[last] = s
+:.b_chain3
+    %ld(s2, sp, 48)                          # last = s
+    %b(&.bloop)
+:.bend
+    %call(&p_bump)                           # }
+    %mov(a0, s0) %li(a1, 16) %mov(a2, s1) %call(&p_nset)   # nd_b = first
+    %mov(a0, s0) %li(a1, 40) %mov(a2, s3) %call(&p_nset)   # nd_e = tail
+    %mov(a0, s0)
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16) %ld(s3, sp, 24)
+})
+
+# ---- fn/const tables (pointers set by parse-main from the brk heap) --------
+:g_fn      $(0)
+:g_fnptok  $(0)
+:g_const   $(0)
+:g_fnn     $(0)
+:g_ptokn   $(0)
+:g_constn  $(0)
+
+# ---- p_program() : parse fn/const definitions -----------------------------
+# fn record (32B): tok@0 body@8 np@16 poff@24. const record (16B): tok@0 expr@8.
+# s0=name s1=poff/cexpr s2=np s3=param-pos/body.
+%fn(p_program, 64, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16) %st(s3, sp, 24)
+    %li(t1, 0)
+    %la(t0, &g_ppos)   %st(t1, t0, 0)
+    %la(t0, &g_noden)  %st(t1, t0, 0)
+    %la(t0, &g_fnn)    %st(t1, t0, 0)
+    %la(t0, &g_ptokn)  %st(t1, t0, 0)
+    %la(t0, &g_constn) %st(t1, t0, 0)
+:.prog_lp
+    %call(&p_cur) %beqz(a0, &.prog_done)     # T_EOF
+    %li(t0, 52) %beq(a0, t0, &.prog_const)   # KW_CONST
+    %li(a0, 3) %call(&p_expect)              # fn
+    %call(&p_pos) %mov(s0, a0)               # name
+    %li(a0, 1) %call(&p_expect)              # IDENT
+    %li(a0, 14) %call(&p_expect)             # (
+    %la(t0, &g_ptokn) %ld(s1, t0, 0)         # poff = ptokn
+    %li(s2, 0)                               # np
+:.param_lp
+    %call(&p_cur) %li(t0, 15) %beq(a0, t0, &.param_done)   # )
+    %call(&p_cur) %li(t0, 5) %bne(a0, t0, &.param_nm) %call(&p_bump)   # opt mut
+:.param_nm
+    %call(&p_pos) %mov(s3, a0)               # param name pos
+    %la(t0, &g_ptokn) %ld(t1, t0, 0)         # ptokn
+    %la(t2, &g_fnptok) %ld(t2, t2, 0) %shli(a1, t1, 3) %add(t2, t2, a1) %st(s3, t2, 0)
+    %addi(t1, t1, 1) %la(t0, &g_ptokn) %st(t1, t0, 0)     # ptokn++
+    %addi(s2, s2, 1)                         # np++
+    %li(a0, 1) %call(&p_expect)              # IDENT
+    %li(a0, 20) %call(&p_expect)             # :
+    %call(&p_skip_type)
+    %call(&p_cur) %li(t0, 15) %beq(a0, t0, &.param_lp)     # )
+    %li(a0, 18) %call(&p_expect)             # ,
+    %b(&.param_lp)
+:.param_done
+    %call(&p_bump)                           # )
+    %call(&p_cur) %li(t0, 21) %bne(a0, t0, &.no_arrow) %call(&p_bump) %call(&p_skip_type)   # -> type
+:.no_arrow
+    %call(&p_block) %mov(s3, a0)             # body
+    %la(t0, &g_fnn) %ld(t1, t0, 0)           # fnn
+    %la(t2, &g_fn) %ld(t2, t2, 0) %li(a1, 32) %mul(a1, t1, a1) %add(t2, t2, a1)
+    %st(s0, t2, 0) %st(s3, t2, 8) %st(s2, t2, 16) %st(s1, t2, 24)   # tok,body,np,poff
+    %addi(t1, t1, 1) %la(t0, &g_fnn) %st(t1, t0, 0)   # fnn++
+    %b(&.prog_lp)
+:.prog_const
+    %call(&p_bump)                           # const
+    %call(&p_pos) %mov(s0, a0)               # name
+    %li(a0, 1) %call(&p_expect)              # IDENT
+    %li(a0, 20) %call(&p_expect)             # :
+    %call(&p_skip_type)
+    %li(a0, 22) %call(&p_expect)             # =
+    %li(a0, 1) %call(&p_expr) %mov(s1, a0)   # cexpr
+    %li(a0, 19) %call(&p_expect)             # ;
+    %la(t0, &g_constn) %ld(t1, t0, 0)
+    %la(t2, &g_const) %ld(t2, t2, 0) %shli(a1, t1, 4) %add(t2, t2, a1)
+    %st(s0, t2, 0) %st(s1, t2, 8)            # tok, expr
+    %addi(t1, t1, 1) %la(t0, &g_constn) %st(t1, t0, 0)
+    %b(&.prog_lp)
+:.prog_done
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16) %ld(s3, sp, 24)
+})

@@ -1,0 +1,6488 @@
+# scheme1.P1pp -- Phase 1 minimal Scheme interpreter on P1.
+#
+# Build chain:
+#   catm P1-<arch>.M1pp P1.M1pp P1pp.P1pp scheme1/scheme1.P1pp \
+#     | m1pp -> hex2pp -> ELF
+#
+# Run chain:
+#   catm scheme1/prelude.scm prog.scm | scheme1
+
+# =========================================================================
+# Constants
+# =========================================================================
+
+%enum TAG { FIXNUM PAIR SYM HEAP IMM }
+%enum IMM { FALSE TRUE NIL UNSPEC UNBOUND EOF }
+%enum HDR { BV CLOSURE PRIM TD REC MV }
+
+# imm_val(idx) -> integer-expression for the tagged immediate at IMM index
+# `idx`. Used both at %li sites (loaded into a register) and at $() emission
+# sites (baked into a static word).
+%macro imm_val(idx) (| (<< idx 3) %TAG.IMM) %endm
+
+# Layout helpers. %struct stride is 8 bytes per field.
+%struct PAIR    { car cdr }                          # .SIZE = 16
+%struct SYMENT  { name_ptr name_len global_val pad } # .SIZE = 32
+%struct PRIM    { hdr entry_w data }                  # .SIZE = 24
+%struct CLOSURE { hdr params body env }              # .SIZE = 32
+%struct TD      { hdr name nfields fields }           # .SIZE = 32
+%struct BV      { hdr data }                          # .SIZE = 16
+%struct REC     { hdr td }                            # .SIZE = 16 (header)
+# Records are variable width: header + td slot + N field slots.
+
+# BSS arenas anchored past :ELF_end. readbuf is 1 MiB (sized to fit
+# the catm'd cc compiler source incl. prelude — see READBUF_CAP_BYTES),
+# then symtab, then the main heap, then the scratch heap. The ELF
+# p_memsz reservation (currently 512 MiB, declared in
+# vendor/seed/<arch>/ELF.hex2) covers all of them with headroom.
+# HEAP_CAP_BYTES (256 MiB) and SCRATCH_CAP_BYTES (16 MiB) are explicit
+# caps; total bss usage = readbuf + symtab + heap + scratch and must
+# fit inside p_memsz. p1_main calls libp1pp's init_arenas, which walks
+# arena_table and writes &ELF_end + sum of prior sizes into each
+# pointer slot.
+
+%macro SYMTAB_CAP_SLOTS() 8192 %endm
+%macro READBUF_CAP_BYTES() 1048576 %endm
+%macro HEAP_CAP_BYTES() 0x10000000 %endm
+%macro SCRATCH_CAP_BYTES() 0x8000000 %endm
+
+# =========================================================================
+# Tag idioms
+# =========================================================================
+
+%macro tagof(rd, rs) %andi(rd, rs, 7) %endm
+%macro mkfix(rd, rs) %shli(rd, rs, 3) %endm
+%macro untag_fix(rd, rs) %sari(rd, rs, 3) %endm
+%macro untag_sym(rd, rs) %sari(rd, rs, 3) %endm
+%macro car(rd, rs) %ld(rd, rs, -1) %endm
+%macro cdr(rd, rs) %ld(rd, rs, 7) %endm
+%macro set_car(rs, pair_tagged) %st(rs, pair_tagged, -1) %endm
+%macro set_cdr(rs, pair_tagged) %st(rs, pair_tagged, 7) %endm
+%macro hdr_type(rd, rs) %lb(rd, rs, -3) %endm
+
+# Field access through a tagged HEAP pointer (tag = 3). `field` is a
+# constant byte offset from the underlying raw object (e.g. %PRIM.data,
+# %CLOSURE.env). Reader is %ld; writer is %heap_st.
+%macro heap_ld(rd, rs, field) %ld(rd, rs, (- field 3)) %endm
+%macro heap_st(rs, rt, field) %st(rs, rt, (- field 3)) %endm
+
+# =========================================================================
+# Scheme1-local helpers
+# =========================================================================
+
+# Load the byte at readbuf_buf[off_reg] into rd. Clobbers rd. `rd` must
+# be the destination register; the macro reuses it as a scratch pointer
+# during the la / ld / add chain before the final lb writes the byte.
+%macro readbuf_byte(rd, off_reg)
+    %ld_global(rd, &readbuf_buf_ptr)
+    %add(rd, rd, off_reg)
+    %lb(rd, rd, 0)
+%endm
+
+# Increment cursor and store it back. `addr_reg` is the address of
+# readbuf_pos as returned by %lda_global (the second output register).
+%macro readbuf_advance(pos_reg, addr_reg)
+    %addi(pos_reg, pos_reg, 1)
+    %st(pos_reg, addr_reg, 0)
+%endm
+
+# Load readbuf_len into len_reg and branch to target if cursor is at EOF.
+%macro readbuf_at_eof(pos_reg, len_reg, target)
+    %ld_global(len_reg, &readbuf_len)
+    %beq(pos_reg, len_reg, target)
+%endm
+
+# Branch character equal/not-equal: if (c == expect) / (c != expect) goto target.
+# expect passed as -(char_code). scratch is clobbered.
+%macro bceq(c, neg_cv, target, scratch)
+    %addi(scratch, c, neg_cv)
+    %beqz(scratch, target)
+%endm
+
+%macro bcne(c, neg_cv, target, scratch)
+    %addi(scratch, c, neg_cv)
+    %bnez(scratch, target)
+%endm
+
+# Branch immediate equal/not-equal: if (reg == value) / (reg != value) goto target.
+# scratch is clobbered.
+%macro bieq(reg, value, target, scratch)
+    %li(scratch, value)
+    %beq(reg, scratch, target)
+%endm
+
+%macro bine(reg, value, target, scratch)
+    %li(scratch, value)
+    %bne(reg, scratch, target)
+%endm
+
+# Branch to `target` if `ch_reg` holds an ASCII whitespace byte (space,
+# tab, LF, CR). `scratch` is clobbered.
+%macro is_ws_branch(scratch, ch_reg, target)
+    %bceq(ch_reg, -32, target, scratch)    ; SP
+    %bceq(ch_reg,  -9, target, scratch)    ; HT
+    %bceq(ch_reg, -10, target, scratch)    ; LF
+    %bceq(ch_reg, -13, target, scratch)    ; CR
+%endm
+
+# Branch to `target` if lo_neg <= c < lo_neg+count (unsigned). Both
+# scratch and count_scratch are clobbered.
+%macro brange(c, lo_neg, count, scratch, count_scratch, target)
+    %addi(scratch, c, lo_neg)
+    %li(count_scratch, count)
+    %bltu(scratch, count_scratch, target)
+%endm
+
+# Compute &symtab_buf + idx_reg * SYMENT.SIZE into rd. `scratch` is
+# clobbered.
+%macro symtab_entry(rd, idx_reg, scratch)
+    %ld_global(rd, &symtab_buf_ptr)
+    %shli(scratch, idx_reg, 5)
+    %add(rd, rd, scratch)
+%endm
+
+# Print msg_label and abort. Never returns. Routes through runtime_error
+# so every error path lands in one place (stderr + exit 1).
+%macro die(msg)
+    %la(a0, & ## msg)
+    %call(&runtime_error)
+%endm
+
+# Emit an 8-aligned NUL-terminated string.
+%macro cstr8(str)
+    str
+    00
+    .align 8
+%endm
+
+# Intern `str` into `slot` and declare its padded string data inline.
+# `key` is the label suffix; the data label :name_##key is emitted here.
+%macro intern_form(key, str, slot)
+    %la(a0, &name_ ## key)
+    %li(a1, (strlen str))
+    %call(&intern)
+    %st_global(a0, slot, t0)
+    %b(&@end)
+    :name_ ## key
+    %cstr8(str)
+    :@end
+%endm
+
+# Special-form dispatch: pointer-compare the head symbol against `slot`'s
+# cached value (in t0) and branch to `target` on hit. Caller has already
+# loaded head into t0.
+%macro dispatch_form(slot, target)
+    %ld_global(t1, slot)
+    %beq(t0, t1, target)
+%endm
+
+# Tail-jump from a special-form dispatch label to its handler. Handlers
+# uniformly take (rest=cdr(expr), env) -> value; expr lives at sp[0],
+# env at sp[8] in eval's frame.
+%macro tail_to_handler(handler)
+    %ld(a0, sp, 0)
+    %cdr(a0, a0)
+    %ld(a1, sp, 8)
+    %tail(handler)
+%endm
+
+# Branch to `target` if `val` holds the NIL immediate. `scratch` is
+# clobbered.
+%macro if_nil(scratch, val, target)
+    %li(scratch, %imm_val(%IMM.NIL))
+    %beq(val, scratch, target)
+%endm
+
+# Advance a named list-cursor local to its cdr. t0 is the implicit scratch
+# register; callers must ensure it's free.
+%macro advance_walk(name)
+    %ldl(t0, name)
+    %cdr(t0, t0)
+    %stl(t0, name)
+%endm
+
+# Set a global binding. sym is a tagged symbol, val is the new value.
+# Untags sym into the idx ABI position and calls sym_set_global.
+%macro set_global(sym, val)
+    %mov(a1, val)
+    %untag_sym(a0, sym)
+    %call(&sym_set_global)
+%endm
+
+# car-and-untag-fixnum: rd = car(list) >> 3.
+%macro car_fix(rd, list)
+    %car(rd, list)
+    %sari(rd, rd, 3)
+%endm
+
+# car-then-load-bytevector-data-pointer: rd = (car(list)).data_ptr.
+%macro car_bvdata(rd, list)
+    %car(rd, list)
+    %ld(rd, rd, 5)
+%endm
+
+# Positional list-arg extraction. r_n receives the nth element of `list`;
+# the last destination register doubles as the in-flight rest cursor
+# during extraction (its final value is the last argument).
+%macro args2(r0, r1, list)
+    %car(r0, list)
+    %cdr(r1, list)
+    %car(r1, r1)
+%endm
+
+%macro args3(r0, r1, r2, list)
+    %car(r0, list)
+    %cdr(r2, list)
+    %car(r1, r2)
+    %cdr(r2, r2)
+    %car(r2, r2)
+%endm
+
+%macro args4(r0, r1, r2, r3, list)
+    %car(r0, list)
+    %cdr(r3, list)
+    %car(r1, r3)
+    %cdr(r3, r3)
+    %car(r2, r3)
+    %cdr(r3, r3)
+    %car(r3, r3)
+%endm
+
+# =========================================================================
+# p1_main -- runtime spine
+# =========================================================================
+
+%fn(p1_main, 0, {
+    # Stash argc/argv
+    %st_global(a0, &saved_argc, t0)
+    %st_global(a1, &saved_argv, t0)
+
+    # if argc < 2 goto usage
+    %li(t0, 2)
+    %bltu(a0, t0, &.usage)
+
+    # Initialize
+    %la(a0, &ELF_end)
+    %la(a1, &arena_table)
+    %la(a2, &arena_table_end)
+    %call(&init_arenas)
+    %call(&heap_init)
+    %call(&intern_special_forms)
+    %call(&register_primitives)
+    %call(&register_globals)
+
+    # load_source(argv[1])
+    %ld_global(a0, &saved_argv)
+    %ld(a0, a0, 8)
+    %call(&load_source)
+
+    # read-eval loop
+    %loop_scoped({
+        # eof = skip_ws()
+        %call(&skip_ws)
+        # if eof break
+        %if_nez(a0, { %break })
+        # expr = parse_one()
+        %call(&parse_one)
+        # eval(expr, env=nil)
+        %li(a1, %imm_val(%IMM.NIL))
+        %call(&eval)
+    })
+
+    # return 0
+    %li(a0, 0)
+    %eret
+
+    :.usage
+    %la(a0, &msg_usage)
+    %call(&print_cstr)
+    %li(a0, 2)
+})
+
+# =========================================================================
+# Reader -- parse_one over readbuf with a single byte cursor
+# =========================================================================
+#
+# Cursor lives in &readbuf_pos; readbuf_len holds the slurped byte count.
+# The reader is called recursively from parse_list, so every state goes
+# through frame slots, not s-registers.
+
+# Skip whitespace (ASCII 32, 9, 10, 13) and `;`-to-LF comments. Returns
+# a0 = 1 if readbuf_pos >= readbuf_len after skipping (caller hit EOF),
+# else 0. Leaf.
+:skip_ws
+.scope
+    %lda_global(t0, t2, &readbuf_pos)
+    %ld_global(t1, &readbuf_len)
+    :.loop
+        %beq(t0, t1, &.done)
+        %readbuf_byte(a0, t0)
+        %is_ws_branch(a1, a0, &.step)
+        %bceq(a0, -59, &.comment, a1)    ; ';'
+        %b(&.done)
+        :.comment
+        # Consume up to and including the next LF, or to EOF.
+        %addi(t0, t0, 1)
+        %beq(t0, t1, &.done)
+        %readbuf_byte(a0, t0)
+        %bcne(a0, -10, &.comment, a1)    ; LF
+        :.step
+        %addi(t0, t0, 1)
+        %b(&.loop)
+    :.done
+
+    %st(t0, t2, 0)
+    %li(a0, 1)
+    %beq(t0, t1, &.ret)
+    %li(a0, 0)
+    :.ret
+    %ret
+.endscope
+
+# parse_one() -> tagged value in a0
+%fn(parse_one, 0, {
+    %call(&skip_ws)
+    %bnez(a0, &.eof)
+
+    %ld_global(t0, &readbuf_pos)
+    %readbuf_byte(a0, t0)
+
+    %bceq(a0, -40, &.lparen, a1)
+    %bceq(a0, -41, &.rparen, a1)
+    %bceq(a0, -35, &.hash, a1)
+    %bceq(a0, -39, &.quote, a1)
+    %bceq(a0, -44, &.comma, a1)
+    %bceq(a0, -34, &.string, a1)
+
+    %tail(&parse_atom)
+
+    :.lparen
+    # Consume '(' and read items until ')'.
+    %lda_global(t1, t0, &readbuf_pos)
+    %readbuf_advance(t1, t0)
+    %tail(&parse_list)
+
+    :.rparen
+    %die(msg_unexp_rparen)
+
+    :.string
+    # Consume opening '"' and tail to parse_string. parse_string scans
+    # through the matching '"' (consuming it) and returns a tagged bv.
+    %lda_global(t1, t0, &readbuf_pos)
+    %readbuf_advance(t1, t0)
+    %tail(&parse_string)
+
+    :.hash
+    # Consume '#' plus its type byte; dispatch on the type byte.
+    %lda_global(t0, t2, &readbuf_pos)
+    %addi(t0, t0, 1)
+    %readbuf_at_eof(t0, t1, &.eof)
+    %readbuf_byte(a0, t0)
+    %readbuf_advance(t0, t2)
+    %bceq(a0, -116, &.true_lit,  a1)    ; 't'
+    %bceq(a0, -102, &.false_lit, a1)    ; 'f'
+    %bceq(a0, -120, &.hex_lit,   a1)    ; 'x'
+    %bceq(a0,  -88, &.hex_lit,   a1)    ; 'X'
+    %bceq(a0,  -92, &.char_lit,  a1)    ; '\\'
+    %bceq(a0, -117, &.u8_lit,    a1)    ; 'u'
+    %die(msg_bad_hash)
+
+    :.true_lit
+    %li(a0, %imm_val(%IMM.TRUE))
+    %eret
+
+    :.false_lit
+    %li(a0, %imm_val(%IMM.FALSE))
+    %eret
+
+    :.hex_lit
+    # t0 sits at the first hex digit; t1 = readbuf_len. Scan to ws/paren/EOF,
+    # then parse_hex over the slice (with optional leading '-').
+    %mov(a3, t0)
+    :.hex_scan
+        %beq(t0, t1, &.hex_end)
+        %readbuf_byte(a0, t0)
+        %is_ws_branch(a1, a0, &.hex_end)
+        %bceq(a0, -40, &.hex_end, a1)
+        %bceq(a0, -41, &.hex_end, a1)
+        %addi(t0, t0, 1)
+        %b(&.hex_scan)
+    :.hex_end
+
+    %st_global(t0, &readbuf_pos, t2)
+    %ld_global(a0, &readbuf_buf_ptr)
+    %add(a0, a0, a3)
+    %sub(a1, t0, a3)
+    %lb(t2, a0, 0)
+    %addi(t2, t2, -45)              ; '-'
+    %beqz(t2, &.hex_neg)
+    %call(&parse_hex)
+    %mkfix(a0, a0)
+    %eret
+    :.hex_neg
+    %addi(a0, a0, 1)
+    %addi(a1, a1, -1)
+    %call(&parse_hex)
+    %li(t0, 0)
+    %sub(a0, t0, a0)
+    %mkfix(a0, a0)
+    %eret
+
+    :.quote
+    # Consume the leading '\''; recurse into parse_one for the datum;
+    # then build (quote <datum>).
+    %lda_global(t0, t2, &readbuf_pos)
+    %readbuf_advance(t0, t2)
+    %call(&parse_one)
+    %li(a1, %imm_val(%IMM.NIL))
+    %call(&cons)
+    %ld_global(t0, &sym_quote)
+    %mov(a1, a0)
+    %mov(a0, t0)
+    %tail(&cons)
+
+    :.comma
+    # Consume the leading ','; recurse into parse_one for the datum;
+    # build (unquote <datum>). The comma sugar exists so pmatch
+    # patterns can be written as `,ident`. Outside pmatch
+    # `(unquote x)` reaches eval as an application of the unbound
+    # `unquote` and dies through the standard unbound-variable path.
+    %lda_global(t0, t2, &readbuf_pos)
+    %readbuf_advance(t0, t2)
+    %call(&parse_one)
+    %li(a1, %imm_val(%IMM.NIL))
+    %call(&cons)
+    %ld_global(t0, &sym_unquote)
+    %mov(a1, a0)
+    %mov(a0, t0)
+    %tail(&cons)
+
+    :.char_lit
+    # Cursor is already past '#\\'; parse_char scans the body and returns
+    # a tagged fixnum (the u8 char value).
+    %tail(&parse_char)
+
+    :.u8_lit
+    # Cursor is past '#u'. Demand '8' then '('; consume both and tail to
+    # parse_u8_body, which reads the element list and packs it into a bv.
+    %lda_global(t0, t2, &readbuf_pos)
+    %readbuf_at_eof(t0, t1, &.u8_bad)
+    %readbuf_byte(a0, t0)
+    %bcne(a0, -56, &.u8_bad, a1)    ; '8'
+    %addi(t0, t0, 1)
+    %beq(t0, t1, &.u8_bad)
+    %readbuf_byte(a0, t0)
+    %bcne(a0, -40, &.u8_bad, a1)    ; '('
+    %readbuf_advance(t0, t2)
+    %tail(&parse_u8_body)
+
+    :.u8_bad
+    %die(msg_bad_hash)
+
+    :.eof
+    %die(msg_unexp_eof)
+})
+
+# parse_list() -> tagged list value in a0. Cursor sits past '(' on entry;
+# returns once ')' is consumed.
+#
+# Locals:
+#   head  NIL until first item
+#   tail  most recent cons (set-cdr! target)
+%fn2(parse_list, {head tail}, {
+    %li(t0, %imm_val(%IMM.NIL))
+    %stl(t0, head)
+    %stl(t0, tail)
+
+    :.loop
+    %call(&skip_ws)
+    %bnez(a0, &.eof)
+    %ld_global(t0, &readbuf_pos)
+    %ld_global(t1, &readbuf_len)
+
+    %readbuf_byte(a0, t0)
+    %bceq(a0, -41, &.close, a1)
+
+    # Dotted-pair separator: '.' followed by ws/paren/EOF (otherwise the
+    # '.' is part of an identifier and parse_atom handles it).
+    %bcne(a0, -46, &.not_dot, a1)    ; '.'
+    %addi(a2, t0, 1)
+    %beq(a2, t1, &.do_dot)
+    %readbuf_byte(a3, a2)
+    %is_ws_branch(a1, a3, &.do_dot)
+    %bceq(a3, -40, &.do_dot, a1)
+    %bceq(a3, -41, &.do_dot, a1)
+    :.not_dot
+
+    # Not ')': parse one item, append.
+    %call(&parse_one)
+    %li(a1, %imm_val(%IMM.NIL))
+    %call(&cons)
+
+    # If head is NIL, both head and tail = new cons; else set-cdr! tail = new.
+    %ldl(t0, head)
+    %bine(t0, %imm_val(%IMM.NIL), &.link, t1)
+    %stl(a0, head)
+    %stl(a0, tail)
+    %b(&.loop)
+
+    :.link
+    %ldl(t0, tail)
+    # set-cdr! tail = a0  -> store a0 at [tail + 7] (raw + 8)
+    %set_cdr(a0, t0)
+    %stl(a0, tail)
+    %b(&.loop)
+
+    :.do_dot
+    # Consume the '.', read one datum, splice it in as the cdr of the
+    # tail cons. Then expect a closing ')' (with optional ws).
+    %lda_global(t0, t1, &readbuf_pos)
+    %readbuf_advance(t0, t1)
+    %call(&parse_one)
+    %ldl(t0, tail)
+    %set_cdr(a0, t0)
+    %call(&skip_ws)
+    %bnez(a0, &.eof)
+    %lda_global(t0, t1, &readbuf_pos)
+    %readbuf_byte(a0, t0)
+    %bcne(a0, -41, &.eof, a1)    ; ')'
+    %readbuf_advance(t0, t1)
+    %ldl(a0, head)
+    %eret
+
+    :.close
+    # Consume ')' and return head.
+    %lda_global(t1, t0, &readbuf_pos)
+    %readbuf_advance(t1, t0)
+    %ldl(a0, head)
+    %eret
+
+    :.eof
+    %die(msg_unterm_list)
+})
+
+# parse_u8_body() -> tagged HDR.BV in a0. Cursor sits past '#u8(' on
+# entry. Reads elements via parse_list (each must be a fixnum byte 0..255;
+# range is unchecked, matching make-bytevector's lax stance) and packs
+# them into a fresh bytevector.
+#
+# Locals:
+#   list    parsed element list (cursor during fill pass)
+#   result  freshly allocated bv
+%fn2(parse_u8_body, {list result}, {
+    %call(&parse_list)
+    %stl(a0, list)
+
+    %call(&list_length)             ; clobbers a0 -> count
+    %call(&bv_alloc)                ; a0 = bv
+    %stl(a0, result)
+
+    %heap_ld(t0, a0, %BV.data)
+    %ldl(a0, list)                  ; list cursor
+
+    :.loop
+        %if_nil(t1, a0, &.done)
+        %car(t1, a0)
+        %untag_fix(t1, t1)
+        %sb(t1, t0, 0)
+        %addi(t0, t0, 1)
+        %cdr(a0, a0)
+        %b(&.loop)
+    :.done
+    %ldl(a0, result)
+})
+
+# is_ident_byte(c=a0) -> a1 (1 if c is a valid identifier byte, else 0).
+# Leaf. Allowed bytes are R7RS-Small's identifier set: ASCII letters,
+# digits, and the extended chars  ! $ % & * + - . / : < = > ? @ ^ _ ~ .
+# Clobbers t0, t1, a1.
+:is_ident_byte
+.scope
+    %brange(a0, -48, 10, t0, t1, &.ok)    ; '0'..'9'
+    %brange(a0, -65, 26, t0, t1, &.ok)    ; 'A'..'Z'
+    %brange(a0, -97, 26, t0, t1, &.ok)    ; 'a'..'z'
+
+    %bceq(a0,  -33, &.ok, t0)    ; '!'
+    %bceq(a0,  -36, &.ok, t0)    ; '$'
+    %bceq(a0,  -37, &.ok, t0)    ; '%'
+    %bceq(a0,  -38, &.ok, t0)    ; '&'
+    %bceq(a0,  -42, &.ok, t0)    ; '*'
+    %bceq(a0,  -43, &.ok, t0)    ; '+'
+    %bceq(a0,  -45, &.ok, t0)    ; '-'
+    %bceq(a0,  -46, &.ok, t0)    ; '.'
+    %bceq(a0,  -47, &.ok, t0)    ; '/'
+    %bceq(a0,  -58, &.ok, t0)    ; ':'
+    %bceq(a0,  -60, &.ok, t0)    ; '<'
+    %bceq(a0,  -61, &.ok, t0)    ; '='
+    %bceq(a0,  -62, &.ok, t0)    ; '>'
+    %bceq(a0,  -63, &.ok, t0)    ; '?'
+    %bceq(a0,  -64, &.ok, t0)    ; '@'
+    %bceq(a0,  -94, &.ok, t0)    ; '^'
+    %bceq(a0,  -95, &.ok, t0)    ; '_'
+    %bceq(a0, -126, &.ok, t0)    ; '~'
+
+    %li(a1, 0)
+    %ret
+
+    :.ok
+    %li(a1, 1)
+    %ret
+.endscope
+
+# parse_atom() -> tagged value (fixnum or symbol) in a0.
+# Reads until whitespace or paren or EOF, then dispatches by first byte.
+# A token whose first byte is a digit (or sign-then-digit) commits to
+# parse_dec and any non-numeric byte aborts; otherwise the token is a
+# symbol and every byte is checked against is_ident_byte before intern.
+#
+# Locals:
+#   start  cursor (byte offset)
+#   end  cursor   (byte offset)
+#   cursor  (scratch slot for the symbol-validation loop)
+%fn2(parse_atom, {start end cursor}, {
+    %lda_global(t1, t0, &readbuf_pos)
+    %stl(t1, start)
+
+    %ld_global(t2, &readbuf_len)
+
+    :.scan
+    %beq(t1, t2, &.end)
+    %readbuf_byte(a0, t1)
+
+    %is_ws_branch(a1, a0, &.end)
+    %bceq(a0, -40, &.end, a1)    ; '('
+    %bceq(a0, -41, &.end, a1)    ; ')'
+
+    %addi(t1, t1, 1)
+    %b(&.scan)
+
+    :.end
+    %stl(t1, end)
+    %st(t1, t0, 0)
+
+    # Dispatch on the first byte.
+    %ldl(t0, start)
+    %ld_global(a0, &readbuf_buf_ptr)
+    %add(a0, a0, t0)
+    %lb(t1, a0, 0)
+
+    # '0'..'9' -> int
+    %addi(a1, t1, -48)
+    %li(a2, 10)
+    %bltu(a1, a2, &.is_int)
+    # '-' or '+' followed by digit -> int. A lone '+' or '-' falls
+    # through to is_sym (those tokens stay valid identifiers).
+    %bceq(t1, -45, &.sign, a1)    ; '-'
+    %bceq(t1, -43, &.sign, a1)    ; '+'
+    %b(&.is_sym)
+    :.sign
+    %ldl(t2, end)
+    %addi(t0, t0, 1)
+    %beq(t0, t2, &.is_sym)
+    %readbuf_byte(a0, t0)
+    %addi(a1, a0, -48)
+    %bltu(a1, a2, &.is_int)
+    # fall through to is_sym
+
+    :.is_sym
+    # Validate every byte; abort on the first non-ident byte.
+    %ldl(t0, start)
+    %stl(t0, cursor)
+    :.sym_loop
+    %ldl(t0, cursor)
+    %ldl(t1, end)
+    %beq(t0, t1, &.sym_intern)
+    %readbuf_byte(a0, t0)
+    %call(&is_ident_byte)
+    %beqz(a1, &.sym_bad)
+    %ldl(t0, cursor)
+    %addi(t0, t0, 1)
+    %stl(t0, cursor)
+    %b(&.sym_loop)
+
+    :.sym_bad
+    %die(msg_bad_ident)
+
+    :.sym_intern
+    %ldl(a0, start)
+    %ld_global(t0, &readbuf_buf_ptr)
+    %add(a0, t0, a0)
+    %ldl(t1, end)
+    %ldl(t2, start)
+    %sub(a1, t1, t2)
+    %tail(&intern)
+
+    :.is_int
+    %ldl(t0, start)
+    %ldl(t1, end)
+    %ld_global(a0, &readbuf_buf_ptr)
+    %add(a0, a0, t0)
+    %sub(a1, t1, t0)            ; len = end - start
+    # P1pp's parse_dec handles '-' but not '+'; strip '+' here.
+    %lb(t2, a0, 0)
+    %bcne(t2, -43, &.no_plus, t2)    ; '+'
+    %addi(a0, a0, 1)
+    %addi(a1, a1, -1)
+    :.no_plus
+    %stl(a1, cursor)            ; save adjusted len (cursor slot is free on int path)
+    %call(&parse_dec)           ; P1pp: -> (raw_val=a0, consumed=a1)
+    %ldl(t0, cursor)
+    %bne(a1, t0, &.int_bad)    ; partial parse -> bad
+    %mkfix(a0, a0)
+    %eret
+    :.int_bad
+    %die(msg_bad_number)
+})
+
+# parse_string() -> tagged bytevector in a0. Cursor sits past the
+# opening '"' (consumed by parse_one). Two-pass: pass 1 walks the body,
+# counting decoded bytes in a0 and locating the closing '"'; pass 2
+# allocates the bv and decodes into its data buffer. Each named escape
+# (\n \t \r \\ \") yields one byte; an inline-hex escape \xHEX; (1+
+# hex digits, value 0..255, terminated by ';') also yields one byte.
+#
+# Locals:
+#   start  cursor (first content byte)
+#   end  cursor   (closing '"' position)
+#   bv  wrapper   (saved across the data fill loop)
+#   spill  slot   (write ptr saved across parse_hex in \x escape)
+%fn2(parse_string, {start end bv spill}, {
+    %ld_global(t1, &readbuf_pos)
+    %stl(t1, start)
+
+    %ld_global(t2, &readbuf_len)
+
+    %li(a0, 0)
+    :.scan
+        %beq(t1, t2, &.eof)
+        %readbuf_byte(a3, t1)
+        %bceq(a3, -34, &.scan_done, a1)    ; '"'
+        %bceq(a3, -92, &.scan_esc,  a1)    ; '\\'
+        %addi(t1, t1, 1)
+        %addi(a0, a0, 1)
+        %b(&.scan)
+
+        :.scan_esc
+        # Backslash plus the next byte yield one decoded byte. \xHEX; runs
+        # until the terminating ';' (validated in pass 2); every other escape
+        # is exactly two source bytes.
+        %addi(t1, t1, 1)
+        %beq(t1, t2, &.eof)
+        %readbuf_byte(a3, t1)
+        %bceq(a3, -120, &.scan_hex, a1)    ; 'x'
+        %addi(t1, t1, 1)
+        %addi(a0, a0, 1)
+        %b(&.scan)
+
+        :.scan_hex
+        # Skip past 'x' and scan to the terminating ';'. EOF before ';'
+        # falls into the unterminated-string path below, matching how an
+        # unterminated body is reported.
+        %addi(t1, t1, 1)
+        :.scan_hex_loop
+        %beq(t1, t2, &.eof)
+        %readbuf_byte(a3, t1)
+        %bceq(a3, -59, &.scan_hex_done, a1)    ; ';'
+        %addi(t1, t1, 1)
+        %b(&.scan_hex_loop)
+        :.scan_hex_done
+        %addi(t1, t1, 1)                ; consume ';'
+        %addi(a0, a0, 1)                ; +1 output byte
+        %b(&.scan)
+    :.scan_done
+
+    %stl(t1, end)
+    %call(&str_alloc)
+    %stl(a0, bv)
+
+    # Pass 2: decode into the freshly allocated data buffer.
+    %ldl(t1, start)
+    %ldl(t2, end)
+    %heap_ld(a3, a0, %BV.data)
+
+    :.fill
+    %beq(t1, t2, &.fill_done)
+    %readbuf_byte(a1, t1)
+    %bceq(a1, -92, &.fill_esc, a2)    ; '\\'
+    %sb(a1, a3, 0)
+    %addi(a3, a3, 1)
+    %addi(t1, t1, 1)
+    %b(&.fill)
+
+    :.fill_esc
+    %addi(t1, t1, 1)                ; consume backslash
+    %readbuf_byte(a1, t1)
+    %bceq(a1, -110, &.esc_n,      a2)    ; 'n'
+    %bceq(a1, -116, &.esc_t,      a2)    ; 't'
+    %bceq(a1, -114, &.esc_r,      a2)    ; 'r'
+    %bceq(a1,  -92, &.write_byte, a2)    ; '\\'
+    %bceq(a1,  -34, &.write_byte, a2)    ; '"'
+    %bceq(a1, -120, &.esc_hex,    a2)    ; 'x'
+    %die(msg_bad_escape)
+
+    :.esc_n
+    %li(a1, 10)
+    %b(&.write_byte)
+    :.esc_t
+    %li(a1, 9)
+    %b(&.write_byte)
+    :.esc_r
+    %li(a1, 13)
+    :.write_byte
+    %sb(a1, a3, 0)
+    %addi(a3, a3, 1)
+    %addi(t1, t1, 1)
+    %b(&.fill)
+
+    :.esc_hex
+    # Skip past 'x'. parse_hex consumes hex digits; demand at least one,
+    # value <= 255, and an immediate ';' terminator. parse_hex clobbers
+    # t0/t1/t2 and a2/a3, so spill the cursor (t1) and write ptr (a3)
+    # across the call. sp+0 is free once pass 1 finishes.
+    %addi(t1, t1, 1)                ; t1 -> first hex digit
+    %stl(t1, start)
+    %stl(a3, spill)
+    %ld_global(t0, &readbuf_buf_ptr)
+    %add(a0, t0, t1)                ; ptr to first hex digit
+    %sub(a1, t2, t1)                ; max len (bytes left in body)
+    %call(&parse_hex)               ; -> (a0=value, a1=consumed)
+    %beqz(a1, &.hex_bad)
+    %li(t0, 255)
+    %bltu(t0, a0, &.hex_bad)
+    %ldl(t1, start)
+    %add(t1, t1, a1)                ; t1 = position of expected ';'
+    %ldl(t2, end)
+    %beq(t1, t2, &.hex_bad)
+    %readbuf_byte(t0, t1)
+    %bcne(t0, -59, &.hex_bad, t0)    ; ';'
+    %addi(t1, t1, 1)                ; consume ';'
+    %ldl(a3, spill)
+    %sb(a0, a3, 0)
+    %addi(a3, a3, 1)
+    %b(&.fill)
+
+    :.hex_bad
+    %die(msg_bad_escape)
+
+    :.fill_done
+    %addi(t1, t1, 1)                ; consume closing '"'
+    %st_global(t1, &readbuf_pos, t0)
+    %ldl(a0, bv)
+    %eret
+
+    :.eof
+    %die(msg_unterm_string)
+})
+
+# Emit one named-char arm inside parse_char's multi-byte dispatch. t2
+# must hold the slice pointer; ::bad must be in scope. name_label is a
+# full label reference (e.g. &name_ch_tab).
+%macro match_named_char(name_label, len, value)
+    %mov(a0, t2)
+    %la(a1, name_label)
+    %li(a2, len)
+    %call(&memcmp)
+    %bnez(a0, &.bad)
+    %li(a0, value)
+    %mkfix(a0, a0)
+    %eret
+%endm
+
+# parse_char() -> tagged fixnum (the u8 char value) in a0. Cursor sits
+# past '#\\' (consumed by parse_one's hash dispatch). Always consumes
+# at least one byte; then continues until ws/paren/EOF. Single-byte
+# bodies yield that byte; multi-byte bodies dispatch to hex (#\xNN) or
+# named (#\space, #\newline, #\tab, #\return, #\null) forms.
+#
+# Locals:
+#   start  cursor
+#   end  cursor
+%fn2(parse_char, {start end}, {
+    %lda_global(t1, t0, &readbuf_pos)
+    %stl(t1, start)
+
+    %ld_global(t2, &readbuf_len)
+
+    %beq(t1, t2, &.short)
+
+    # Always consume the first byte unconditionally — it might itself be
+    # a delimiter (e.g., '(' in `#\(`) and is still the character value.
+    %addi(t1, t1, 1)
+
+    :.scan
+    %beq(t1, t2, &.scan_done)
+    %readbuf_byte(a0, t1)
+    %is_ws_branch(a1, a0, &.scan_done)
+    %bceq(a0, -40, &.scan_done, a1)    ; '('
+    %bceq(a0, -41, &.scan_done, a1)    ; ')'
+    %addi(t1, t1, 1)
+    %b(&.scan)
+
+    :.scan_done
+    %stl(t1, end)
+    %st(t1, t0, 0)
+
+    %ldl(t0, start)
+    %ldl(t1, end)
+    %sub(a2, t1, t0)                ; length
+
+    %bieq(a2, 1, &.single, a3)
+
+    %ld_global(t2, &readbuf_buf_ptr)
+    %add(t2, t2, t0)                ; t2 = slice ptr
+
+    # Hex form: first byte is 'x'.
+    %lb(a0, t2, 0)
+    %addi(a1, a0, -120)             ; 'x'
+    %beqz(a1, &.hex_form)
+
+    # Named form: dispatch on length.
+    %bieq(a2, 3, &.try_tab,     a3)
+    %bieq(a2, 4, &.try_null,    a3)
+    %bieq(a2, 5, &.try_space,   a3)
+    %bieq(a2, 6, &.try_return,  a3)
+    %bieq(a2, 7, &.try_newline, a3)
+    %b(&.bad)
+
+    :.single
+    %ld_global(t2, &readbuf_buf_ptr)
+    %add(t2, t2, t0)
+    %lb(a0, t2, 0)
+    %mkfix(a0, a0)
+    %eret
+
+    :.hex_form
+    %addi(a0, t2, 1)
+    %addi(a1, a2, -1)
+    %call(&parse_hex)
+    %mkfix(a0, a0)
+    %eret
+
+    :.try_tab
+    %match_named_char(&name_ch_tab, 3, 9)
+
+    :.try_null
+    %match_named_char(&name_ch_null, 4, 0)
+
+    :.try_space
+    %match_named_char(&name_ch_space, 5, 32)
+
+    :.try_return
+    %match_named_char(&name_ch_return, 6, 13)
+
+    :.try_newline
+    %match_named_char(&name_ch_newline, 7, 10)
+
+    :.bad
+    %die(msg_bad_char)
+
+    :.short
+    %die(msg_bad_char)
+})
+
+
+# =========================================================================
+# eval / apply
+# =========================================================================
+
+# eval(expr=a0, env=a1) -> value (a0)
+#
+# Locals:
+#   expr
+#   env
+#   fn  (head value, while args are being evaluated)
+#   pad
+%fn2(eval, {expr env fn pad}, {
+    %stl(a0, expr)
+    %stl(a1, env)
+
+    %tagof(t0, a0)
+    %bieq(t0, %TAG.SYM,  &.sym,  t1)
+    %bieq(t0, %TAG.PAIR, &.pair, t1)
+    # FIXNUM, HEAP, IMM all self-evaluate.
+    %eret
+
+    :.sym
+    # Walk the env alist. Each cell is ((sym . val) . rest). On hit,
+    # return cdr(binding); on NIL, fall back to the symbol's global slot.
+    # a0 still holds the tagged sym; a1 still holds env.
+    :.env_walk
+    %if_nil(t0, a1, &.env_miss)
+    %car(t1, a1)            ; t1 = (sym . val)
+    %car(t2, t1)            ; t2 = sym in binding
+    %beq(t2, a0, &.env_hit)
+    %cdr(a1, a1)
+    %b(&.env_walk)
+
+    :.env_hit
+    %cdr(a0, t1)
+    %eret
+
+    :.env_miss
+    %untag_sym(a0, a0)
+    %call(&sym_global)
+    %bieq(a0, %imm_val(%IMM.UNBOUND), &.unbound, t0)
+    %eret
+
+    :.unbound
+    %die(msg_unbound)
+
+
+    :.pair
+
+    # Special-form dispatch: pointer-compare head against the cached
+    # special-form symbol values. SYM is a distinct tag, so a head that
+    # isn't a symbol cannot collide with any sym_* slot.
+    %ldl(t0, expr)
+    %car(t0, t0)            ; t0 = head
+    %dispatch_form(&sym_quote,   &.do_quote)
+    %dispatch_form(&sym_if,      &.do_if)
+    %dispatch_form(&sym_lambda,  &.do_lambda)
+    %dispatch_form(&sym_define,  &.do_define)
+    %dispatch_form(&sym_begin,   &.do_begin)
+    %dispatch_form(&sym_cond,    &.do_cond)
+    %dispatch_form(&sym_let,     &.do_let)
+    %dispatch_form(&sym_letstar, &.do_letstar)
+    %dispatch_form(&sym_let_values, &.do_let_values)
+    %dispatch_form(&sym_letstar_values, &.do_letstar_values)
+    %dispatch_form(&sym_and,     &.do_and)
+    %dispatch_form(&sym_or,      &.do_or)
+    %dispatch_form(&sym_when,    &.do_when)
+    %dispatch_form(&sym_case,    &.do_case)
+    %dispatch_form(&sym_setbang, &.do_setbang)
+    %dispatch_form(&sym_define_record_type, &.do_define_record_type)
+    %dispatch_form(&sym_pmatch,  &.do_pmatch)
+    %dispatch_form(&sym_do,      &.do_do)
+
+    # Apply car to cdr
+    # fn = eval(car(expr), env)
+    %ldl(a0, expr)
+    %car(a0, a0)
+    %ldl(a1, env)
+    %call(&eval)
+    %stl(a0, fn)
+    # args = eval_args(cdr(expr), env)
+    %ldl(a0, expr)
+    %cdr(a0, a0)
+    %ldl(a1, env)
+    %call(&eval_args)
+    # apply(fn, args) -- tail call
+    %mov(a1, a0)
+    %ldl(a0, fn)
+    %tail(&apply)
+
+    :.do_quote
+    %tail_to_handler(&eval_quote)
+    :.do_if
+    %tail_to_handler(&eval_if)
+    :.do_lambda
+    %tail_to_handler(&eval_lambda)
+    :.do_define
+    %tail_to_handler(&eval_define)
+    :.do_begin
+    %tail_to_handler(&eval_body)
+    :.do_cond
+    %tail_to_handler(&eval_cond)
+    :.do_let
+    %tail_to_handler(&eval_let)
+    :.do_letstar
+    %tail_to_handler(&eval_letstar)
+    :.do_let_values
+    %tail_to_handler(&eval_let_values)
+    :.do_letstar_values
+    %tail_to_handler(&eval_letstar_values)
+    :.do_and
+    %tail_to_handler(&eval_and)
+    :.do_or
+    %tail_to_handler(&eval_or)
+    :.do_when
+    %tail_to_handler(&eval_when)
+    :.do_case
+    %tail_to_handler(&eval_case)
+    :.do_setbang
+    %tail_to_handler(&eval_setbang)
+    :.do_define_record_type
+    %tail_to_handler(&eval_define_record_type)
+    :.do_pmatch
+    %tail_to_handler(&eval_pmatch)
+    :.do_do
+    %tail_to_handler(&eval_do)
+})
+
+# eval_args(args=a0, env=a1) -> evaluated args list (cons-built).
+# Iterative head/tail-cdr build: each iteration evals one arg, allocates
+# a (val . NIL) cell, and either seeds head/tail or set-cdr!s onto the
+# previous tail. Host stack stays O(1) regardless of arg-list length;
+# eval order is left-to-right.
+#
+# Locals:
+#   args  (advances)
+#   env
+#   head  (NIL until first val is appended)
+#   tail  (most recent cell; set-cdr! target)
+%fn2(eval_args, {args env head tail}, {
+    %stl(a0, args)
+    %stl(a1, env)
+    %li(t0, %imm_val(%IMM.NIL))
+    %stl(t0, head)
+    %stl(t0, tail)
+
+    :.loop
+        %ldl(t0, args)
+        %if_nil(t1, t0, &.done)
+
+        # val = eval(car(args), env)
+        %car(a0, t0)
+        %ldl(a1, env)
+        %call(&eval)
+
+        # cell = cons(val, NIL); append to head/tail.
+        %li(a1, %imm_val(%IMM.NIL))
+        %call(&cons)
+
+        %ldl(t0, head)
+        %if_nil(t1, t0, &.first)
+        %ldl(t0, tail)
+        %set_cdr(a0, t0)
+        %stl(a0, tail)
+        %b(&.advance)
+
+        :.first
+        %stl(a0, head)
+        %stl(a0, tail)
+
+        :.advance
+        %advance_walk(args)
+        %b(&.loop)
+    :.done
+
+    %ldl(a0, head)
+})
+
+
+# apply(fn=a0, args=a1) -> result (a0)
+#
+# Locals:
+#   args
+#   body  (saved across bind_params for the closure path)
+%fn2(apply, {args body}, {
+    %stl(a1, args)
+
+    %hdr_type(t0, a0)
+    %bieq(t0, %HDR.PRIM,    &.prim,    t1)
+    %bieq(t0, %HDR.CLOSURE, &.closure, t1)
+
+    :.prim
+    # Primitive calling convention:
+    #   a0 = args list (proper list of evaluated args)
+    #   a1 = the PRIM object itself (HEAP-tagged)
+    # Parameterized PRIMs (e.g. the per-field record accessors built
+    # by define-record-type) read their closed-over datum from
+    # a1+13. Plain PRIMs ignore a1. A primitive that needs a1 as a
+    # working register must save it first; this convention is shared
+    # across every entry in prim_table and is not negotiable per
+    # primitive. prim_apply_entry maintains the same contract when it
+    # tail-calls back into apply.
+    %mov(a1, a0)
+    %heap_ld(t0, a0, %PRIM.entry_w)
+    %ldl(a0, args)
+    %tailr(t0)
+
+    :.closure
+    # Closure layout (HEAP-tagged): [hdr][params][body][env]
+    %heap_ld(t0, a0, %CLOSURE.params)
+    %heap_ld(t1, a0, %CLOSURE.body)
+    %heap_ld(t2, a0, %CLOSURE.env)
+    %stl(t1, body)  ; persist body past bind_params
+
+    # bind_params(params, args, env)
+    %mov(a0, t0)
+    %ldl(a1, args)
+    %mov(a2, t2)
+    %call(&bind_params)
+
+    # eval_body(body, new_env) -- tail call
+    %mov(a1, a0)
+    %ldl(a0, body)
+    %tail(&eval_body)
+})
+
+# =========================================================================
+# Special forms
+# =========================================================================
+#
+# intern_special_forms runs at startup, before register_primitives, so
+# the symbols `if`, ... occupy the first sym_idx slots (per LISP-C.md
+# §Reservation convention). For now we just cache each one's tagged
+# value in a labeled slot; eval's pair branch compares head against
+# these slots before falling through to ordinary application.
+
+%fn(intern_special_forms, 0, {
+    %intern_form(quote,              "quote",              &sym_quote)
+    %intern_form(if,                 "if",                 &sym_if)
+    %intern_form(lambda,             "lambda",             &sym_lambda)
+    %intern_form(define,             "define",             &sym_define)
+    %intern_form(begin,              "begin",              &sym_begin)
+    %intern_form(cond,               "cond",               &sym_cond)
+    %intern_form(else,               "else",               &sym_else)
+    %intern_form(arrow,              "=>",                 &sym_arrow)
+    %intern_form(let,                "let",                &sym_let)
+    %intern_form(letstar,            "let*",               &sym_letstar)
+    %intern_form(let_values,         "let-values",         &sym_let_values)
+    %intern_form(letstar_values,     "let*-values",        &sym_letstar_values)
+    %intern_form(and,                "and",                &sym_and)
+    %intern_form(or,                 "or",                 &sym_or)
+    %intern_form(when,               "when",               &sym_when)
+    %intern_form(case,               "case",               &sym_case)
+    %intern_form(setbang,            "set!",               &sym_setbang)
+    %intern_form(define_record_type, "define-record-type", &sym_define_record_type)
+    %intern_form(pmatch,             "pmatch",             &sym_pmatch)
+    %intern_form(do,                 "do",                 &sym_do)
+    %intern_form(unquote,            "unquote",            &sym_unquote)
+    %intern_form(guard,              "guard",              &sym_guard)
+    %intern_form(underscore,         "_",                  &sym_underscore)
+    %intern_form(dollar,             "$",                  &sym_dollar)
+})
+
+# eval_quote(rest=a0, env=a1) -> value (a0). rest is (datum); return datum.
+%fn(eval_quote, 0, {
+    %car(a0, a0)
+})
+
+# eval_if(rest=a0, env=a1) -> value (a0). `rest` is (test then) or
+# (test then else). Single-arm form returns UNSPEC when test is #f.
+# No arity check beyond that -- spec policy: malformed special forms
+# are UB.
+#
+# Locals:
+#   rest
+#   env
+%fn2(eval_if, {rest env}, {
+    %stl(a0, rest)
+    %stl(a1, env)
+
+    # val = eval(car(rest), env)
+    %car(a0, a0)
+    %call(&eval)
+
+    %bieq(a0, %imm_val(%IMM.FALSE), &.else_branch, t0)
+
+    # then-branch: tail-eval(cadr(rest), env)
+    %ldl(a0, rest)
+    %cdr(a0, a0)
+    %car(a0, a0)
+    %ldl(a1, env)
+    %tail(&eval)
+
+    :.else_branch
+    # If cddr(rest) is NIL, this is single-arm `if` -> UNSPEC.
+    %ldl(t0, rest)
+    %cdr(t0, t0)
+    %cdr(t0, t0)
+    %if_nil(t1, t0, &.no_else)
+
+    # else-branch: tail-eval(car(cddr(rest)), env)
+    %car(a0, t0)
+    %ldl(a1, env)
+    %tail(&eval)
+
+    :.no_else
+    %li(a0, %imm_val(%IMM.UNSPEC))
+})
+
+# eval_lambda(rest=a0, env=a1) -> closure (a0).
+# rest is (params . body). Allocates a 32-byte CLOSURE on the heap
+# and stores params, body, and the captured env directly.
+#
+# Locals:
+#   rest
+#   env
+#   closure  ptr (HEAP-tagged)
+%fn2(eval_lambda, {rest env closure}, {
+    %stl(a0, rest)
+    %stl(a1, env)
+
+    %li(a0, %CLOSURE.SIZE)
+    %li(a1, %HDR.CLOSURE)
+    %call(&alloc_hdr)
+    %stl(a0, closure)
+
+    # closure[params] = car(rest)
+    %ldl(t0, rest)
+    %car(t1, t0)
+    %ldl(t0, closure)
+    %heap_st(t1, t0, %CLOSURE.params)
+
+    # closure[body] = cdr(rest)
+    %ldl(t1, rest)
+    %cdr(t1, t1)
+    %heap_st(t1, t0, %CLOSURE.body)
+
+    # closure[env] = captured env
+    %ldl(t1, env)
+    %heap_st(t1, t0, %CLOSURE.env)
+
+    %ldl(a0, closure)
+})
+
+# eval_define(rest=a0, env=a1) -> UNSPEC (a0).
+# Top-level only. Two surface forms:
+#   (define <sym> <expr>)              ; head of rest is a SYM
+#   (define (<sym> . <params>) . body) ; head of rest is a PAIR; sugar for
+#                                         (define <sym> (lambda <params> . body))
+# Internal `define` is rejected by eval_body before this entry is reached
+# (every internal body context routes through eval_body); see the check
+# at the head of eval_body's loop.
+#
+# Locals:
+#   rest
+#   env
+%fn2(eval_define, {rest env}, {
+    %stl(a0, rest)
+    %stl(a1, env)
+
+    # If car(rest) is a pair, this is the lambda-sugar form.
+    %car(t0, a0)
+    %tagof(t1, t0)
+    %bieq(t1, %TAG.PAIR, &.sugar, t2)
+
+    # Plain define: value = eval(car(cdr(rest)), env)
+    %ldl(t0, rest)
+    %cdr(a0, t0)
+    %car(a0, a0)
+    %ldl(a1, env)
+    %call(&eval)
+
+    %ldl(t0, rest)
+    %car(t0, t0)
+    %set_global(t0, a0)
+    %li(a0, %imm_val(%IMM.UNSPEC))
+    %eret
+
+    :.sugar
+    # rest = ((name . params) . body); build (params . body) for eval_lambda.
+    %ldl(t0, rest)
+    %car(t0, t0)
+    %cdr(a0, t0)            ; params
+    %ldl(t0, rest)
+    %cdr(a1, t0)            ; body
+    %call(&cons)
+    %ldl(a1, env)
+    %call(&eval_lambda)
+
+    %ldl(t0, rest)
+    %car(t0, t0)
+    %car(t0, t0)            ; name
+    %set_global(t0, a0)
+    %li(a0, %imm_val(%IMM.UNSPEC))
+})
+
+# eval_setbang(rest=a0, env=a1) -> UNSPEC (a0).
+# rest = (sym value-expr). Evaluates value-expr in env, then walks the
+# env alist looking for a binding cell whose car is the target sym;
+# on hit, mutates the cell's cdr (offset 7, same as set-cdr!). On miss,
+# falls back to the global slot via sym_set_global -- the shape used
+# by define for top-level rebind. Spec: behavior on a truly unbound
+# name follows the primitive-failure policy.
+#
+# Locals:
+#   rest  (sym . (value-expr . ()))
+#   env
+#   saved  value   (eval'd value-expr)
+%fn2(eval_setbang, {rest env saved}, {
+    %stl(a0, rest)
+    %stl(a1, env)
+
+    # value = eval(cadr(rest), env)
+    %cdr(a0, a0)
+    %car(a0, a0)
+    %ldl(a1, env)
+    %call(&eval)
+    %stl(a0, saved)
+
+    # Walk env looking for a binding cell whose car == target sym.
+    # Only t0..t2 are available: t0 scratch, t1 target sym, t2 env cursor.
+    %ldl(t1, rest)
+    %car(t1, t1)            ; target sym
+
+    :.loop
+        %ldl(t2, env)
+        %if_nil(t0, t2, &.miss)
+        %car(t0, t2)
+        %car(t0, t0)            ; cell sym
+        %beq(t0, t1, &.hit)
+        %cdr(t2, t2)
+        %stl(t2, env)
+        %b(&.loop)
+
+    :.hit
+    %car(t0, t2)            ; re-fetch binding cell
+    %ldl(a0, saved)
+    %set_cdr(a0, t0)          ; mutate cell's cdr
+    %li(a0, %imm_val(%IMM.UNSPEC))
+    %eret
+
+    :.miss
+    # Miss: rebind global.
+    %ldl(a0, saved)
+    %ldl(t0, rest)
+    %car(t0, t0)
+    %set_global(t0, a0)
+    %li(a0, %imm_val(%IMM.UNSPEC))
+})
+
+# eval_cond(clauses=a0, env=a1) -> value (a0).
+# Clause shapes: (else body...), (test body...), (test => proc-expr).
+# else / => are literal symbols matched by pointer equality. The =>
+# arrow is only recognized in non-else clauses; an empty body after a
+# truthy test returns UNSPEC (spec policy: malformed-form UB).
+#
+# Locals:
+#   clauses  (advances)
+#   env
+#   test  value (live across the => eval/cons calls)
+#   proc  (live across the => cons call)
+%fn2(eval_cond, {clauses env test proc}, {
+    %stl(a0, clauses)
+    %stl(a1, env)
+
+    :.loop
+    %ldl(t0, clauses)
+    %if_nil(t1, t0, &.no_match)
+
+    %car(t1, t0)            ; clause
+    %car(t2, t1)            ; test_expr
+
+    %ld_global(a0, &sym_else)
+    %beq(t2, a0, &.else_clause)
+
+    %mov(a0, t2)
+    %ldl(a1, env)
+    %call(&eval)
+    %li(t0, %imm_val(%IMM.FALSE))
+    %beq(a0, t0, &.next)
+
+    # Truthy. Spill test value and inspect cdr(clause): empty -> UNSPEC,
+    # car == => -> arrow path, else regular body.
+    %stl(a0, test)
+    %ldl(t0, clauses)
+    %car(t0, t0)
+    %cdr(t0, t0)
+    %if_nil(t1, t0, &.no_match)
+    %car(t1, t0)
+    %ld_global(t2, &sym_arrow)
+    %beq(t1, t2, &.arrow)
+
+    %mov(a0, t0)            ; regular body
+    %ldl(a1, env)
+    %tail(&eval_body)
+
+    :.arrow
+    %cdr(t0, t0)
+    %car(a0, t0)            ; proc-expr
+    %ldl(a1, env)
+    %call(&eval)
+    %stl(a0, proc)
+    %ldl(a0, test)
+    %li(a1, %imm_val(%IMM.NIL))
+    %call(&cons)
+    %mov(a1, a0)
+    %ldl(a0, proc)
+    %tail(&apply)
+
+    :.else_clause
+    %ldl(t0, clauses)
+    %car(t0, t0)
+    %cdr(a0, t0)
+    %ldl(a1, env)
+    %tail(&eval_body)
+
+    :.next
+    %advance_walk(clauses)
+    %b(&.loop)
+
+    :.no_match
+    %li(a0, %imm_val(%IMM.UNSPEC))
+})
+
+# eval_let(rest=a0, env=a1) -> value (a0).
+# Two surface forms:
+#   (let ((p v) ...) body...)
+#   (let name ((p v) ...) body...)   ; named let, dispatches to eval_let_named
+# Standard `let` evaluates every init in `env`, then extends env with all
+# bindings simultaneously and tail-evaluates the body.
+#
+# Locals:
+#   rest
+#   env  (original)
+#   walk  (bindings, advances)
+#   new_env  (built up)
+%fn2(eval_let, {rest env walk new_env}, {
+    %stl(a0, rest)
+    %stl(a1, env)
+
+    # Named let?
+    %car(t0, a0)
+    %tagof(t1, t0)
+    %bieq(t1, %TAG.SYM, &.named, t2)
+
+    %ldl(t0, rest)
+    %car(t0, t0)            ; bindings
+    %stl(t0, walk)
+    %ldl(t0, env)
+    %stl(t0, new_env)         ; new_env = env
+
+    :.loop
+    %ldl(t0, walk)
+    %if_nil(t1, t0, &.done)
+
+    %car(t1, t0)            ; pair = (name init)
+    %cdr(t2, t1)
+    %car(t2, t2)            ; init
+
+    # val = eval(init, env_orig)
+    %mov(a0, t2)
+    %ldl(a1, env)
+    %call(&eval)
+
+    # binding = cons(name, val)
+    %ldl(t0, walk)
+    %car(t1, t0)
+    %car(t2, t1)
+    %mov(a1, a0)
+    %mov(a0, t2)
+    %call(&cons)
+
+    # new_env = cons(binding, new_env)
+    %ldl(a1, new_env)
+    %call(&cons)
+    %stl(a0, new_env)
+
+    %advance_walk(walk)
+    %b(&.loop)
+
+    :.done
+    %ldl(a0, rest)
+    %cdr(a0, a0)            ; body
+    %ldl(a1, new_env)
+    %tail(&eval_body)
+
+    :.named
+    %ldl(a0, rest)
+    %ldl(a1, env)
+    %tail(&eval_let_named)
+})
+
+# eval_letstar(rest=a0, env=a1) -> value (a0).
+# Like let, but each init is evaluated in the env extended by all prior
+# bindings of the same let* form (left-to-right shadowing).
+#
+# Locals:
+#   rest
+#   env
+#   walk
+#   new_env
+%fn2(eval_letstar, {rest env walk new_env}, {
+    %stl(a0, rest)
+    %stl(a1, env)
+
+    %ldl(t0, rest)
+    %car(t0, t0)
+    %stl(t0, walk)
+    %ldl(t0, env)
+    %stl(t0, new_env)
+
+    :.loop
+        %ldl(t0, walk)
+        %if_nil(t1, t0, &.done)
+
+        %car(t1, t0)
+        %cdr(t2, t1)
+        %car(t2, t2)
+
+        # val = eval(init, new_env)
+        %mov(a0, t2)
+        %ldl(a1, new_env)
+        %call(&eval)
+
+        %ldl(t0, walk)
+        %car(t1, t0)
+        %car(t2, t1)
+        %mov(a1, a0)
+        %mov(a0, t2)
+        %call(&cons)
+
+        %ldl(a1, new_env)
+        %call(&cons)
+        %stl(a0, new_env)
+
+        %advance_walk(walk)
+        %b(&.loop)
+    :.done
+
+    %ldl(a0, rest)
+    %cdr(a0, a0)
+    %ldl(a1, new_env)
+    %tail(&eval_body)
+})
+
+# eval_let_values(rest=a0, env=a1) -> value (a0).
+# rest = (((formals init) ...) body...). Each init is evaluated in the
+# OUTER env; mv_to_list normalizes its result so bind_params can drive
+# both list-style and dotted/rest formals identically. Then bodies run
+# in the env extended by all clauses.
+#
+# Locals:
+#   rest
+#   env  (original)
+#   walk  (clauses, advances)
+#   new_env  (built up)
+%fn2(eval_let_values, {rest env walk new_env}, {
+    %stl(a0, rest)
+    %stl(a1, env)
+
+    %ldl(t0, rest)
+    %car(t0, t0)            ; clauses
+    %stl(t0, walk)
+    %ldl(t0, env)
+    %stl(t0, new_env)         ; new_env = env
+
+    :.loop
+        %ldl(t0, walk)
+        %if_nil(t1, t0, &.done)
+
+        %car(t1, t0)            ; clause = (formals init)
+        %cdr(t2, t1)
+        %car(t2, t2)            ; init
+
+        # val = eval(init, env_orig)
+        %mov(a0, t2)
+        %ldl(a1, env)
+        %call(&eval)
+
+        # vals = mv_to_list(val)
+        %call(&mv_to_list)
+
+        # new_env = bind_params(formals, vals, new_env)
+        %ldl(t0, walk)
+        %car(t1, t0)
+        %car(t1, t1)            ; formals
+        %mov(a1, a0)
+        %mov(a0, t1)
+        %ldl(a2, new_env)
+        %call(&bind_params)
+        %stl(a0, new_env)
+
+        %advance_walk(walk)
+        %b(&.loop)
+    :.done
+
+    %ldl(a0, rest)
+    %cdr(a0, a0)            ; body
+    %ldl(a1, new_env)
+    %tail(&eval_body)
+})
+
+# eval_letstar_values(rest=a0, env=a1) -> value (a0).
+# Like let-values but each init is evaluated in new_env (the env extended
+# by all prior clauses' bindings), giving sequential / shadowing semantics.
+#
+# Locals:
+#   rest
+#   env
+#   walk
+#   new_env
+%fn2(eval_letstar_values, {rest env walk new_env}, {
+    %stl(a0, rest)
+    %stl(a1, env)
+
+    %ldl(t0, rest)
+    %car(t0, t0)
+    %stl(t0, walk)
+    %ldl(t0, env)
+    %stl(t0, new_env)
+
+    :.loop
+        %ldl(t0, walk)
+        %if_nil(t1, t0, &.done)
+
+        %car(t1, t0)
+        %cdr(t2, t1)
+        %car(t2, t2)            ; init
+
+        # val = eval(init, new_env)
+        %mov(a0, t2)
+        %ldl(a1, new_env)
+        %call(&eval)
+
+        %call(&mv_to_list)
+
+        %ldl(t0, walk)
+        %car(t1, t0)
+        %car(t1, t1)            ; formals
+        %mov(a1, a0)
+        %mov(a0, t1)
+        %ldl(a2, new_env)
+        %call(&bind_params)
+        %stl(a0, new_env)
+
+        %advance_walk(walk)
+        %b(&.loop)
+    :.done
+
+    %ldl(a0, rest)
+    %cdr(a0, a0)
+    %ldl(a1, new_env)
+    %tail(&eval_body)
+})
+
+# eval_and(rest=a0, env=a1) -> value (a0).
+# (and) is #t. Otherwise eval forms left-to-right, short-circuiting to #f
+# the moment one yields #f. The last form is tail-evaluated so a tail call
+# inside `and` doesn't grow the host stack.
+#
+# Locals:
+#   rest
+#   env
+%fn2(eval_and, {rest env}, {
+    %li(t0, %imm_val(%IMM.TRUE))
+    %if_nil(t1, a0, &.done_imm)
+
+    :.loop
+        %stl(a0, rest)
+        %stl(a1, env)
+
+        # If cdr(rest) is NIL, the head is the last form -> tail-eval.
+        %cdr(t0, a0)
+        %if_nil(t1, t0, &.last)
+
+        # Non-last: eval, short-circuit on #f, otherwise advance.
+        %car(a0, a0)
+        %call(&eval)
+        %li(t0, %imm_val(%IMM.FALSE))
+        %beq(a0, t0, &.done)
+        %ldl(a0, rest)
+        %cdr(a0, a0)
+        %ldl(a1, env)
+        %b(&.loop)
+
+        :.last
+        %ldl(a0, rest)
+        %car(a0, a0)
+        %ldl(a1, env)
+        %tail(&eval)
+    :.done
+
+    %eret
+
+    :.done_imm
+    %mov(a0, t0)
+})
+
+# eval_or(rest=a0, env=a1) -> value (a0).
+# (or) is #f. Otherwise eval forms left-to-right and return the first
+# non-#f value; if every form was #f, return #f. The last form is
+# tail-evaluated.
+#
+# Locals:
+#   rest
+#   env
+%fn2(eval_or, {rest env}, {
+    %li(t0, %imm_val(%IMM.FALSE))
+    %if_nil(t1, a0, &.done_imm)
+
+    :.loop
+        %stl(a0, rest)
+        %stl(a1, env)
+
+        %cdr(t0, a0)
+        %if_nil(t1, t0, &.last)
+
+        %car(a0, a0)
+        %call(&eval)
+        %bine(a0, %imm_val(%IMM.FALSE), &.done, t0)
+        %ldl(a0, rest)
+        %cdr(a0, a0)
+        %ldl(a1, env)
+        %b(&.loop)
+
+        :.last
+        %ldl(a0, rest)
+        %car(a0, a0)
+        %ldl(a1, env)
+        %tail(&eval)
+    :.done
+
+    %eret
+
+    :.done_imm
+    %mov(a0, t0)
+})
+
+# eval_when(rest=a0, env=a1) -> value (a0).
+# (when test body...) -- if test evaluates non-#f, tail-eval body and
+# return its last value; otherwise return UNSPEC. Body never enters a
+# new scope.
+#
+# Locals:
+#   rest
+#   env
+%fn2(eval_when, {rest env}, {
+    %stl(a0, rest)
+    %stl(a1, env)
+
+    %car(a0, a0)            ; test
+    %call(&eval)
+
+    %bieq(a0, %imm_val(%IMM.FALSE), &.skip, t0)
+
+    %ldl(a0, rest)
+    %cdr(a0, a0)            ; body
+    %ldl(a1, env)
+    %tail(&eval_body)
+
+    :.skip
+    %li(a0, %imm_val(%IMM.UNSPEC))
+})
+
+# eval_case(rest=a0, env=a1) -> value (a0).
+# rest is (key-expr clause...). The key is evaluated once; clauses are
+# tried in order. Clause shape:
+#   ((datum...) body...)   ; datums are literal, eq?-compared to key
+#   (else body...)         ; matches unconditionally
+# Matching uses pointer equality (eq?), which is correct for fixnums,
+# symbols, chars, and booleans -- the values case is meant for. The
+# matched clause's body is tail-evaluated via eval_body. No-match (and
+# no else) returns UNSPEC, mirroring eval_cond's no-match policy.
+#
+# Locals:
+#   subject  (evaluated key)
+#   env
+#   clauses  (advances)
+#   datums   (advances within a clause)
+%fn2(eval_case, {subject env clauses datums}, {
+    %stl(a1, env)
+
+    # subject = eval(car(rest), env); clauses = cdr(rest).
+    %mov(t0, a0)
+    %cdr(t1, t0)
+    %stl(t1, clauses)
+    %car(a0, t0)
+    %ldl(a1, env)
+    %call(&eval)
+    %stl(a0, subject)
+
+    :.loop
+        %ldl(t0, clauses)
+        %if_nil(t1, t0, &.no_match)
+
+        %car(t1, t0)                  ; clause
+        %car(t2, t1)                  ; head: datum-list or `else`
+
+        %ld_global(a3, &sym_else)
+        %beq(t2, a3, &.do_else)
+
+        # Walk the datum list, eq?-compare each against subject.
+        %stl(t2, datums)
+        %ldl(a0, subject)
+        :.scan
+        %ldl(t0, datums)
+        %if_nil(t1, t0, &.next_clause)
+        %car(t1, t0)                  ; datum
+        %beq(t1, a0, &.do_body)
+        %cdr(t0, t0)
+        %stl(t0, datums)
+        %b(&.scan)
+
+        :.do_body
+        %ldl(t0, clauses)
+        %car(t0, t0)
+        %cdr(a0, t0)                  ; body
+        %ldl(a1, env)
+        %tail(&eval_body)
+
+        :.do_else
+        %ldl(t0, clauses)
+        %car(t0, t0)
+        %cdr(a0, t0)                  ; body
+        %ldl(a1, env)
+        %tail(&eval_body)
+
+        :.next_clause
+        %ldl(t0, clauses)
+        %cdr(t0, t0)
+        %stl(t0, clauses)
+        %b(&.loop)
+
+    :.no_match
+    %li(a0, %imm_val(%IMM.UNSPEC))
+})
+
+# eval_pmatch(rest=a0, env=a1) -> value (a0).
+# rest is (subject-expr . clauses). The subject is evaluated once; each
+# clause is then tried in order against the same subject value, restarting
+# from the outer env per clause. Clause shape:
+#   (<pat> <body>...)
+#   (<pat> (guard <g>...) <body>...)
+#   (else <body>...)
+# An `else` clause always matches with no bindings; a guarded clause is
+# selected only if every guard expression evaluates non-#f. The matched
+# clause's body is tail-evaluated via eval_body so the last form keeps
+# tail position. No-match (and no else) dies via runtime_error.
+#
+# Locals:
+#   subject
+#   env_outer  (per-clause restart point)
+#   clauses  (current cursor; advances on miss / failed guard)
+#   env_ext  (env extended with the matched clause's bindings)
+#   guard  cursor (advances during the guard AND-fold)
+#   body  (saved across guard evals, tail-evaluated on success)
+%fn2(eval_pmatch, {subject env_outer clauses env_ext guard body}, {
+    %stl(a1, env_outer)
+
+    # subject = eval(car(rest), env_outer); clauses = cdr(rest).
+    %mov(t0, a0)
+    %cdr(t1, t0)
+    %stl(t1, clauses)
+    %car(a0, t0)
+    %ldl(a1, env_outer)
+    %call(&eval)
+    %stl(a0, subject)
+
+    :.loop
+        %ldl(t0, clauses)
+        %if_nil(t1, t0, &.no_match)
+
+        %car(t1, t0)                  ; clause
+        %car(t2, t1)                  ; pat
+
+        %ld_global(a3, &sym_else)
+        %beq(t2, a3, &.do_else)
+
+        # pmatch_match(pat, subject, env_outer) -> (a0=env_ext, a1=ok)
+        %mov(a0, t2)
+        %ldl(a1, subject)
+        %ldl(a2, env_outer)
+        %call(&pmatch_match)
+        %beqz(a1, &.next)
+
+        %stl(a0, env_ext)               ; env_ext
+
+        # tail = cdr(clause)
+        %ldl(t0, clauses)
+        %car(t0, t0)
+        %cdr(t0, t0)                  ; tail = (body...) or ((guard ...) body...)
+
+        # Guard form? tail is a pair, car(tail) is a pair, head of car(tail)
+        # eq? sym_guard.
+        %tagof(t1, t0)
+        %bine(t1, %TAG.PAIR, &.body_simple, t2)
+        %car(t1, t0)                  ; first form of tail
+        %tagof(t2, t1)
+        %bine(t2, %TAG.PAIR, &.body_simple, a0)
+        %car(a0, t1)                  ; head of first form
+        %ld_global(a1, &sym_guard)
+        %bne(a0, a1, &.body_simple)
+
+        # Guard clause. guards = cdr(car(tail)); body = cdr(tail).
+        %cdr(a0, t1)
+        %stl(a0, guard)
+        %cdr(t0, t0)
+        %stl(t0, body)
+
+        :.g_loop
+            %ldl(t0, guard)
+            %if_nil(t1, t0, &.body_run)
+
+            %car(a0, t0)                  ; guard expr
+            %ldl(a1, env_ext)               ; env_ext
+            %call(&eval)
+            %bieq(a0, %imm_val(%IMM.FALSE), &.next, t0)
+
+            %ldl(t0, guard)
+            %cdr(t0, t0)
+            %stl(t0, guard)
+            %b(&.g_loop)
+
+        :.body_run
+        %ldl(a0, body)
+        %ldl(a1, env_ext)
+        %tail(&eval_body)
+
+        :.body_simple
+        # tail itself is the body (no guard wrapper). Tail-call eval_body
+        # with the extended env; tail position of the matched clause's body
+        # is preserved.
+        %mov(a0, t0)
+        %ldl(a1, env_ext)
+        %tail(&eval_body)
+
+        :.do_else
+        %ldl(t0, clauses)
+        %car(t0, t0)
+        %cdr(a0, t0)                  ; body
+        %ldl(a1, env_outer)                ; env_outer (no bindings introduced)
+        %tail(&eval_body)
+
+        :.next
+        %ldl(t0, clauses)
+        %cdr(t0, t0)
+        %stl(t0, clauses)
+        %b(&.loop)
+
+    :.no_match
+    %die(msg_pmatch_no_match)
+})
+
+# eval_do(rest=a0, env=a1) -> value (a0).
+# rest = (((var init step?) ...) (test result?...) body...).
+#
+# Phase 1 (init): walk binding-specs in order, eval each `init` in the
+# outer env, build new_env by consing (var . val) pairs onto it. A
+# parallel list `pairs_head` records the binding pairs in spec order so
+# the iteration can mutate them by set-cdr!. A second parallel list
+# `vals_head` is preallocated (one cell per spec) to hold each iteration's
+# computed step values without per-iteration cell allocation.
+#
+# Phase 2 (loop): eval test in new_env. Truthy -> tail-eval result body
+# (UNSPEC if no result forms). Falsy -> eval each command form in
+# new_env (discard), collect new step values into vals_head (parallel
+# semantics: every step is evaluated against the iteration's pre-update
+# bindings; specs without a step keep their current value), then walk
+# pairs_head/vals_head together and set-cdr! each binding pair to its
+# new value. Loop.
+#
+# Locals:
+#   rest          original rest pointer
+#   env           outer env
+#   new_env       env extended with binding pairs (mutated each iter)
+#   walk          generic cdr-cursor (binding-specs / commands / steps)
+#   pairs_head    list of binding-pair refs in spec order
+#   pairs_tail    append point during init
+#   vals_head     parallel list of cells holding each iteration's step vals
+#   vals_tail     append point during init
+#   body          body command-forms (cddr of rest)
+#   pair_walk     cdr-cursor over pairs_head during step/update
+#   val_walk      cdr-cursor over vals_head during step/update
+%fn2(eval_do, {rest env new_env walk pairs_head pairs_tail vals_head vals_tail body pair_walk val_walk}, {
+    %stl(a0, rest)
+    %stl(a1, env)
+
+    %ldl(t0, rest)
+    %car(t0, t0)
+    %stl(t0, walk)
+    %ldl(t0, env)
+    %stl(t0, new_env)
+    %li(t0, %imm_val(%IMM.NIL))
+    %stl(t0, pairs_head)
+    %stl(t0, pairs_tail)
+    %stl(t0, vals_head)
+    %stl(t0, vals_tail)
+
+    :.init_loop
+        %ldl(t0, walk)
+        %if_nil(t1, t0, &.init_done)
+
+        # spec = car(walk); init-expr = car(cdr(spec)).
+        %car(t1, t0)
+        %cdr(a0, t1)
+        %car(a0, a0)            ; init expression
+
+        # val = eval(init, env)
+        %ldl(a1, env)
+        %call(&eval)
+
+        # binding pair = cons(var, val); var = car(car(walk)).
+        %ldl(t0, walk)
+        %car(t1, t0)
+        %car(t2, t1)            ; var
+        %mov(a1, a0)
+        %mov(a0, t2)
+        %call(&cons)            ; a0 = binding pair
+
+        # new_env = cons(pair, new_env). cons clobbers t0/t1/t2 so we don't
+        # spill pair into a t-reg; recover it as car(new_env) afterwards.
+        %ldl(a1, new_env)
+        %call(&cons)
+        %stl(a0, new_env)
+
+        # pcell = cons(pair, NIL). pair = car(new_env), and a0 still holds
+        # the new_env list pointer from the cons above.
+        %car(a0, a0)
+        %li(a1, %imm_val(%IMM.NIL))
+        %call(&cons)
+
+        %ldl(t0, pairs_head)
+        %if_nil(t1, t0, &.pairs_first)
+        %ldl(t0, pairs_tail)
+        %set_cdr(a0, t0)
+        %stl(a0, pairs_tail)
+        %b(&.vals_alloc)
+
+        :.pairs_first
+        %stl(a0, pairs_head)
+        %stl(a0, pairs_tail)
+
+        :.vals_alloc
+        # vcell = cons(NIL, NIL). Append onto vals list.
+        %li(a0, %imm_val(%IMM.NIL))
+        %li(a1, %imm_val(%IMM.NIL))
+        %call(&cons)
+
+        %ldl(t0, vals_head)
+        %if_nil(t1, t0, &.vals_first)
+        %ldl(t0, vals_tail)
+        %set_cdr(a0, t0)
+        %stl(a0, vals_tail)
+        %b(&.init_advance)
+
+        :.vals_first
+        %stl(a0, vals_head)
+        %stl(a0, vals_tail)
+
+        :.init_advance
+        %advance_walk(walk)
+        %b(&.init_loop)
+    :.init_done
+
+    # body = cddr(rest).
+    %ldl(t0, rest)
+    %cdr(t0, t0)
+    %cdr(t0, t0)
+    %stl(t0, body)
+
+    :.iter_loop
+    # test = car(car(cdr(rest))). Eval in new_env.
+    %ldl(t0, rest)
+    %cdr(t0, t0)
+    %car(t0, t0)            ; (test result?...)
+    %car(a0, t0)            ; test
+    %ldl(a1, new_env)
+    %call(&eval)
+
+    %bieq(a0, %imm_val(%IMM.FALSE), &.commands, t0)
+
+    # Truthy: results = cdr(car(cdr(rest))).
+    %ldl(t0, rest)
+    %cdr(t0, t0)
+    %car(t0, t0)
+    %cdr(t0, t0)            ; results
+    %if_nil(t1, t0, &.no_results)
+    %mov(a0, t0)
+    %ldl(a1, new_env)
+    %tail(&eval_body)
+
+    :.no_results
+    %li(a0, %imm_val(%IMM.UNSPEC))
+    %eret
+
+    :.commands
+    %ldl(t0, body)
+    %stl(t0, walk)
+
+    :.cmd_loop
+    %ldl(t0, walk)
+    %if_nil(t1, t0, &.step_phase)
+    %car(a0, t0)
+    %ldl(a1, new_env)
+    %call(&eval)
+    %advance_walk(walk)
+    %b(&.cmd_loop)
+
+    :.step_phase
+    # Compute new step values. walk = specs, pair_walk = pairs_head,
+    # val_walk = vals_head. For each spec: if spec has step (cddr non-NIL),
+    # val = eval(step, new_env); else val = cdr(binding_pair) (current).
+    # Store val into car(val_walk).
+    %ldl(t0, rest)
+    %car(t0, t0)
+    %stl(t0, walk)
+    %ldl(t0, pairs_head)
+    %stl(t0, pair_walk)
+    %ldl(t0, vals_head)
+    %stl(t0, val_walk)
+
+    :.step_loop
+    %ldl(t0, walk)
+    %if_nil(t1, t0, &.update_phase)
+
+    %car(t1, t0)            ; spec
+    %cdr(t2, t1)
+    %cdr(t2, t2)            ; (step?) or NIL
+    %if_nil(t1, t2, &.no_step)
+
+    %car(a0, t2)            ; step
+    %ldl(a1, new_env)
+    %call(&eval)
+    %b(&.store_val)
+
+    :.no_step
+    %ldl(t0, pair_walk)
+    %car(t0, t0)            ; binding pair
+    %cdr(a0, t0)            ; current val
+
+    :.store_val
+    %ldl(t0, val_walk)
+    %set_car(a0, t0)
+
+    %advance_walk(walk)
+    %advance_walk(pair_walk)
+    %advance_walk(val_walk)
+    %b(&.step_loop)
+
+    :.update_phase
+    # Walk pairs_head and vals_head; set-cdr!(pair, val) for each.
+    %ldl(t0, pairs_head)
+    %stl(t0, pair_walk)
+    %ldl(t0, vals_head)
+    %stl(t0, val_walk)
+
+    :.update_loop
+    %ldl(t0, pair_walk)
+    %if_nil(t1, t0, &.iter_loop)
+    %car(t1, t0)            ; binding pair
+    %ldl(t0, val_walk)
+    %car(t2, t0)            ; new val
+    %set_cdr(t2, t1)
+    %advance_walk(pair_walk)
+    %advance_walk(val_walk)
+    %b(&.update_loop)
+})
+
+# pmatch_match(pat=a0, subj=a1, env=a2) -> (env=a0, ok=a1)
+#
+# Walks pat and subj structurally. On success returns the (possibly
+# extended) env in a0 and 1 in a1; on failure returns 0 in a1 (a0 is
+# undefined and callers must not use it). Pattern shapes:
+#
+#   - pair (car eq? sym_unquote): binder `,ident` or wildcard `,_`. The
+#     pattern must be exactly (unquote <sym>) — any other shape dies
+#     with msg_bad_unquote_pattern (the only carve-out from the spec's
+#     primitive-failure UB policy, since pattern shape is a syntax
+#     error in the user's source).
+#   - pair (car eq? sym_dollar): record pattern `($ pred (f1 p1) ...)`.
+#     Looks up `pred` in the current env; expects a record predicate
+#     PRIM (the one bound by define-record-type). The TD pulled from
+#     PRIM.data drives the type check on subj and the field-name -> idx
+#     lookup. Each clause matches recursively. Listed fields only;
+#     missing fields are unconstrained. Malformed pattern shape, an
+#     unknown field name, a non-record subject, or a TD mismatch fall
+#     through as ::no.
+#   - pair (otherwise): subj must be a pair; recurse on car, then cdr.
+#   - atomic (fixnum, sym, immediate, identical heap pointer): raw
+#     word equality.
+#   - HEAP-tagged HDR.BV: structural byte-for-byte equality via
+#     bv_equal_check; only when both pat and subj are HDR.BV.
+#
+# Locals:
+#   pat
+#   subj
+#   env
+#   td   (record-pattern: TD pulled from the predicate PRIM)
+#   flw  (record-pattern: cursor over remaining (fname pat) clauses)
+%fn2(pmatch_match, {pat subj env td flw}, {
+    %stl(a0, pat)
+    %stl(a1, subj)
+    %stl(a2, env)
+
+    %tagof(t0, a0)
+    %li(t1, %TAG.PAIR)
+    %beq(t0, t1, &.pair_pat)
+
+    # Atomic pattern. Identity covers fixnum / symbol / immediate / same
+    # heap pointer.
+    %beq(a0, a1, &.ok)
+
+    # HDR.BV equality.
+    %bine(t0, %TAG.HEAP, &.no, t1)
+    %hdr_type(t1, a0)
+    %bine(t1, %HDR.BV,   &.no, t2)
+    %tagof(t1, a1)
+    %bine(t1, %TAG.HEAP, &.no, t2)
+    %hdr_type(t1, a1)
+    %bine(t1, %HDR.BV,   &.no, t2)
+    %call(&bv_equal_check)
+    %bieq(a0, %imm_val(%IMM.TRUE), &.ok, t0)
+    %b(&.no)
+
+    :.pair_pat
+    %car(t0, a0)                   ; phead
+    %ld_global(t1, &sym_unquote)
+    %beq(t0, t1, &.binder)
+    %ld_global(t1, &sym_dollar)
+    %beq(t0, t1, &.record_pat)
+
+    # Structural pair. subj must be a pair too.
+    %tagof(t0, a1)
+    %bine(t0, %TAG.PAIR, &.no, t1)
+
+    # Recurse on the cars; on success, recurse on the cdrs as a tail call.
+    %ldl(t0, pat)
+    %car(a0, t0)
+    %ldl(t0, subj)
+    %car(a1, t0)
+    %ldl(a2, env)
+    %call(&pmatch_match)
+    %beqz(a1, &.no)
+
+    %mov(a2, a0)                  ; env_after_car
+    %ldl(t0, pat)
+    %cdr(a0, t0)
+    %ldl(t0, subj)
+    %cdr(a1, t0)
+    %tail(&pmatch_match)
+
+    :.binder
+    # Validate (unquote <sym>): cdr(pat) is a pair, cdr(cdr(pat)) is NIL,
+    # car(cdr(pat)) is a symbol.
+    %ldl(t0, pat)
+    %cdr(t1, t0)                  ; cdr(pat)
+    %tagof(t0, t1)
+    %bine(t0, %TAG.PAIR,           &.bad, t2)
+    %cdr(t0, t1)                  ; cdr(cdr(pat))
+    %bine(t0, %imm_val(%IMM.NIL), &.bad, t2)
+    %car(t0, t1)                  ; pident (kept in t0)
+    %tagof(t2, t0)
+    %bine(t2, %TAG.SYM,           &.bad, a3)
+
+    # Wildcard? Compare against sym_underscore; if so, no binding.
+    %ld_global(t1, &sym_underscore)
+    %beq(t0, t1, &.ok)
+
+    # Bind: env' = cons(cons(pident, subj), env). pident lives in t0;
+    # cons clobbers t0..t2, so move it into a0 right away.
+    %mov(a0, t0)
+    %ldl(a1, subj)
+    %call(&cons)
+    %ldl(a1, env)
+    %call(&cons)
+    %li(a1, 1)
+    %eret
+
+    :.record_pat
+    # pat = ($ pred-sym (f1 p1) (f2 p2) ...). Resolve pred-sym -> PRIM via
+    # eval, pull TD from PRIM.data, type-check subj, then iterate the
+    # (fname pat_i) clauses. Clobbers `pat` local once we begin the loop:
+    # we stash each pat_i there before recursing so the recursion has the
+    # right argument and the local stays usable as scratch.
+    %ldl(t0, pat)
+    %cdr(t1, t0)                  ; (pred-sym . clauses)
+    %tagof(t0, t1)
+    %bine(t0, %TAG.PAIR, &.no, t2)
+    %car(t0, t1)                  ; t0 = pred-sym
+    %tagof(t2, t0)
+    %bine(t2, %TAG.SYM,  &.no, a3)
+    %cdr(t2, t1)                  ; t2 = clauses
+    %stl(t2, flw)
+
+    # eval(pred-sym, env) -> a0 = pred PRIM (or dies "unbound").
+    %mov(a0, t0)
+    %ldl(a1, env)
+    %call(&eval)
+
+    # Verify HEAP / HDR.PRIM, entry == &prim_predicate_entry; extract TD
+    # from PRIM.data; sanity-check TD is HEAP / HDR.TD.
+    %tagof(t0, a0)
+    %bine(t0, %TAG.HEAP, &.no, t1)
+    %hdr_type(t0, a0)
+    %bine(t0, %HDR.PRIM, &.no, t1)
+    %heap_ld(t1, a0, %PRIM.entry_w)
+    %la(t2, &prim_predicate_entry)
+    %bne(t1, t2, &.no)
+    %heap_ld(t1, a0, %PRIM.data)  ; t1 = TD
+    %tagof(t0, t1)
+    %li(t2, %TAG.HEAP)
+    %bne(t0, t2, &.no)
+    %hdr_type(t0, t1)
+    %li(t2, %HDR.TD)
+    %bne(t0, t2, &.no)
+    %stl(t1, td)
+
+    # Verify subj is HDR.REC with REC.td == TD.
+    %ldl(a0, subj)
+    %tagof(t0, a0)
+    %li(t1, %TAG.HEAP)
+    %bne(t0, t1, &.no)
+    %hdr_type(t0, a0)
+    %li(t1, %HDR.REC)
+    %bne(t0, t1, &.no)
+    %heap_ld(t0, a0, %REC.td)
+    %ldl(t1, td)
+    %bne(t0, t1, &.no)
+
+    :.record_field_loop
+    # flw points at remaining (fname pat_i) clauses; NIL ends the loop.
+    %ldl(t0, flw)
+    %if_nil(t1, t0, &.ok)
+    %car(t1, t0)                  ; t1 = clause
+    %tagof(t0, t1)
+    %bine(t0, %TAG.PAIR, &.no, t2)
+    %car(t2, t1)                  ; t2 = fname
+    %cdr(t1, t1)                  ; t1 = (pat_i)
+    %tagof(t0, t1)
+    %bine(t0, %TAG.PAIR, &.no, a3)
+    %car(a3, t1)                  ; a3 = pat_i
+    %stl(a3, pat)                 ; reuse `pat` local for pat_i across recursion
+
+    # Linear scan of TD.fields for fname; idx accumulated in t1. t2 holds
+    # fname (still live); a3 is scratch (since we no longer need pat_i in
+    # a register — it's in the local).
+    %ldl(t0, td)
+    %heap_ld(t0, t0, %TD.fields)
+    %li(t1, 0)
+    :.record_field_idx_loop
+    %if_nil(a3, t0, &.no)
+    %car(a3, t0)
+    %beq(a3, t2, &.record_field_found)
+    %cdr(t0, t0)
+    %addi(t1, t1, 1)
+    %b(&.record_field_idx_loop)
+
+    :.record_field_found
+    # val = ld(subj_tagged + (idx<<3) + 13). Same offset arithmetic as
+    # prim_accessor_entry. Compute the address into a1 directly so the
+    # recursive call's val arg is in place.
+    %ldl(a1, subj)
+    %shli(t1, t1, 3)
+    %add(a1, a1, t1)
+    %ld(a1, a1, 13)
+
+    # Recurse: pmatch_match(pat_i, val, env). pat_i is in `pat` local.
+    %ldl(a0, pat)
+    %ldl(a2, env)
+    %call(&pmatch_match)
+    %beqz(a1, &.no)
+    %stl(a0, env)
+
+    %ldl(t0, flw)
+    %cdr(t0, t0)
+    %stl(t0, flw)
+    %b(&.record_field_loop)
+
+    :.ok
+    %ldl(a0, env)
+    %li(a1, 1)
+    %eret
+
+    :.no
+    %li(a1, 0)
+    %eret
+
+    :.bad
+    %die(msg_bad_unquote_pattern)
+})
+
+# eval_let_named(rest=a0, env=a1) -> value (a0).
+# rest = (name bindings . body). Builds a closure whose captured env
+# contains a self-binding that resolves `name` to the closure itself
+# (set after the closure is allocated, via set-cdr! on the placeholder
+# pair). Inits are evaluated in the *original* env (matches let
+# semantics), then we apply the closure.
+#
+# Locals:
+#   rest
+#   env_orig
+#   self_binding  (the (name . UNSPEC) placeholder, patched at the end)
+#   self_env  (cons(self_binding, env_orig))
+#   walk  (advances; reset between passes)
+#   head  (current pass's list head — params, then args)
+#   tail  (current pass's list tail)
+#   params  (saved between passes)
+%fn2(eval_let_named, {rest env_orig self_binding self_env walk head tail params}, {
+    %stl(a0, rest)
+    %stl(a1, env_orig)
+
+    # 1. self_binding = (name . UNSPEC); self_env = cons(self_binding, env)
+    %car(t0, a0)
+    %mov(a0, t0)
+    %li(a1, %imm_val(%IMM.UNSPEC))
+    %call(&cons)
+    %stl(a0, self_binding)
+    %ldl(a1, env_orig)
+    %call(&cons)
+    %stl(a0, self_env)
+
+    # 2. Pass 1: build params list (cdr-tail trick) by walking bindings.
+    %li(t0, %imm_val(%IMM.NIL))
+    %stl(t0, head)
+    %stl(t0, tail)
+    %ldl(t0, rest)
+    %cdr(t0, t0)
+    %car(t0, t0)            ; bindings
+    %stl(t0, walk)
+
+    :.p1_loop
+    %ldl(t0, walk)
+    %if_nil(t1, t0, &.p1_done)
+
+    %car(t1, t0)
+    %car(t2, t1)            ; name
+    %mov(a0, t2)
+    %li(a1, %imm_val(%IMM.NIL))
+    %call(&cons)            ; cell = (name . NIL)
+
+    %ldl(t0, head)
+    %if_nil(t1, t0, &.p1_first)
+    %ldl(t0, tail)
+    %set_cdr(a0, t0)
+    %stl(a0, tail)
+    %b(&.p1_advance)
+
+    :.p1_first
+    %stl(a0, head)
+    %stl(a0, tail)
+
+    :.p1_advance
+    %advance_walk(walk)
+    %b(&.p1_loop)
+
+    :.p1_done
+    %ldl(t0, head)
+    %stl(t0, params)         ; save params
+
+    # 3. Pass 2: build args list (eval inits in env_orig).
+    %li(t0, %imm_val(%IMM.NIL))
+    %stl(t0, head)
+    %stl(t0, tail)
+    %ldl(t0, rest)
+    %cdr(t0, t0)
+    %car(t0, t0)
+    %stl(t0, walk)
+
+    :.p2_loop
+    %ldl(t0, walk)
+    %if_nil(t1, t0, &.p2_done)
+
+    %car(t1, t0)
+    %cdr(t2, t1)
+    %car(t2, t2)            ; init
+    %mov(a0, t2)
+    %ldl(a1, env_orig)
+    %call(&eval)            ; val
+
+    %li(a1, %imm_val(%IMM.NIL))
+    %call(&cons)            ; cell = (val . NIL)
+
+    %ldl(t0, head)
+    %if_nil(t1, t0, &.p2_first)
+    %ldl(t0, tail)
+    %set_cdr(a0, t0)
+    %stl(a0, tail)
+    %b(&.p2_advance)
+
+    :.p2_first
+    %stl(a0, head)
+    %stl(a0, tail)
+
+    :.p2_advance
+    %advance_walk(walk)
+    %b(&.p2_loop)
+
+    :.p2_done
+    # 4. Closure: eval_lambda((params . body), self_env).
+    %ldl(a0, params)         ; params
+    %ldl(t0, rest)
+    %cdr(t0, t0)
+    %cdr(a1, t0)            ; body
+    %call(&cons)
+    %ldl(a1, self_env)
+    %call(&eval_lambda)
+
+    # 5. Patch self_binding cdr to closure.
+    %ldl(t0, self_binding)
+    %set_cdr(a0, t0)
+
+    # 6. apply(closure, args).
+    %ldl(a1, head)
+    %tail(&apply)
+})
+
+# bind_params(params=a0, args=a1, env=a2) -> extended env (a0).
+# Walks params and args in lockstep, prepending (param . arg) to env.
+# Variadic `.`-tail: when params terminates with a SYM (rather than NIL),
+# bind it to the remaining args list and stop.
+#
+# Locals:
+#   params  (advanced each iteration)
+#   args  (advanced each iteration)
+#   env  (extended each iteration)
+%fn2(bind_params, {params args env}, {
+    %stl(a0, params)
+    %stl(a1, args)
+    %stl(a2, env)
+
+    :.loop
+        %ldl(t0, params)
+        %tagof(t1, t0)
+        %li(t2, %TAG.PAIR)
+        %beq(t1, t2, &.pair)
+        %li(t2, %TAG.SYM)
+        %beq(t1, t2, &.rest_bind)
+        %b(&.done)
+
+        :.pair
+        # binding = cons(car(params), car(args))
+        %ldl(t0, params)
+        %car(a0, t0)
+        %ldl(t0, args)
+        %car(a1, t0)
+        %call(&cons)
+
+        # env = cons(binding, env)
+        %ldl(a1, env)
+        %call(&cons)
+        %stl(a0, env)
+
+        # advance params and args
+        %advance_walk(params)
+        %advance_walk(args)
+        %b(&.loop)
+
+    :.rest_bind
+    # binding = cons(params_sym, args_list); env = cons(binding, env)
+    %ldl(a0, params)
+    %ldl(a1, args)
+    %call(&cons)
+    %ldl(a1, env)
+    %call(&cons)
+    %stl(a0, env)
+
+    :.done
+    %ldl(a0, env)
+})
+
+# eval_body(body=a0, env=a1) -> value of last form (a0).
+# Evaluates each non-last form for effect; tail-evaluates the last so
+# that closures used in tail position do not grow the host stack.
+#
+# Internal `define` is rejected here (this is the single chokepoint for
+# every body context: closure body via apply, let / letrec / named-let
+# bodies, cond clause bodies, begin's body). Per-form check is one
+# tagof + one symbol compare, regardless of body length.
+#
+# Locals:
+#   body
+#   env
+%fn2(eval_body, {body env}, {
+    :.loop
+    %stl(a0, body)
+    %stl(a1, env)
+
+    # Reject internal `define`. Detect (define ...) at the head of any
+    # form before dispatching to eval; top-level-only.
+    %car(t0, a0)              ; form
+    %tagof(t1, t0)
+    %li(t2, %TAG.PAIR)
+    %bne(t1, t2, &.not_define)
+    %car(t1, t0)              ; head sym
+    %ld_global(t2, &sym_define)
+    %beq(t1, t2, &.internal_define)
+
+    :.not_define
+    # If cdr(body) is NIL, body's car is the last form.
+    %ldl(a0, body)
+    %cdr(t0, a0)
+    %if_nil(t1, t0, &.last)
+
+    # Non-last form: eval and discard, advance.
+    %car(a0, a0)
+    %ldl(a1, env)
+    %call(&eval)
+    %ldl(a0, body)
+    %cdr(a0, a0)
+    %ldl(a1, env)
+    %b(&.loop)
+
+    :.last
+    %ldl(a0, body)
+    %car(a0, a0)
+    %ldl(a1, env)
+    %tail(&eval)
+
+    :.internal_define
+    %die(msg_internal_define)
+})
+
+# =========================================================================
+# Runtime error -- single abort entry point
+# =========================================================================
+#
+# runtime_error(msg_cstr=a0) -> never returns. Every overflow / bounds /
+# unbound / type-failure path lands here so error reporting (and the
+# eventual user-facing `error` primitive) only have to be implemented
+# once. Today we tail into libp1pp's `panic`, which writes msg + LF to
+# stderr and sys_exits 1.
+:runtime_error
+    %tail(&panic)
+
+# =========================================================================
+# Source loading -- argv[1] -> readbuf, length stored in readbuf_len
+# =========================================================================
+
+%fn(load_source, 0, {
+    %ld_global(a1, &readbuf_buf_ptr)
+    %li(a2, %READBUF_CAP_BYTES)
+    %call(&read_file)
+    %bltz(a0, &.fail)
+
+    # If the read filled (or would have filled) the buffer, the source
+    # is at least cap bytes; refuse rather than silently truncate.
+    # read_file does a single sys_read so n == cap is the only saturation
+    # signal we have. We treat n >= cap as overflow defensively.
+    %li(t0, %READBUF_CAP_BYTES)
+    %bltu(a0, t0, &.ok)
+    %die(msg_readbuf_full)
+
+    :.ok
+    %st_global(a0, &readbuf_len, t0)
+    %li(a0, 0)
+    %st_global(a0, &readbuf_pos, t0)
+    %eret
+
+    :.fail
+    %die(msg_load_fail)
+})
+
+# =========================================================================
+# Heap: cons (leaf) and alloc_hdr (leaf)
+# =========================================================================
+#
+# Both are call-free leaves: bump *current_heap_next_ptr, write fields,
+# return tagged pointer. Each allocation tests (new_next <=
+# *current_heap_end_ptr) and aborts via runtime_error if the bump would
+# overflow the current heap. The current heap is selected by
+# (use-scratch-heap!) / (use-main-heap!); both pointer-of-pointer slots
+# default to &heap_next / &heap_end at heap_init. *_next is kept 8-byte
+# aligned so every PAIR/HEAP tag bit is exact: cons always bumps by a
+# multiple of 8 (16); alloc_hdr / alloc_bytes round their argument up
+# via %alignup(_,_,8,_).
+
+# cons(car=a0, cdr=a1) -> tagged pair (a0). Allocates 16 bytes.
+:cons
+.scope
+    %ld_global(t2, &current_heap_next_ptr)
+    %ld(t0, t2, 0)
+    %addi(t1, t0, %PAIR.SIZE)
+    %ld_global(a3, &current_heap_end_ptr)
+    %ld(a3, a3, 0)
+    %bltu(a3, t1, &.oom)
+    %st(a0, t0, %PAIR.car)
+    %st(a1, t0, %PAIR.cdr)
+    %st(t1, t2, 0)
+    %addi(a0, t0, %TAG.PAIR)
+    %ret
+    :.oom
+    %b(&heap_oom_die)
+.endscope
+
+# cons_main(car=a0, cdr=a1) -> tagged pair (a0). Allocates in main
+# regardless of current heap selection. Used for process-global
+# interpreter metadata that is represented as Scheme pairs.
+:cons_main
+.scope
+    %la(t2, &heap_next)
+    %ld(t0, t2, 0)
+    %addi(t1, t0, %PAIR.SIZE)
+    %ld_global(a3, &heap_end)
+    %bltu(a3, t1, &.oom)
+    %st(a0, t0, %PAIR.car)
+    %st(a1, t0, %PAIR.cdr)
+    %st(t1, t2, 0)
+    %addi(a0, t0, %TAG.PAIR)
+    %ret
+    :.oom
+    %die(msg_heap_full)
+.endscope
+
+# alloc_hdr(bytes=a0, hdr_word=a1) -> tagged heap obj (a0)
+# Rounds bytes up to a multiple of 8 and writes hdr_word at offset 0.
+:alloc_hdr
+.scope
+    %alignup(a0, a0, 8, t0)
+    %ld_global(t2, &current_heap_next_ptr)
+    %ld(t0, t2, 0)
+    %add(t1, t0, a0)
+    %ld_global(a3, &current_heap_end_ptr)
+    %ld(a3, a3, 0)
+    %bltu(a3, t1, &.oom)
+    %st(t1, t2, 0)
+    %st(a1, t0, 0)
+    %addi(a0, t0, 3)
+    %ret
+    :.oom
+    %b(&heap_oom_die)
+.endscope
+
+# alloc_hdr_main(bytes=a0, hdr_word=a1) -> tagged heap obj (a0), allocated
+# in main regardless of current heap selection.
+:alloc_hdr_main
+.scope
+    %alignup(a0, a0, 8, t0)
+    %la(t2, &heap_next)
+    %ld(t0, t2, 0)
+    %add(t1, t0, a0)
+    %ld_global(a3, &heap_end)
+    %bltu(a3, t1, &.oom)
+    %st(t1, t2, 0)
+    %st(a1, t0, 0)
+    %addi(a0, t0, 3)
+    %ret
+    :.oom
+    %die(msg_heap_full)
+.endscope
+
+# list_length(list=a0) -> count (a0). Linear walk; clobbers a0 (used as
+# the cursor). Callers that need the list afterward must save it first.
+:list_length
+.scope
+    %li(t0, 0)
+    :.loop
+        %if_nil(t1, a0, &.done)
+        %addi(t0, t0, 1)
+        %cdr(a0, a0)
+        %b(&.loop)
+    :.done
+    %mov(a0, t0)
+    %ret
+.endscope
+
+# =========================================================================
+# Multiple-values protocol
+# =========================================================================
+#
+# An MV-pack is a HEAP-tagged object with header (count << 8) | HDR.MV
+# followed by `count` slot words (raw +8, +16, ...). The R7RS protocol
+# below treats single values and MV-packs uniformly: a 1-value yield is
+# returned as the bare value, while 0 or 2+ values are materialized as
+# an MV-pack. mv_to_list normalizes either form to a list so let-values /
+# call-with-values can reuse the existing destructuring machinery.
+
+# list_to_mv(list=a0) -> tagged MV-pack (a0).
+# Walks `list` to count it, allocates (count+1)*8 bytes with header
+# (count<<8)|HDR.MV, then copies elements into consecutive slots in
+# order. An empty list yields a 0-pack.
+#
+# Locals:
+#   list   (preserved across list_length + alloc_hdr)
+#   count
+#   mv     (tagged MV-pack)
+%fn2(list_to_mv, {list count mv pad}, {
+    %stl(a0, list)
+    %call(&list_length)         ; clobbers a0; returns count
+    %stl(a0, count)
+
+    # alloc_hdr((count+1)*8, (count<<8)|HDR.MV)
+    %addi(a0, a0, 1)
+    %shli(a0, a0, 3)
+    %ldl(t0, count)
+    %shli(t0, t0, 8)
+    %ori(a1, t0, %HDR.MV)
+    %call(&alloc_hdr)
+    %stl(a0, mv)
+
+    # Walk list, store at consecutive slots. The first slot's raw byte
+    # offset from a tagged HEAP pointer is +5 (= raw+8 - 3).
+    %ldl(t0, list)
+    %addi(t1, a0, 5)
+
+    :.loop
+    %if_nil(t2, t0, &.done)
+    %car(t2, t0)
+    %st(t2, t1, 0)
+    %addi(t1, t1, 8)
+    %cdr(t0, t0)
+    %b(&.loop)
+
+    :.done
+    %ldl(a0, mv)
+})
+
+# mv_to_list(val=a0) -> list (a0).
+# If val is HEAP-tagged with HDR.MV, build a fresh list of its slots in
+# order. Any other value is wrapped as a single-element list, so callers
+# can uniformly reuse list-shaped destructuring.
+#
+# Locals:
+#   ptr    (raw cursor into MV slots, walked backward)
+#   count  (remaining slot count)
+%fn2(mv_to_list, {ptr count}, {
+    %tagof(t0, a0)
+    %bine(t0, %TAG.HEAP, &.single, t1)
+    %hdr_type(t0, a0)
+    %bine(t0, %HDR.MV,   &.single, t1)
+
+    # MV-pack: count = (hdr >> 8); header sits at raw+0 = tagged-3.
+    %ld(t0, a0, -3)
+    %shri(t0, t0, 8)
+    %stl(t0, count)
+
+    # Walk slots back-to-front so each cons prepends, yielding original
+    # left-to-right order. Cursor = (tagged+5) + (count-1)*8.
+    %addi(t1, a0, 5)
+    %shli(t2, t0, 3)
+    %add(t1, t1, t2)
+    %addi(t1, t1, -8)
+    %stl(t1, ptr)
+
+    %li(a0, %imm_val(%IMM.NIL))
+
+    :.loop
+    %ldl(t0, count)
+    %beqz(t0, &.done)
+
+    %ldl(t1, ptr)
+    %ld(t2, t1, 0)
+    %mov(a1, a0)
+    %mov(a0, t2)
+    %call(&cons)
+
+    %ldl(t1, ptr)
+    %addi(t1, t1, -8)
+    %stl(t1, ptr)
+    %ldl(t0, count)
+    %addi(t0, t0, -1)
+    %stl(t0, count)
+    %b(&.loop)
+
+    :.done
+    %eret
+
+    :.single
+    # Non-MV: return (val . NIL).
+    %li(a1, %imm_val(%IMM.NIL))
+    %tail(&cons)
+})
+
+# =========================================================================
+# Symbol intern -- linear scan, append on miss
+# =========================================================================
+#
+# Locals:
+#   name_ptr  (input)
+#   name_len  (input)
+#   idx  (loop counter / found index)
+#   entry_ptr  (spilled across memcmp)
+%fn2(intern, {name_ptr name_len idx entry_ptr}, {
+    %stl(a0, name_ptr)
+    %stl(a1, name_len)
+
+    %li(t0, 0)
+    %stl(t0, idx)
+
+    :.scan
+    # idx >= count? -> append
+    %ldl(t0, idx)
+    %ld_global(t1, &symtab_count)
+    %bltu(t0, t1, &.probe)
+    %b(&.append)
+
+    :.probe
+    %symtab_entry(t1, t0, t2)
+    %stl(t1, entry_ptr)
+
+    # entry.name_len == name_len ?
+    %ld(t2, t1, %SYMENT.name_len)
+    %ldl(a2, name_len)
+    %bne(t2, a2, &.next)
+
+    # memcmp(entry.name_ptr, name_ptr, len)
+    %ld(a0, t1, %SYMENT.name_ptr)
+    %ldl(a1, name_ptr)
+    %ldl(a2, name_len)
+    %call(&memcmp)
+    %beqz(a0, &.found)
+
+    :.next
+    %ldl(t0, idx)
+    %addi(t0, t0, 1)
+    %stl(t0, idx)
+    %b(&.scan)
+
+    :.append
+    # Bounds check; on overflow exit 5 with a message.
+    %ldl(t0, idx)
+    %li(t1, %SYMTAB_CAP_SLOTS)
+    %bltu(t0, t1, &.append_ok)
+    %die(msg_symtab_full)
+
+    :.append_ok
+    # Copy the name into a stable main-heap buffer. The caller-provided
+    # ptr may live in readbuf_buf (parse_atom), and the current heap may
+    # be scratch while user code is being read/evaluated. Symtab names
+    # must outlive both source-buffer reuse and scratch resets.
+    %ldl(a0, name_len)
+    %call(&alloc_bytes_main)
+    %ldl(a1, name_ptr)
+    %ldl(a2, name_len)
+    %call(&memcpy)              ; returns dst in a0 = stable copy
+
+    %ldl(t0, idx)
+    %symtab_entry(t1, t0, t2)
+    %st(a0, t1, %SYMENT.name_ptr)   ; stable copy
+    %ldl(a0, name_len)
+    %st(a0, t1, %SYMENT.name_len)
+    %li(a0, %imm_val(%IMM.UNBOUND))
+    %st(a0, t1, %SYMENT.global_val)
+    %li(a0, 0)
+    %st(a0, t1, %SYMENT.pad)
+
+    # symtab_count = idx + 1
+    %addi(a0, t0, 1)
+    %st_global(a0, &symtab_count, t2)
+
+    # fall through with idx in t0 = sp[16]
+
+    :.found
+    %ldl(t0, idx)
+    %shli(a0, t0, 3)
+    %ori(a0, a0, %TAG.SYM)
+})
+
+# Lookup by sym_idx (untagged, in a0). Returns symtab[idx].global_val in a0.
+# Leaf.
+:sym_global
+    %ld_global(t0, &symtab_buf_ptr)
+    %ld_array(a0, t0, %SYMENT.SIZE, a0, %SYMENT.global_val, t1)
+    %ret
+
+# sym_set_global(idx=a0, val=a1). Leaf.
+:sym_set_global
+    %ld_global(t0, &symtab_buf_ptr)
+    %st_array(a1, t0, %SYMENT.SIZE, a0, %SYMENT.global_val, t1)
+    %ret
+
+# =========================================================================
+# Primitives
+# =========================================================================
+#
+# PRIM objects live on the heap so the bump allocator's 8-byte alignment
+# is what makes (heap_ptr & 7 == 0) hold; that's what lets `+3` encode
+# the HEAP tag cleanly. (A static :prim_sys_exit emitted in the data
+# section was at the mercy of preceding code length and could land at
+# any 4-byte alignment, producing tag bits 5 or 7 instead of 3.)
+#
+# register_primitives walks prim_table at startup. Each table entry is
+# 24 bytes: 8-byte name_ptr (4-byte label ref + 4 pad), 8-byte name_len,
+# 8-byte entry_label (4 ref + 4 pad). For each entry we alloc a 16-byte
+# PRIM, write the entry-label into the prim header's entry slot, intern
+# the surface name, and bind the symbol's global slot to the HEAP-tagged
+# prim pointer.
+#
+# Locals:
+#   prim  ptr (HEAP-tagged; spilled across intern + sym_set_global)
+#   walk  (current table cursor)
+#   end  (table_end)
+%fn2(register_primitives, {prim walk end}, {
+    %la(t0, &prim_table)
+    %stl(t0, walk)
+    %la(t0, &prim_table_end)
+    %stl(t0, end)
+
+    :.loop
+    %ldl(t0, walk)
+    %ldl(t1, end)
+    %beq(t0, t1, &.done)
+
+    # alloc_hdr(24, HDR.PRIM) -> HEAP-tagged a0. The third slot (offset 13
+    # from tagged) holds per-instance data and stays zero for the
+    # primitives registered here -- only parameterized prims (record
+    # ctor/predicate/accessor/mutator) read it.
+    %li(a0, 24)
+    %li(a1, %HDR.PRIM)
+    %call(&alloc_hdr)
+    %stl(a0, prim)
+
+    # Write entry-label into prim's entry slot.
+    %ldl(t0, walk)
+    %ld(t1, t0, 16)
+    %ldl(t2, prim)
+    %heap_st(t1, t2, %PRIM.entry_w)
+
+    # Intern surface name; bind global to prim ptr.
+    %ldl(t0, walk)
+    %ld(a0, t0, 0)
+    %ld(a1, t0, 8)
+    %call(&intern)
+    %untag_sym(a0, a0)
+    %ldl(a1, prim)
+    %call(&sym_set_global)
+
+    %ldl(t0, walk)
+    %addi(t0, t0, 24)
+    %stl(t0, walk)
+    %b(&.loop)
+
+    :.done
+})
+
+%fn(register_globals, 0, {
+    # Bind `eof` as a direct global -> IMM.EOF value. (Predicate is `eof?`,
+    # registered via prim_table.) Cheaper and shorter than a 0-arg thunk.
+    %la(a0, &name_eof)
+    %li(a1, 3)
+    %call(&intern)
+    %untag_sym(a0, a0)
+    %li(a1, %imm_val(%IMM.EOF))
+    %call(&sym_set_global)
+})
+
+# Each primitive is a leaf reached via apply's %tailr: args list is in a0,
+# and the result goes back in a0. Most use no frame at all; the few that
+# need recursion (apply) carry a small one via %fn.
+#
+# Arithmetic / compare / bitwise primitives on tagged fixnums take
+# advantage of the (n << 3) representation: + / - / signed compare /
+# bit-and / bit-or / bit-xor all work directly on the tagged words, so
+# the variadic fold loop preserves the tag at every step. Only * has to
+# untag each incoming operand to avoid a stray <<6.
+
+# (sys-exit code) -- libp1pp's sys_exit doesn't return; %b, not %call.
+:prim_sys_exit_entry
+    %car(a0, a0)
+    %untag_fix(a0, a0)
+    %b(&sys_exit)
+
+# (cons a b) -> tagged pair.
+:prim_cons_entry
+    %car(t0, a0)
+    %cdr(t1, a0)
+    %car(t1, t1)
+    %mov(a0, t0)
+    %mov(a1, t1)
+    %b(&cons)
+
+# (car p), (cdr p)
+:prim_car_entry
+    %car(a0, a0)
+    %car(a0, a0)
+    %ret
+
+:prim_cdr_entry
+    %car(a0, a0)
+    %cdr(a0, a0)
+    %ret
+
+# Predicate primitives. Same shape: extract the arg, compare, return one
+# of the two boolean immediates.
+
+:prim_nullq_entry
+.scope
+    %car(t0, a0)
+    %li(a0, %imm_val(%IMM.TRUE))
+    %if_nil(t1, t0, &.end)
+    %li(a0, %imm_val(%IMM.FALSE))
+    :.end
+    %ret
+.endscope
+
+:prim_pairq_entry
+.scope
+    %car(t0, a0)
+    %tagof(t1, t0)
+    %li(t2, %TAG.PAIR)
+    %li(a0, %imm_val(%IMM.FALSE))
+    %bne(t1, t2, &.end)
+    %li(a0, %imm_val(%IMM.TRUE))
+    :.end
+    %ret
+.endscope
+
+# (string? x) -- #t iff x is a HEAP-tagged HDR.BV. Bytevectors back the
+# string type until characters get a distinct repr; this prim is also
+# the bytevector? predicate.
+:prim_stringq_entry
+.scope
+    %car(t0, a0)
+    %li(a0, %imm_val(%IMM.FALSE))
+    %tagof(t1, t0)
+    %li(t2, %TAG.HEAP)
+    %bne(t1, t2, &.end)
+    %hdr_type(t1, t0)
+    %li(t2, %HDR.BV)
+    %bne(t1, t2, &.end)
+    %li(a0, %imm_val(%IMM.TRUE))
+    :.end
+    %ret
+.endscope
+
+# (set-car! pair val) / (set-cdr! pair val) -- in-place pair mutation.
+# No type check (matches car/cdr's lax stance); both return UNSPEC.
+:prim_set_car_entry
+    %args2(t0, t1, a0)
+    %set_car(t1, t0)
+    %li(a0, %imm_val(%IMM.UNSPEC))
+    %ret
+
+:prim_set_cdr_entry
+    %args2(t0, t1, a0)
+    %set_cdr(t1, t0)
+    %li(a0, %imm_val(%IMM.UNSPEC))
+    %ret
+
+# (length xs) -- count of pairs in a proper list. Forwards to the
+# list_length helper (which clobbers a0 as the cursor) and tags the
+# resulting count as a fixnum. Needs a frame because %call(&list_length)
+# would otherwise clobber lr and the trailing %ret would loop.
+%fn(prim_length_entry, 0, {
+    %car(a0, a0)
+    %call(&list_length)
+    %mkfix(a0, a0)
+    %eret
+})
+
+# (list-ref xs n) -- 0-indexed nth element. n is a fixnum; we untag,
+# advance via cdr, then car. Out-of-range is undefined behavior, same
+# as car/cdr on '().
+:prim_list_ref_entry
+.scope
+    %args2(t0, t1, a0)
+    %sari(t1, t1, 3)
+    :.loop
+    %beqz(t1, &.done)
+    %cdr(t0, t0)
+    %addi(t1, t1, -1)
+    %b(&.loop)
+    :.done
+    %car(a0, t0)
+    %ret
+.endscope
+
+# (assq key alist) -> matching pair or #f. Walks alist, comparing
+# car of each pair to key by identity (eq?); first match wins. Pure
+# leaf -- no allocation, no calls. Replaces the interpreted prelude
+# define so file-scope alist lookups (e.g. cc.scm scope-bind!'s
+# redecl check) don't pay bind_params env-cons cost per step.
+:prim_assq_entry
+.scope
+    %args2(t0, t1, a0)         ; t0=key, t1=alist
+    :.loop
+    %if_nil(t2, t1, &.miss)
+    %car(t2, t1)               ; pair = (car alist)
+    %car(a0, t2)               ; (car pair)
+    %beq(a0, t0, &.hit)
+    %cdr(t1, t1)
+    %b(&.loop)
+    :.hit
+    %mov(a0, t2)
+    %ret
+    :.miss
+    %li(a0, %imm_val(%IMM.FALSE))
+    %ret
+.endscope
+
+# (assoc key alist) -> matching pair or #f. Same shape as assq but
+# the key compare goes through equal_recurse, which means we need a
+# frame to preserve the key/cursor/current-pair across the call.
+#
+# Locals:
+#   key
+#   cursor
+#   pair  (saved across equal_recurse so we can return it on hit)
+%fn2(prim_assoc_entry, {key cursor pair}, {
+    %args2(t0, t1, a0)
+    %stl(t0, key)
+    %stl(t1, cursor)
+
+    :.loop
+    %ldl(t1, cursor)
+    %if_nil(t2, t1, &.miss)
+    %car(t2, t1)               ; pair = (car cursor)
+    %stl(t2, pair)
+    %car(a0, t2)               ; (car pair)
+    %ldl(a1, key)
+    %call(&equal_recurse)
+    %bieq(a0, %imm_val(%IMM.FALSE), &.next, t0)
+    %ldl(a0, pair)
+    %eret
+
+    :.next
+    %ldl(t1, cursor)
+    %cdr(t1, t1)
+    %stl(t1, cursor)
+    %b(&.loop)
+
+    :.miss
+    %li(a0, %imm_val(%IMM.FALSE))
+})
+
+# (reverse list) -> fresh reversed list. Walks the input forward,
+# consing each element onto an accumulator; result is the accumulator.
+# One fresh PAIR per input element, no intermediates. Frame needed
+# because cons is a leaf and %call clobbers lr.
+#
+# Locals:
+#   xs   (cursor; advanced each iteration)
+#   acc
+%fn2(prim_reverse_entry, {xs acc}, {
+    %car(t0, a0)               ; t0 = list arg
+    %stl(t0, xs)
+    %li(t0, %imm_val(%IMM.NIL))
+    %stl(t0, acc)
+
+    :.loop
+    %ldl(t0, xs)
+    %if_nil(t1, t0, &.done)
+    %car(a0, t0)
+    %ldl(a1, acc)
+    %call(&cons)
+    %stl(a0, acc)
+    %ldl(t0, xs)
+    %cdr(t0, t0)
+    %stl(t0, xs)
+    %b(&.loop)
+
+    :.done
+    %ldl(a0, acc)
+})
+
+# (bytevector-append bv ...) -- variadic concatenation. Two passes:
+# the first sums the bv lengths so we can size the result up front; the
+# second walks the args again and memcpy's each src into the result.
+# The args list head is saved at +0 because pass 1 walks a separate
+# cursor (t1) and pass 2 needs to re-read the head. memcpy clobbers
+# t-regs, so the running write offset and remaining-args cursor live
+# in the frame across each call.
+#
+# Locals:
+#   args  list head (re-read for pass 2; cursor during pass 2)
+#   total  length (raw)
+#   result  bv
+#   write  offset (raw, into result.data)
+%fn2(prim_bv_append_entry, {args total result write}, {
+    %stl(a0, args)
+
+    %li(t0, 0)
+    %mov(t1, a0)
+    :.sum_loop
+        %if_nil(t2, t1, &.sum_done)
+        %car(t2, t1)
+        %heap_ld(a0, t2, %BV.hdr)
+        %shri(a0, a0, 8)
+        %add(t0, t0, a0)
+        %cdr(t1, t1)
+        %b(&.sum_loop)
+    :.sum_done
+    %stl(t0, total)
+
+    %mov(a0, t0)
+    %call(&bv_alloc)
+    %stl(a0, result)
+
+    %li(t0, 0)
+    %stl(t0, write)
+
+    :.copy_loop
+        %ldl(t0, args)
+        %if_nil(t1, t0, &.copy_done)
+        %car(t1, t0)                ; src bv
+        %heap_ld(t2, t1, %BV.hdr)
+        %shri(t2, t2, 8)            ; src length
+
+        %ldl(a0, result)
+        %heap_ld(a0, a0, %BV.data)  ; result.data
+        %ldl(a3, write)
+        %add(a0, a0, a3)            ; dst = result.data + offset
+        %heap_ld(a1, t1, %BV.data)  ; src.data
+        %mov(a2, t2)                ; count
+
+        %add(a3, a3, t2)
+        %stl(a3, write)
+        %cdr(t0, t0)
+        %stl(t0, args)
+
+        %call(&memcpy)
+        %b(&.copy_loop)
+    :.copy_done
+
+    %ldl(a0, result)
+})
+
+# (string->symbol bv) -- intern the bytes and return the SYM-tagged
+# value. intern copies the name into stable heap storage if it has to
+# append, so the bv's data buffer is safe to relocate afterwards.
+:prim_string_to_symbol_entry
+    %car(t0, a0)
+    %heap_ld(a0, t0, %BV.data)
+    %heap_ld(a1, t0, %BV.hdr)
+    %shri(a1, a1, 8)            ; length
+    %b(&intern)
+
+# (symbol->string sym) -- fresh bv copy of the symtab name. sym_name
+# returns (ptr, len); str_alloc gives us a NUL-terminated wrapper;
+# memcpy fills the data. Frame holds the (ptr, len) pair across
+# str_alloc and the resulting bv across memcpy.
+
+%fn2(prim_symbol_to_string_entry, {ptr len bv}, {
+    %car(a0, a0)
+    %sari(a0, a0, 3)            ; raw sym idx
+    %call(&sym_name)            ; -> ptr (a0), len (a1)
+    %stl(a0, ptr)
+    %stl(a1, len)
+    %mov(a0, a1)
+    %call(&str_alloc)           ; tagged bv in a0
+    %stl(a0, bv)
+    %ldl(a1, ptr)              ; src ptr
+    %ldl(a2, len)              ; len
+    %heap_ld(t0, a0, %BV.data)  ; dst = bv.data
+    %mov(a0, t0)
+    %call(&memcpy)
+    %ldl(a0, bv)
+})
+
+# (number->string n [radix]) -- fresh bv with the integer's text form.
+# Radix 16 selects str_puthex (lowercase, leading '-' for negatives);
+# any other radix (or omitted) selects decimal. str_alloc(0) gives an
+# empty NUL-terminated wrapper that the str_put* helper grows in place.
+
+%fn2(prim_number_to_string_entry, {value radix}, {
+    %car(t0, a0)
+    %sari(t0, t0, 3)            ; raw value
+    %stl(t0, value)
+
+    # Default radix = 10. If a second arg is present, untag it.
+    %li(t0, 10)
+    %stl(t0, radix)
+    %cdr(t1, a0)
+    %if_nil(t0, t1, &.have_radix)
+    %car(t0, t1)
+    %sari(t0, t0, 3)
+    %stl(t0, radix)
+    :.have_radix
+
+    %li(a0, 0)
+    %call(&str_alloc)
+    %ldl(a1, value)
+    %ldl(t0, radix)
+    %bieq(t0, 16, &.hex, t1)
+    %tail(&str_putint)
+    :.hex
+    %tail(&str_puthex)
+})
+
+# (string->number bv [radix]) -- decimal goes through parse_dec; radix
+# 16 strips an optional leading '-' and calls parse_hex over the
+# remainder, demanding it consume every byte. Returns #f on
+# non-bytevector input, empty string, lone "-", or any non-recognized
+# byte. Other radices are not pinned by LISP.md and currently fall
+# through to the decimal path.
+%fn2(prim_string_to_number_entry, {args ptr len sign}, {
+    %stl(a0, args)
+
+    %car(t2, a0)
+    %tagof(t0, t2)
+    %bine(t0, %TAG.HEAP, &.fail, t1)
+    %hdr_type(t0, t2)
+    %bine(t0, %HDR.BV,   &.fail, t1)
+
+    %heap_ld(t0, t2, %BV.data)
+    %heap_ld(t1, t2, %BV.hdr)
+    %shri(t1, t1, 8)            ; length
+    %stl(t0, ptr)
+    %stl(t1, len)
+
+    # Inspect the optional radix arg.
+    %ldl(t0, args)
+    %cdr(t0, t0)
+    %if_nil(t1, t0, &.dec)
+    %car(t1, t0)
+    %sari(t1, t1, 3)
+    %bieq(t1, 16, &.hex, t2)
+
+    :.dec
+    %ldl(a0, ptr)
+    %ldl(a1, len)
+    %beqz(a1, &.fail)
+    %lb(t0, a0, 0)
+    %bcne(t0, -43, &.dec_no_plus, t0)    ; '+'
+    %addi(a0, a0, 1)
+    %addi(a1, a1, -1)
+    %beqz(a1, &.fail)
+    :.dec_no_plus
+    %stl(a1, len)               ; save adjusted len
+    %call(&parse_dec)           ; P1pp: -> (raw_val=a0, consumed=a1)
+    %ldl(t0, len)
+    %bne(a1, t0, &.fail)       ; partial parse -> fail
+    %mkfix(a0, a0)
+    %b(&.end)
+
+    :.hex
+    # Strip optional leading '+' / '-'.
+    %li(t0, 0)
+    %stl(t0, sign)
+    %ldl(t0, len)
+    %beqz(t0, &.fail)
+    %ldl(t1, ptr)
+    %lb(t2, t1, 0)
+    %addi(t0, t2, -45)          ; '-'
+    %beqz(t0, &.hex_neg)
+    %addi(t0, t2, -43)          ; '+'
+    %beqz(t0, &.hex_skip_sign)
+    %b(&.hex_parse)
+    :.hex_neg
+    %li(t0, 1)
+    %stl(t0, sign)
+    :.hex_skip_sign
+    %ldl(t0, ptr)
+    %addi(t0, t0, 1)
+    %stl(t0, ptr)
+    %ldl(t0, len)
+    %addi(t0, t0, -1)
+    %stl(t0, len)
+    %beqz(t0, &.fail)
+
+    :.hex_parse
+    %ldl(a0, ptr)
+    %ldl(a1, len)
+    %call(&parse_hex)            ; -> (a0=value, a1=consumed)
+    %ldl(t0, len)
+    %bne(a1, t0, &.fail)        ; demand full consumption
+    %ldl(t0, sign)
+    %beqz(t0, &.hex_pos)
+    %li(t1, 0)
+    %sub(a0, t1, a0)
+    :.hex_pos
+    %mkfix(a0, a0)
+    %b(&.end)
+
+    :.fail
+    %li(a0, %imm_val(%IMM.FALSE))
+    :.end
+})
+
+# (boolean? x) -- #t iff x is the IMM.FALSE or IMM.TRUE singleton.
+:prim_booleanq_entry
+.scope
+    %car(t0, a0)
+    %li(a0, %imm_val(%IMM.TRUE))
+    %li(t1, %imm_val(%IMM.FALSE))
+    %beq(t0, t1, &.end)
+    %li(t1, %imm_val(%IMM.TRUE))
+    %beq(t0, t1, &.end)
+    %li(a0, %imm_val(%IMM.FALSE))
+    :.end
+    %ret
+.endscope
+
+# (integer? x) -- #t iff x is a fixnum (low 3 tag bits == TAG.FIXNUM == 0).
+:prim_integerq_entry
+.scope
+    %car(t0, a0)
+    %tagof(t1, t0)
+    %li(a0, %imm_val(%IMM.FALSE))
+    %bnez(t1, &.end)
+    %li(a0, %imm_val(%IMM.TRUE))
+    :.end
+    %ret
+.endscope
+
+# (symbol? x) -- #t iff x is TAG.SYM (interned symbol index, not a heap obj).
+:prim_symbolq_entry
+.scope
+    %car(t0, a0)
+    %tagof(t1, t0)
+    %li(t2, %TAG.SYM)
+    %li(a0, %imm_val(%IMM.FALSE))
+    %bne(t1, t2, &.end)
+    %li(a0, %imm_val(%IMM.TRUE))
+    :.end
+    %ret
+.endscope
+
+# (procedure? x) -- #t iff x is HEAP-tagged with header HDR.CLOSURE or HDR.PRIM.
+:prim_procedureq_entry
+.scope
+    %car(t0, a0)
+    %tagof(t1, t0)
+    %li(t2, %TAG.HEAP)
+    %li(a0, %imm_val(%IMM.FALSE))
+    %bne(t1, t2, &.end)
+    %hdr_type(t1, t0)
+    %li(t2, %HDR.CLOSURE)
+    %beq(t1, t2, &.yes)
+    %li(t2, %HDR.PRIM)
+    %beq(t1, t2, &.yes)
+    %b(&.end)
+    :.yes
+    %li(a0, %imm_val(%IMM.TRUE))
+    :.end
+    %ret
+.endscope
+
+:prim_zeroq_entry
+.scope
+    %car(t0, a0)
+    %li(a0, %imm_val(%IMM.FALSE))
+    %bnez(t0, &.end)
+    %li(a0, %imm_val(%IMM.TRUE))
+    :.end
+    %ret
+.endscope
+
+:prim_not_entry
+.scope
+    %car(t0, a0)
+    %li(t1, %imm_val(%IMM.FALSE))
+    %li(a0, %imm_val(%IMM.FALSE))
+    %bne(t0, t1, &.end)
+    %li(a0, %imm_val(%IMM.TRUE))
+    :.end
+    %ret
+.endscope
+
+:prim_eqq_entry
+.scope
+    %car(t0, a0)
+    %cdr(t1, a0)
+    %car(t1, t1)
+    %li(a0, %imm_val(%IMM.FALSE))
+    %bne(t0, t1, &.end)
+    %li(a0, %imm_val(%IMM.TRUE))
+    :.end
+    %ret
+.endscope
+
+# Variadic arithmetic. (+ ...) folds with identity 0; (* ...) folds with
+# identity 1; (- x) is unary negate, (- x y z ...) folds left.
+
+:prim_plus_entry
+.scope
+    %li(t0, 0)              ; tagged 0; tag bits stay 0 across %add
+    :.loop
+        %if_nil(t1, a0, &.done)
+        %car(t1, a0)
+        %add(t0, t0, t1)
+        %cdr(a0, a0)
+        %b(&.loop)
+    :.done
+    %mov(a0, t0)
+    %ret
+.endscope
+
+# (- x) -> -x; (- x y ...) -> x - y - ... .  (-) is undefined behavior
+# per the primitive-failure policy.
+:prim_minus_entry
+.scope
+    %car(t0, a0)            ; seed = first arg (tagged)
+    %cdr(a0, a0)
+    %if_nil(t1, a0, &.neg)
+    :.loop
+        %if_nil(t1, a0, &.done)
+        %car(t1, a0)
+        %sub(t0, t0, t1)
+        %cdr(a0, a0)
+        %b(&.loop)
+    :.neg
+    %li(t1, 0)              ; unary: 0 - seed
+    %sub(t0, t1, t0)
+    :.done
+    %mov(a0, t0)
+    %ret
+.endscope
+
+# Multiply keeps the accumulator tagged and untags each incoming arg:
+# (a<<3) * b == (a*b)<<3, so the loop preserves the fixnum tag.
+:prim_mult_entry
+.scope
+    %li(t0, 8)              ; tagged 1 = mkfix(1)
+    :.loop
+        %if_nil(t1, a0, &.done)
+        %car(t1, a0)
+        %untag_fix(t1, t1)
+        %mul(t0, t0, t1)
+        %cdr(a0, a0)
+        %b(&.loop)
+    :.done
+    %mov(a0, t0)
+    %ret
+.endscope
+
+# Variadic chained comparisons: (op a b c ...) ⇔ (a op b) ∧ (b op c) ∧ ...
+# Walks the tail with a single live `prev` register; a0 is reused as the
+# args cursor and finally as the result. <2 args is undefined behavior.
+:prim_eq_entry
+.scope
+    %car(t0, a0)            ; prev = first
+    %cdr(a0, a0)
+    :.loop
+        %if_nil(t1, a0, &.true)
+        %car(t1, a0)            ; curr
+        %bne(t0, t1, &.false)
+        %mov(t0, t1)
+        %cdr(a0, a0)
+        %b(&.loop)
+    :.true
+    %li(a0, %imm_val(%IMM.TRUE))
+    %ret
+    :.false
+    %li(a0, %imm_val(%IMM.FALSE))
+    %ret
+.endscope
+
+:prim_lt_entry
+.scope
+    %car(t0, a0)
+    %cdr(a0, a0)
+    :.loop
+        %if_nil(t1, a0, &.true)
+        %car(t1, a0)
+        %blt(t0, t1, &.ok)     ; prev < curr -> continue
+        %li(a0, %imm_val(%IMM.FALSE))
+        %ret
+        :.ok
+        %mov(t0, t1)
+        %cdr(a0, a0)
+        %b(&.loop)
+    :.true
+    %li(a0, %imm_val(%IMM.TRUE))
+    %ret
+.endscope
+
+:prim_gt_entry
+.scope
+    %car(t0, a0)
+    %cdr(a0, a0)
+    :.loop
+        %if_nil(t1, a0, &.true)
+        %car(t1, a0)
+        %blt(t1, t0, &.ok)     ; curr < prev <=> prev > curr -> continue
+        %li(a0, %imm_val(%IMM.FALSE))
+        %ret
+        :.ok
+        %mov(t0, t1)
+        %cdr(a0, a0)
+        %b(&.loop)
+    :.true
+    %li(a0, %imm_val(%IMM.TRUE))
+    %ret
+.endscope
+
+# (quotient x y) -- truncating integer division. Both fixnums are tagged
+# (real << 3); div(tagged, tagged) yields the raw quotient (the shifts
+# cancel), which mkfix retags. UB on y == 0.
+:prim_quotient_entry
+    %args2(t0, t1, a0)
+    %div(a0, t0, t1)
+    %mkfix(a0, a0)
+    %ret
+
+# (remainder x y) -- truncating remainder, sign of dividend. rem(tagged,
+# tagged) = 8 * (real_x rem real_y), already in tagged form.
+:prim_remainder_entry
+    %args2(t0, t1, a0)
+    %rem(a0, t0, t1)
+    %ret
+
+# Variadic bitwise folds. Tagged fixnums have low 3 bits = 0, so AND/OR/
+# XOR with another tagged fixnum preserves the tag in the accumulator.
+# Identities: bit-and -> -1 (tagged -8), bit-or -> 0, bit-xor -> 0.
+:prim_bit_and_entry
+.scope
+    %li(t0, -8)             ; tagged -1; AND-identity preserves the tag
+    :.loop
+        %if_nil(t1, a0, &.done)
+        %car(t1, a0)
+        %and(t0, t0, t1)
+        %cdr(a0, a0)
+        %b(&.loop)
+    :.done
+    %mov(a0, t0)
+    %ret
+.endscope
+
+:prim_bit_or_entry
+.scope
+    %li(t0, 0)
+    :.loop
+        %if_nil(t1, a0, &.done)
+        %car(t1, a0)
+        %or(t0, t0, t1)
+        %cdr(a0, a0)
+        %b(&.loop)
+    :.done
+    %mov(a0, t0)
+    %ret
+.endscope
+
+:prim_bit_xor_entry
+.scope
+    %li(t0, 0)
+    :.loop
+        %if_nil(t1, a0, &.done)
+        %car(t1, a0)
+        %xor(t0, t0, t1)
+        %cdr(a0, a0)
+        %b(&.loop)
+    :.done
+    %mov(a0, t0)
+    %ret
+.endscope
+
+# (bit-not n) -- bitwise complement. Untag, XOR with -1 (= ~n), retag.
+# Can't XOR the tagged value directly: that would flip the low 3 tag bits.
+:prim_bit_not_entry
+    %car(t0, a0)
+    %untag_fix(t0, t0)
+    %li(t1, -1)
+    %xor(t0, t0, t1)
+    %mkfix(a0, t0)
+    %ret
+
+# (arithmetic-shift n k): k > 0 means left shift; k < 0 means arith right.
+# Untag both, branch on sign of k, retag.
+:prim_arith_shift_entry
+.scope
+    %car(t0, a0)
+    %cdr(t1, a0)
+    %car(t1, t1)
+    %untag_fix(t0, t0)
+    %untag_fix(t1, t1)
+    %bltz(t1, &.right)
+    %shl(a0, t0, t1)
+    %mkfix(a0, a0)
+    %ret
+    :.right
+    %li(t2, 0)
+    %sub(t1, t2, t1)
+    %sar(a0, t0, t1)
+    %mkfix(a0, a0)
+    %ret
+.endscope
+
+# Bytevectors are 24-byte HEAP-tagged wrappers pointing at a separately
+# allocated data buffer; this gives them dynamic-array semantics — capacity
+# can grow in place by reallocating just the data buffer (no need to find
+# and patch every reference to the wrapper).
+#
+#   word 0  ::  (length << 8) | HDR.BV       ; length = hdr >> 8
+#   word 1  ::  data_ptr (raw heap address)
+#   word 2  ::  capacity in bytes
+#
+# Tagged-pointer offsets into the wrapper:
+#   hdr      = ld(bv, -3)
+#   data_ptr = ld(bv,  5)
+#   capacity = ld(bv, 13)
+#
+# bv_capacity_for(n) returns the smallest power-of-two ≥ max(n, 16); bv_grow
+# then doubles by repeatedly shifting until cap ≥ requested. Bytevectors
+# are raw u8[] and need no headroom for a NUL terminator -- callers that
+# build "strings" use the str_* writers, which reserve cap > len AND
+# explicitly zero data[len] (the heap is reused via heap-mark/heap-rewind!,
+# so BSS-zero cannot be assumed).
+
+# alloc_bytes(size=a0) -> raw addr (a0). Untagged data buffer; size is
+# rounded up to 8 to keep the next bump 8-byte-aligned.
+:alloc_bytes
+.scope
+    %alignup(a0, a0, 8, t0)
+    %ld_global(t2, &current_heap_next_ptr)
+    %ld(t1, t2, 0)
+    %add(t0, t1, a0)
+    %ld_global(a3, &current_heap_end_ptr)
+    %ld(a3, a3, 0)
+    %bltu(a3, t0, &.oom)
+    %st(t0, t2, 0)
+    %mov(a0, t1)
+    %ret
+    :.oom
+    %b(&heap_oom_die)
+.endscope
+
+# alloc_bytes_main(size=a0) -> raw addr (a0). Untagged data buffer in the
+# main heap regardless of current heap selection. Used for interpreter-
+# owned stable storage such as symtab names, which must survive scratch
+# resets even when user code is currently allocating in scratch.
+:alloc_bytes_main
+.scope
+    %alignup(a0, a0, 8, t0)
+    %la(t2, &heap_next)
+    %ld(t1, t2, 0)
+    %add(t0, t1, a0)
+    %ld_global(a3, &heap_end)
+    %bltu(a3, t0, &.oom)
+    %st(t0, t2, 0)
+    %mov(a0, t1)
+    %ret
+    :.oom
+    %die(msg_heap_full)
+.endscope
+
+# bv_capacity_for(n=a0) -> smallest power-of-two ≥ n, minimum 16. Pure
+# bytevector sizing -- no NUL slack. Callers building "strings" call
+# bv_capacity_for(raw_len + 1) to reserve room for the trailing NUL.
+:bv_capacity_for
+.scope
+    %li(t0, 16)
+    :.loop
+    %bltu(t0, a0, &.shift)         ; t0 < a0: keep doubling
+    %mov(a0, t0)                    ; t0 >= a0: done
+    %ret
+    :.shift
+    %shli(t0, t0, 1)
+    %b(&.loop)
+.endscope
+
+# bv_alloc(raw_len=a0) -> tagged bv (a0). Length = raw_len, capacity from
+# bv_capacity_for, data buffer uninitialized. data_ptr lives in a frame
+# slot because alloc_hdr's alignup clobbers t-regs.
+#
+# Locals:
+#   raw_len
+#   capacity
+#   data_ptr  (raw)
+%fn2(bv_alloc, {raw_len capacity data_ptr}, {
+    %stl(a0, raw_len)
+
+    %call(&bv_capacity_for)
+    %stl(a0, capacity)
+    %call(&alloc_bytes)
+    %stl(a0, data_ptr)
+
+    %ldl(a1, raw_len)
+    %shli(a1, a1, 8)        ; hdr = (raw_len << 8) | HDR.BV (BV == 0)
+    %li(a0, 24)
+    %call(&alloc_hdr)
+
+    %ldl(t0, data_ptr)
+    %heap_st(t0, a0, %BV.data)
+    %ldl(t1, capacity)
+    %st(t1, a0, 13)         ; bv.cap (raw offset 16; not in BV struct)
+})
+
+# bv_grow(bv=a0, min_cap=a1) -> bv (a0). Doubles capacity until ≥ min_cap;
+# allocates a fresh data buffer, copies the live bytes (length, not
+# capacity), and patches the wrapper's data_ptr/capacity slots in place.
+# A no-op when current capacity already satisfies min_cap.
+#
+# Locals:
+#   bv
+#   min_cap  (input) / new_cap (during loop)
+#   new_data_ptr
+#   raw  length
+%fn2(bv_grow, {bv min_cap new_data_ptr raw}, {
+    %stl(a0, bv)
+    %stl(a1, min_cap)
+
+    %ld(t0, a0, 13)         ; bv.cap (raw offset 16; not in BV struct)
+    %bltu(t0, a1, &.need)
+    %ldl(a0, bv)
+    %eret
+
+    :.need
+    :.loop
+    %shli(t0, t0, 1)
+    %ldl(t1, min_cap)
+    %bltu(t0, t1, &.loop)
+    %stl(t0, min_cap)
+
+    %mov(a0, t0)
+    %call(&alloc_bytes)
+    %stl(a0, new_data_ptr)
+
+    %ldl(t0, bv)
+    %heap_ld(t1, t0, %BV.hdr)
+    %shri(t1, t1, 8)        ; raw length
+    %stl(t1, raw)
+    %ldl(a0, new_data_ptr)
+    %heap_ld(a1, t0, %BV.data)  ; old data ptr
+    %ldl(a2, raw)
+    %call(&memcpy)
+
+    %ldl(t0, bv)
+    %ldl(t1, new_data_ptr)
+    %heap_st(t1, t0, %BV.data)
+    %ldl(t1, min_cap)
+    %st(t1, t0, 13)         ; bv.cap (raw offset 16; not in BV struct)
+    %ldl(a0, bv)
+})
+
+# (make-bytevector len) or (make-bytevector len fill)
+
+%fn2(prim_make_bytevector_entry, {args fill wrapper}, {
+    %stl(a0, args)
+
+    %li(t2, 0)
+    %cdr(t0, a0)
+    %if_nil(t1, t0, &.no_fill)
+    %car(t0, t0)
+    %sari(t2, t0, 3)
+    :.no_fill
+    %stl(t2, fill)
+
+    %ldl(a0, args)
+    %car_fix(a0, a0)
+    %bltz(a0, &.bad_len)
+    %call(&bv_alloc)
+    %stl(a0, wrapper)
+
+    %ldl(t0, args)
+    %car_fix(t0, t0)        ; raw_len
+    %ldl(t1, fill)          ; fill
+    %ldl(a1, wrapper)
+    %heap_ld(t2, a1, %BV.data)
+    %li(a1, 0)
+
+    :.fill_loop
+        %beq(a1, t0, &.fill_done)
+        %sb(t1, t2, 0)
+        %addi(t2, t2, 1)
+        %addi(a1, a1, 1)
+        %b(&.fill_loop)
+    :.fill_done
+
+    %ldl(a0, wrapper)
+    %eret
+
+    :.bad_len
+    %die(msg_bv_oob)
+})
+
+:prim_bv_length_entry
+    %car(t0, a0)
+    %heap_ld(t1, t0, %BV.hdr)
+    %shri(a0, t1, 5)
+    %ret
+
+# (string-length s) -- assumes s is a NUL-terminated bv (a "string");
+# returns strlen(data_ptr). Mirrors bytevector-length but uses the NUL
+# terminator instead of the bv header. For a well-formed string built
+# via str_alloc / str_putn / etc the two agree; for a raw bytevector
+# without a NUL the result is unspecified (strlen may walk past the
+# data buffer).
+%fn(prim_string_length_entry, 0, {
+    %car(t0, a0)
+    %heap_ld(a0, t0, %BV.data)
+    %call(&libp1pp__strlen)
+    %mkfix(a0, a0)
+    %eret
+})
+
+:prim_bv_u8_ref_entry
+.scope
+    %args2(t0, t1, a0)      ; bv, tagged idx
+    %sari(t1, t1, 3)        ; raw idx
+    %bltz(t1, &.oob)
+    %heap_ld(a0, t0, %BV.hdr)
+    %shri(a0, a0, 8)        ; length
+    %bltu(t1, a0, &.ok)
+    :.oob
+    %die(msg_bv_oob)
+    :.ok
+    %heap_ld(t2, t0, %BV.data)
+    %add(t2, t2, t1)
+    %lb(a0, t2, 0)
+    %mkfix(a0, a0)
+    %ret
+.endscope
+
+:prim_bv_u8_set_entry
+.scope
+    %args3(t0, t2, t1, a0)  ; bv, idx, val
+    %sari(t2, t2, 3)        ; raw idx
+    %sari(t1, t1, 3)        ; raw val
+    %bltz(t2, &.oob)
+    %heap_ld(a0, t0, %BV.hdr)
+    %shri(a0, a0, 8)        ; length
+    %bltu(t2, a0, &.ok)
+    :.oob
+    %die(msg_bv_oob)
+    :.ok
+    %heap_ld(a0, t0, %BV.data)
+    %add(a0, a0, t2)
+    %sb(t1, a0, 0)
+    %li(a0, %imm_val(%IMM.UNSPEC))
+    %ret
+.endscope
+
+# (bytevector-copy src start end) -> fresh bv of length end-start.
+# Bounds: 0 <= start <= end <= src.length.
+#
+# Locals:
+#   args
+#   src  tagged
+#   wrapper  (saved after bv_alloc)
+%fn2(prim_bv_copy_entry, {args src wrapper}, {
+    %stl(a0, args)
+
+    %args3(t0, t2, t1, a0)  ; src, start, end
+    %stl(t0, src)
+    %sari(t2, t2, 3)        ; raw start
+    %sari(t1, t1, 3)        ; raw end
+
+    # Bounds: start >= 0; end >= start (signed catches negative end since
+    # start is now non-negative); src.length >= end.
+    %bltz(t2, &.oob)
+    %blt(t1, t2, &.oob)
+    %heap_ld(a0, t0, %BV.hdr)
+    %shri(a0, a0, 8)        ; src.length
+    %blt(a0, t1, &.oob)
+
+    %sub(a0, t1, t2)        ; count
+    %call(&bv_alloc)
+    %stl(a0, wrapper)
+
+    # Recompute src ptr at start; dst ptr at 0; count from new bv's hdr.
+    %ldl(t0, args)
+    %cdr(t0, t0)
+    %car_fix(t0, t0)        ; raw start
+    %ldl(t1, src)
+    %heap_ld(t2, t1, %BV.data)
+    %add(t2, t2, t0)        ; src ptr
+    %ldl(a3, wrapper)
+    %heap_ld(a2, a3, %BV.data)  ; dst ptr
+    %heap_ld(a1, a3, %BV.hdr)
+    %shri(a1, a1, 8)        ; count
+
+    :.copy_loop
+    %beqz(a1, &.copy_done)
+    %lb(t0, t2, 0)
+    %sb(t0, a2, 0)
+    %addi(t2, t2, 1)
+    %addi(a2, a2, 1)
+    %addi(a1, a1, -1)
+    %b(&.copy_loop)
+
+    :.copy_done
+    %ldl(a0, wrapper)
+    %eret
+
+    :.oob
+    %die(msg_bv_oob)
+})
+
+# (bytevector-copy! dst dst-start src src-start src-end). Bounds:
+# 0 <= src-start <= src-end <= src.length and
+# 0 <= dst-start && dst-start + (src-end-src-start) <= dst.length.
+#
+# Locals:
+#   dst  -start (raw)
+#   dst_start
+#   src  -end (raw)
+#   src_start
+#   src_end
+%fn2(prim_bv_copy_bang_entry, {dst dst_start src src_start src_end}, {
+    %car(t0, a0)
+    %stl(t0, dst)              ; dst
+    %cdr(a0, a0)
+    %car(t0, a0)
+    %sari(t0, t0, 3)
+    %stl(t0, dst_start)              ; dst-start
+    %cdr(a0, a0)
+    %car(t0, a0)
+    %stl(t0, src)             ; src
+    %cdr(a0, a0)
+    %car(t0, a0)
+    %sari(t0, t0, 3)
+    %stl(t0, src_start)             ; src-start
+    %cdr(a0, a0)
+    %car(t0, a0)
+    %sari(t0, t0, 3)
+    %stl(t0, src_end)             ; src-end
+
+    # src-start >= 0
+    %ldl(t0, src_start)
+    %bltz(t0, &.oob)
+    # src-end >= src-start (signed catches negative src-end)
+    %ldl(t1, src_end)
+    %blt(t1, t0, &.oob)
+    # src-end <= src.length
+    %ldl(t2, src)
+    %heap_ld(a0, t2, %BV.hdr)
+    %shri(a0, a0, 8)
+    %blt(a0, t1, &.oob)
+    # dst-start >= 0
+    %ldl(t2, dst_start)
+    %bltz(t2, &.oob)
+    # dst-start + count <= dst.length
+    %sub(a0, t1, t0)            ; count = src-end - src-start
+    %add(a0, a0, t2)            ; dst-start + count
+    %ldl(t1, dst)
+    %heap_ld(t2, t1, %BV.hdr)
+    %shri(t2, t2, 8)
+    %blt(t2, a0, &.oob)
+
+    # Set up copy. dst ptr = dst.data + dst-start; src ptr = src.data +
+    # src-start; count = src-end - src-start.
+    %ldl(t0, dst)
+    %heap_ld(t0, t0, %BV.data)
+    %ldl(a1, dst_start)
+    %add(t0, t0, a1)            ; dst ptr
+    %ldl(a1, src)
+    %heap_ld(a1, a1, %BV.data)
+    %ldl(a2, src_start)
+    %add(a1, a1, a2)            ; src ptr
+    %ldl(a3, src_end)
+    %sub(a3, a3, a2)            ; count
+
+    :.loop
+        %beqz(a3, &.done)
+        %lb(t1, a1, 0)
+        %sb(t1, t0, 0)
+        %addi(t0, t0, 1)
+        %addi(a1, a1, 1)
+        %addi(a3, a3, -1)
+    %b(&.loop)
+
+    :.done
+    %li(a0, %imm_val(%IMM.UNSPEC))
+    %eret
+
+    :.oob
+    %die(msg_bv_oob)
+})
+
+# bv_equal_check(a=a0, b=a1) -> a0 (IMM.TRUE / IMM.FALSE). Leaf. Both
+# arguments are assumed to be HEAP-tagged HDR.BV values; callers do the
+# type check (either bytevector=?'s prim entry or equal_recurse's BV
+# branch). Compares lengths first, then walks bytes; %lb is zero-extending
+# on every backend, so a single %bne is enough for the byte test.
+:bv_equal_check
+.scope
+    %heap_ld(t0, a0, %BV.hdr)
+    %shri(t0, t0, 8)            ; len_a
+    %heap_ld(t1, a1, %BV.hdr)
+    %shri(t1, t1, 8)            ; len_b
+    %bne(t0, t1, &.false)
+
+    %heap_ld(a2, a0, %BV.data)
+    %heap_ld(a3, a1, %BV.data)
+
+    :.loop
+        %beqz(t0, &.true)
+        %lb(t1, a2, 0)
+        %lb(t2, a3, 0)
+        %bne(t1, t2, &.false)
+        %addi(a2, a2, 1)
+        %addi(a3, a3, 1)
+        %addi(t0, t0, -1)
+    %b(&.loop)
+
+    :.true
+    %li(a0, %imm_val(%IMM.TRUE))
+    %ret
+
+    :.false
+    %li(a0, %imm_val(%IMM.FALSE))
+    %ret
+.endscope
+
+# (bytevector=? a b) -- structural equality on bytevectors. Non-bv
+# inputs return #f rather than aborting, matching the lax stance the
+# other predicates take until LISP.md pins a stricter policy.
+:prim_bytevector_eq_entry
+.scope
+    %args2(t0, t1, a0)
+    %tagof(t2, t0)
+    %li(a0, %TAG.HEAP)
+    %bne(t2, a0, &.false)
+    %tagof(t2, t1)
+    %bne(t2, a0, &.false)
+    %hdr_type(t2, t0)
+    %li(a0, %HDR.BV)
+    %bne(t2, a0, &.false)
+    %hdr_type(t2, t1)
+    %bne(t2, a0, &.false)
+    %mov(a0, t0)
+    %mov(a1, t1)
+    %b(&bv_equal_check)
+    :.false
+    %li(a0, %imm_val(%IMM.FALSE))
+    %ret
+.endscope
+
+# equal_recurse(a=a0, b=a1) -> a0 (IMM.TRUE / IMM.FALSE). Identity covers
+# fixnums, symbols, immediates, and any case where both arguments are the
+# same heap or pair pointer. For non-identical pair pointers we recurse
+# into car then cdr; for non-identical heap pointers we structural-equal
+# only when both are HDR.BV (closures, prims, records, and TDs are
+# identity-only). Tail-calls the cdr-side recursion and the BV check.
+#
+# Locals:
+#   a
+#   b
+%fn2(equal_recurse, {a b}, {
+    %stl(a0, a)
+    %stl(a1, b)
+
+    %beq(a0, a1, &.true)
+
+    %tagof(t0, a0)
+    %tagof(t1, a1)
+    %bne(t0, t1, &.false)
+
+    %bieq(t0, %TAG.PAIR, &.pair, t1)
+    %bieq(t0, %TAG.HEAP, &.heap, t1)
+    %b(&.false)
+
+    :.pair
+    %ldl(t0, a)
+    %ldl(t1, b)
+    %car(a0, t0)
+    %car(a1, t1)
+    %call(&equal_recurse)
+    %bieq(a0, %imm_val(%IMM.FALSE), &.done, t0)
+    %ldl(t0, a)
+    %ldl(t1, b)
+    %cdr(a0, t0)
+    %cdr(a1, t1)
+    %tail(&equal_recurse)
+
+    :.heap
+    %ldl(t0, a)
+    %ldl(t1, b)
+    %hdr_type(t2, t0)
+    %hdr_type(a0, t1)
+    %bne(t2, a0, &.false)      ; differing heap classes -> #f
+    %li(a0, %HDR.BV)
+    %beq(t2, a0, &.heap_bv)
+    %li(a0, %HDR.REC)
+    %beq(t2, a0, &.heap_rec)
+    %b(&.false)                 ; CLOSURE/PRIM/TD: identity-only
+
+    :.heap_bv
+    %mov(a0, t0)
+    %mov(a1, t1)
+    %tail(&bv_equal_check)
+
+    :.heap_rec
+    %mov(a0, t0)
+    %mov(a1, t1)
+    %tail(&rec_equal_check)
+
+    :.true
+    %li(a0, %imm_val(%IMM.TRUE))
+    %b(&.done)
+
+    :.false
+    %li(a0, %imm_val(%IMM.FALSE))
+
+    :.done
+})
+
+# rec_equal_check(a=a0, b=a1) -> a0 (IMM.TRUE / IMM.FALSE). Both args
+# are HEAP-tagged HDR.REC. Records are equal iff their TDs are eq? and
+# every field is equal? (recursing through equal_recurse). Field i sits
+# at tagged + 13 + 8*i; nfields lives at the TD's offset 13 (raw).
+#
+# Locals:
+#   a  (rec, tagged)
+#   b  (rec, tagged)
+#   i  (raw counter)
+#   nfields  (raw)
+%fn2(rec_equal_check, {a b i nfields}, {
+    %stl(a0, a)
+    %stl(a1, b)
+
+    %heap_ld(t0, a0, %REC.td)   ; td_a
+    %heap_ld(t1, a1, %REC.td)   ; td_b
+    %bne(t0, t1, &.false)
+
+    %heap_ld(t1, t0, %TD.nfields)
+    %stl(t1, nfields)
+    %li(t0, 0)
+    %stl(t0, i)              ; i = 0
+
+    :.loop
+    %ldl(t0, i)
+    %ldl(t1, nfields)
+    %beq(t0, t1, &.true)
+
+    %shli(t2, t0, 3)
+    %addi(t2, t2, 13)            ; field offset = 13 + 8*i
+    %ldl(t1, a)
+    %add(t1, t1, t2)
+    %ld(a0, t1, 0)               ; a's field i
+    %ldl(t1, b)
+    %add(t1, t1, t2)
+    %ld(a1, t1, 0)               ; b's field i
+    %call(&equal_recurse)
+    %bieq(a0, %imm_val(%IMM.FALSE), &.done, t0)
+
+    %ldl(t0, i)
+    %addi(t0, t0, 1)
+    %stl(t0, i)
+    %b(&.loop)
+
+    :.true
+    %li(a0, %imm_val(%IMM.TRUE))
+    %b(&.done)
+
+    :.false
+    %li(a0, %imm_val(%IMM.FALSE))
+
+    :.done
+})
+
+# (equal? a b) -- thin prim wrapper that unpacks the args list and falls
+# into equal_recurse. equal_recurse owns the frame; this entry stays a
+# leaf so the prim-dispatch tailr lands directly into the frame setup.
+:prim_equal_entry
+    %args2(t0, t1, a0)
+    %mov(a0, t0)
+    %mov(a1, t1)
+    %b(&equal_recurse)
+
+# (apply fn rest...)  -- the trailing element of `rest` is a list; any
+# leading elements get prepended to it. apply_build_args walks `rest` and
+# returns the assembled args list; prim_apply_entry then tail-calls apply.
+#
+# `apply` is itself a primitive, so on entry here a0 holds (fn . rest)
+# and a1 holds the apply PRIM ptr (per the convention documented at
+# `apply::prim`). a1 is dead from this primitive's point of view; we
+# clobber it freely while assembling args, then tail-call apply, which
+# re-derives a1 from the callee fn it dispatches on. Outer convention
+# stays intact end-to-end.
+
+%fn2(prim_apply_entry, {args pad}, {
+    %stl(a0, args)
+    %cdr(a0, a0)
+    %call(&apply_build_args)
+    %mov(t0, a0)
+    %ldl(a0, args)
+    %car(a0, a0)
+    %mov(a1, t0)
+    %tail(&apply)
+})
+
+# apply_build_args(rest=a0) -> assembled args list.
+# `rest` is (a1 a2 ... aN listargs); the trailing element is itself a list
+# whose elements get appended after the leading aₖ's. Iterative
+# head/tail-cdr build: walk every cell whose cdr isn't NIL into a fresh
+# (aₖ . NIL) cons; the final element (the trailing list) becomes the
+# tail's cdr (or the result itself if there are no leading elements).
+#
+# Locals:
+#   walk  (advances; current cell of rest)
+#   head  (NIL until first leading arg appended)
+#   tail  (most recent cell; set-cdr! target)
+%fn2(apply_build_args, {walk head tail}, {
+    %stl(a0, walk)
+    %li(t0, %imm_val(%IMM.NIL))
+    %stl(t0, head)
+    %stl(t0, tail)
+
+    :.loop
+        %ldl(t0, walk)
+        %cdr(t1, t0)
+        %if_nil(t2, t1, &.last)
+
+        # cell = cons(car(walk), NIL); append to head/tail.
+        %car(a0, t0)
+        %li(a1, %imm_val(%IMM.NIL))
+        %call(&cons)
+
+        %ldl(t0, head)
+        %if_nil(t1, t0, &.first)
+        %ldl(t0, tail)
+        %set_cdr(a0, t0)
+        %stl(a0, tail)
+        %b(&.advance)
+
+        :.first
+        %stl(a0, head)
+        %stl(a0, tail)
+
+        :.advance
+        %advance_walk(walk)
+        %b(&.loop)
+
+    :.last
+    # car(walk) is the trailing list. If head is NIL there were no leading
+    # args -- return the trailing list directly. Otherwise splice it onto
+    # the tail and return head.
+    %car(a0, t0)
+    %ldl(t1, head)
+    %if_nil(t2, t1, &.done)
+    %ldl(t1, tail)
+    %set_cdr(a0, t1)
+    %ldl(a0, head)
+
+    :.done
+})
+
+# Records: TDs (type descriptors) and instances. A TD is a 24-byte heap
+# object [HDR.TD][name_sym][nfields_raw]. A record is a variable-width
+# heap object [HDR.REC][td][field_0]...[field_{n-1}], so field i lives at
+# tagged + 13 + 8*i. define-record-type allocates one TD plus one
+# parameterized PRIM per ctor/predicate/accessor/mutator, all pointing
+# into the same TD via the prim's data slot.
+
+# make_param_prim(entry=a0, data=a1) -> prim (a0). Allocates a 24-byte
+# PRIM in main, sets the entry label and data word. These PRIMs are
+# installed in global bindings by define-record-type, so they must not
+# be reclaimed by scratch reset.
+
+%fn2(make_param_prim, {entry data}, {
+    %stl(a0, entry)
+    %stl(a1, data)
+
+    %li(a0, 24)
+    %li(a1, %HDR.PRIM)
+    %call(&alloc_hdr_main)
+
+    %ldl(t0, entry)
+    %heap_st(t0, a0, %PRIM.entry_w)
+    %ldl(t1, data)
+    %heap_st(t1, a0, %PRIM.data)
+})
+
+# Parameterized PRIM entries used by define-record-type. Each receives
+# args in a0 and the prim itself in a1; the prim's data slot (offset 13
+# from tagged) holds either the TD or a tagged field index. The
+# constructor inlines record allocation; predicate / accessor / mutator
+# inline what would otherwise be %record-is-a? / %record-ref /
+# %record-set! bodies. None of these primitives are exposed at the
+# user level — R7RS define-record-type binds only ctor / pred /
+# accessor / mutator names.
+
+# ctor: prim.data = TD (HEAP); args = (f0 f1 ...). Inlines the
+# %make-record body so we don't have to cons (TD . args) first.
+
+%fn2(prim_ctor_entry, {args td record}, {
+    %stl(a0, args)
+    %heap_ld(t0, a1, %PRIM.data)
+    %stl(t0, td)
+
+    # Count = length(args).
+    %call(&list_length)
+    %shli(a0, a0, 3)
+    %addi(a0, a0, 16)
+    %li(a1, %HDR.REC)
+    %call(&alloc_hdr)
+    %stl(a0, record)
+
+    %ldl(t0, td)
+    %heap_st(t0, a0, %REC.td)
+
+    %ldl(t0, args)
+    %addi(t1, a0, 13)
+
+    :.fill_loop
+        %if_nil(t2, t0, &.fill_done)
+        %car(t2, t0)
+        %st(t2, t1, 0)
+        %addi(t1, t1, 8)
+        %cdr(t0, t0)
+        %b(&.fill_loop)
+    :.fill_done
+
+    %ldl(a0, record)
+})
+
+# predicate: prim.data = TD; args = (rec).
+:prim_predicate_entry
+.scope
+    %car(t0, a0)
+    %heap_ld(t1, a1, %PRIM.data)
+    %tagof(t2, t0)
+    %li(a0, %imm_val(%IMM.FALSE))
+    %bine(t2, %TAG.HEAP, &.end, a2)
+    %hdr_type(t2, t0)
+    %bine(t2, %HDR.REC,  &.end, a2)
+    %heap_ld(t2, t0, %REC.td)
+    %bne(t2, t1, &.end)
+    %li(a0, %imm_val(%IMM.TRUE))
+    :.end
+    %ret
+.endscope
+
+# accessor: prim.data = tagged field index; args = (rec).
+:prim_accessor_entry
+    %car(t0, a0)
+    %heap_ld(t1, a1, %PRIM.data)
+    %addi(t1, t1, 13)
+    %add(t1, t1, t0)
+    %ld(a0, t1, 0)
+    %ret
+
+# mutator: prim.data = tagged field index; args = (rec val).
+:prim_mutator_entry
+.scope
+    %car(t0, a0)
+    %cdr(t1, a0)
+    %car(t1, t1)
+    %heap_ld(t2, a1, %PRIM.data)
+    %addi(t2, t2, 13)
+    %add(t2, t2, t0)
+    %st(t1, t2, 0)
+    %li(a0, %imm_val(%IMM.UNSPEC))
+    %ret
+.endscope
+
+# eval_define_record_type(rest=a0, env=a1) -> UNSPEC.
+# rest = (name (ctor f1 ...) pred clause1 clause2 ...)
+# Each clause is (field-name accessor) or (field-name accessor mutator).
+# Allocates one TD + one parameterized PRIM per name introduced (ctor,
+# predicate, accessor, mutator) and binds each to the symbol's global.
+# The TD also stores a list of field-name symbols in declaration order;
+# pmatch's ($ pred (field pat) ...) record pattern uses this to map
+# field names to indices at match time.
+#
+# Locals:
+#   rest
+#   env  (unused, but the dispatcher passes it)
+#   td
+#   walk  (clauses, advancing)
+#   idx  (raw counter)
+#   nfields
+#   fl_head  (head of field-name list under construction)
+#   fl_tail  (tail cell of field-name list under construction)
+#   fl_cur   (cursor walking clauses for field-name pre-pass)
+%fn2(eval_define_record_type, {rest env td walk idx nfields fl_head fl_tail fl_cur}, {
+    %stl(a0, rest)
+    %stl(a1, env)
+
+    # clauses = cdddr(rest); count them via list_length.
+    %ldl(a0, rest)
+    %cdr(a0, a0)
+    %cdr(a0, a0)
+    %cdr(a0, a0)
+    %stl(a0, walk)
+    %call(&list_length)
+    %stl(a0, nfields)
+
+    # td = alloc_hdr_main(TD.SIZE, HDR.TD); td.name = type-name;
+    # td.nfields = nfields; td.fields = NIL (filled below). TDs are
+    # process-global record metadata, not scratch-resident instances.
+    %li(a0, %TD.SIZE)
+    %li(a1, %HDR.TD)
+    %call(&alloc_hdr_main)
+    %stl(a0, td)
+    %ldl(t0, rest)
+    %car(t0, t0)
+    %heap_st(t0, a0, %TD.name)
+    %ldl(t1, nfields)
+    %heap_st(t1, a0, %TD.nfields)
+    %li(t1, %imm_val(%IMM.NIL))
+    %heap_st(t1, a0, %TD.fields)
+
+    # Pre-pass: build (field-name-1 ... field-name-N) in declaration order
+    # via head/tail accumulator, then store at td.fields. Each clause's
+    # car is the field-name symbol. Uses fl_cur as a separate cursor so
+    # walk is left intact for the accessor-binding loop below.
+    %li(t0, %imm_val(%IMM.NIL))
+    %stl(t0, fl_head)
+    %stl(t0, fl_tail)
+    %ldl(t0, walk)
+    %stl(t0, fl_cur)
+
+    :.fl_loop
+    %ldl(t0, fl_cur)
+    %if_nil(t1, t0, &.fl_done)
+    # cell = cons(car(car(fl_cur)), NIL)
+    %car(t1, t0)
+    %car(a0, t1)
+    %li(a1, %imm_val(%IMM.NIL))
+    %call(&cons_main)
+    # Splice into list: if head is NIL, head = tail = cell.
+    # Else set-cdr!(tail, cell); tail = cell.
+    %ldl(t1, fl_head)
+    %bine(t1, %imm_val(%IMM.NIL), &.fl_append, t2)
+    %stl(a0, fl_head)
+    %stl(a0, fl_tail)
+    %b(&.fl_next)
+    :.fl_append
+    %ldl(t1, fl_tail)
+    %set_cdr(a0, t1)
+    %stl(a0, fl_tail)
+    :.fl_next
+    %ldl(t0, fl_cur)
+    %cdr(t0, t0)
+    %stl(t0, fl_cur)
+    %b(&.fl_loop)
+
+    :.fl_done
+    %ldl(t0, td)
+    %ldl(t1, fl_head)
+    %heap_st(t1, t0, %TD.fields)
+
+    # ctor-prim = make_param_prim(prim_ctor_entry, td); bind ctor-name.
+    %la(a0, &prim_ctor_entry)
+    %ldl(a1, td)
+    %call(&make_param_prim)
+    %ldl(t0, rest)
+    %cdr(t0, t0)
+    %car(t0, t0)
+    %car(t0, t0)
+    %set_global(t0, a0)
+
+    # pred-prim = make_param_prim(prim_predicate_entry, td); bind pred.
+    %la(a0, &prim_predicate_entry)
+    %ldl(a1, td)
+    %call(&make_param_prim)
+    %ldl(t0, rest)
+    %cdr(t0, t0)
+    %cdr(t0, t0)
+    %car(t0, t0)
+    %set_global(t0, a0)
+
+    # Iterate clauses: bind accessor + optional mutator per clause.
+    %li(t0, 0)
+    %stl(t0, idx)
+
+    :.clause_loop
+    %ldl(t0, walk)
+    %if_nil(t1, t0, &.done)
+
+    # accessor-prim with data = tagged idx; bind cadr(clause).
+    %ldl(a1, idx)
+    %mkfix(a1, a1)
+    %la(a0, &prim_accessor_entry)
+    %call(&make_param_prim)
+
+    %ldl(t0, walk)
+    %car(t0, t0)
+    %cdr(t0, t0)
+    %car(t0, t0)
+    %set_global(t0, a0)
+
+    # Mutator? If cddr(clause) is a pair, bind it.
+    %ldl(t0, walk)
+    %car(t0, t0)
+    %cdr(t0, t0)
+    %cdr(t0, t0)
+    %if_nil(t1, t0, &.no_mutator)
+
+    %ldl(a1, idx)
+    %mkfix(a1, a1)
+    %la(a0, &prim_mutator_entry)
+    %call(&make_param_prim)
+
+    %ldl(t0, walk)
+    %car(t0, t0)
+    %cdr(t0, t0)
+    %cdr(t0, t0)
+    %car(t0, t0)
+    %set_global(t0, a0)
+
+    :.no_mutator
+    %advance_walk(walk)
+    %ldl(t0, idx)
+    %addi(t0, t0, 1)
+    %stl(t0, idx)
+    %b(&.clause_loop)
+
+    :.done
+    %li(a0, %imm_val(%IMM.UNSPEC))
+})
+
+# =========================================================================
+# Writer -- display, write, format, error
+# =========================================================================
+#
+# All four entry points walk values through a single recursive writer
+# that appends bytes into an output bytevector. display / write call the
+# writer once, then sys_write the resulting bytes to stdout. error
+# prepends `scheme1: error: `, joins irritants with spaces, and tails
+# into runtime_error so the prefix stays consistent with every other
+# abort path. format walks a template bv, emitting raw bytes verbatim
+# and dispatching ~a (display), ~s (write), ~d (decimal), ~% (newline),
+# and ~~ (literal '~') against successive args.
+#
+# Mode flag for write_to_bv: 0 = display (bytevectors emit raw), 1 =
+# write (bytevectors emit "..." with a leading and trailing double quote;
+# escapes are not handled because string literals are not yet supported).
+#
+# bv_putn / bv_putc / bv_putint append raw bytes to a bv and return the
+# (same wrapper, possibly-grown) bv. They do NOT maintain a trailing NUL
+# -- callers building "strings" must use the str_* family below.
+# bv_grow patches data_ptr/capacity in place, so the wrapper pointer
+# never changes -- callers can keep a stable handle in a single frame
+# slot.
+
+# bv_putn(bv=a0, src=a1, n=a2) -> bv (a0). Append n bytes from src to bv,
+# growing the data buffer when capacity falls short. Raw u8[] semantics:
+# the byte at index `length` after append is unspecified.
+
+%fn2(bv_putn, {bv src n old_len}, {
+    %stl(a0, bv)
+    %stl(a1, src)
+    %stl(a2, n)
+
+    %heap_ld(t0, a0, %BV.hdr)
+    %shri(t0, t0, 8)            ; old_len
+    %stl(t0, old_len)
+
+    # bv_grow ensures cap >= old_len + n.
+    %add(a1, t0, a2)
+    %call(&bv_grow)
+
+    %ldl(t0, bv)
+    %heap_ld(a0, t0, %BV.data)
+    %ldl(t1, old_len)
+    %add(a0, a0, t1)            ; dst = data + old_len
+    %ldl(a1, src)
+    %ldl(a2, n)
+    %call(&memcpy)
+
+    # hdr = (old_len + n) << 8 | HDR.BV. HDR.BV is 0.
+    %ldl(t0, old_len)
+    %ldl(t1, n)
+    %add(t0, t0, t1)
+    %shli(t0, t0, 8)
+    %ldl(t1, bv)
+    %heap_st(t0, t1, %BV.hdr)
+
+    %ldl(a0, bv)
+})
+
+# bv_putc(bv=a0, byte=a1) -> bv (a0). Append a single byte (low 8 bits
+# of a1). Same growth + length-update protocol as bv_putn; no NUL.
+
+%fn2(bv_putc, {bv byte}, {
+    %stl(a0, bv)
+    %stl(a1, byte)
+
+    %heap_ld(t0, a0, %BV.hdr)
+    %shri(t0, t0, 8)            ; old_len
+    %addi(a1, t0, 1)             ; min_cap = old_len + 1
+    %call(&bv_grow)
+
+    %ldl(t0, bv)
+    %heap_ld(t1, t0, %BV.hdr)
+    %shri(t1, t1, 8)            ; old_len (re-read after grow)
+    %heap_ld(t2, t0, %BV.data)
+    %add(t2, t2, t1)
+    %ldl(a0, byte)
+    %sb(a0, t2, 0)
+
+    %addi(t1, t1, 1)
+    %shli(t1, t1, 8)
+    %heap_st(t1, t0, %BV.hdr)
+
+    %ldl(a0, bv)
+})
+
+# bv_putint(bv=a0, value=a1) -> bv (a0). Append decimal repr of (raw,
+# untagged) value. Uses :writer_num_buf as a 24-byte scratch buffer
+# (fmt_dec writes at most 20 bytes for a 64-bit signed integer).
+
+%fn2(bv_putint, {bv pad}, {
+    %stl(a0, bv)
+
+    %la(a0, &writer_num_buf)
+    %call(&fmt_dec)              ; n_bytes (a0)
+
+    %mov(a2, a0)
+    %la(a1, &writer_num_buf)
+    %ldl(a0, bv)
+    %tail(&bv_putn)
+})
+
+# String writers: identical to bv_putn / bv_putc / bv_putint except they
+# guarantee cap > length AND data[length] == 0 on return. Required for
+# any bv whose data_ptr is later read as a C string (syscall paths,
+# runtime_error). The explicit zero is necessary -- the heap is reused
+# via heap-mark / heap-rewind!, so a fresh data buffer from alloc_bytes
+# may carry stale bytes.
+
+# str_alloc(raw_len=a0) -> tagged bv (a0). Like bv_alloc, but cap >
+# raw_len and data[raw_len] = 0.
+%fn2(str_alloc, {raw_len bv}, {
+    %stl(a0, raw_len)
+    %addi(a0, a0, 1)             ; reserve a NUL slot
+    %call(&bv_alloc)
+    %stl(a0, bv)
+
+    # Patch hdr length back down to raw_len.
+    %ldl(t0, raw_len)
+    %shli(t0, t0, 8)             ; HDR.BV is 0
+    %heap_st(t0, a0, %BV.hdr)
+
+    # Zero data[raw_len].
+    %heap_ld(t1, a0, %BV.data)
+    %ldl(t2, raw_len)
+    %add(t1, t1, t2)
+    %li(t0, 0)
+    %sb(t0, t1, 0)
+
+    %ldl(a0, bv)
+})
+
+# str_putn(bv=a0, src=a1, n=a2) -> bv (a0). Append n bytes; on return
+# cap > new_len and data[new_len] == 0.
+%fn2(str_putn, {bv src n}, {
+    %stl(a0, bv)
+    %stl(a1, src)
+    %stl(a2, n)
+
+    # Pre-grow so the post-append buffer has a NUL slot.
+    %heap_ld(t0, a0, %BV.hdr)
+    %shri(t0, t0, 8)             ; old_len
+    %add(a1, t0, a2)
+    %addi(a1, a1, 1)             ; min_cap = old_len + n + 1
+    %call(&bv_grow)
+
+    %ldl(a0, bv)
+    %ldl(a1, src)
+    %ldl(a2, n)
+    %call(&bv_putn)              ; appends + updates length
+
+    # Zero data[new_len]. bv_putn left cap and data_ptr alone, so the
+    # NUL slot reserved above is still ours.
+    %heap_ld(t0, a0, %BV.hdr)
+    %shri(t0, t0, 8)             ; new_len
+    %heap_ld(t1, a0, %BV.data)
+    %add(t1, t1, t0)
+    %li(t2, 0)
+    %sb(t2, t1, 0)
+})
+
+# str_putc(bv=a0, byte=a1) -> bv (a0). Append one byte; cap > new_len
+# and data[new_len] == 0 on return.
+%fn2(str_putc, {bv byte}, {
+    %stl(a0, bv)
+    %stl(a1, byte)
+
+    %heap_ld(t0, a0, %BV.hdr)
+    %shri(t0, t0, 8)             ; old_len
+    %addi(a1, t0, 2)             ; min_cap = old_len + 1 + 1
+    %call(&bv_grow)
+
+    %ldl(a0, bv)
+    %ldl(a1, byte)
+    %call(&bv_putc)
+
+    %heap_ld(t0, a0, %BV.hdr)
+    %shri(t0, t0, 8)             ; new_len
+    %heap_ld(t1, a0, %BV.data)
+    %add(t1, t1, t0)
+    %li(t2, 0)
+    %sb(t2, t1, 0)
+})
+
+# str_putint(bv=a0, value=a1) -> bv (a0). Like bv_putint but tails into
+# str_putn, so the result is NUL-terminated.
+%fn2(str_putint, {bv pad}, {
+    %stl(a0, bv)
+
+    %la(a0, &writer_num_buf)
+    %call(&fmt_dec)              ; n_bytes (a0)
+
+    %mov(a2, a0)
+    %la(a1, &writer_num_buf)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+})
+
+# str_puthex(bv=a0, value=a1) -> bv (a0). Signed hex: emits a leading
+# '-' for negatives, then unsigned hex of |value| via fmt_hex. The bv
+# wrapper pointer is stable across str_putc / str_putn (only the
+# internal data buffer can move), so we reload it from the local.
+%fn2(str_puthex, {bv value}, {
+    %stl(a0, bv)
+    %stl(a1, value)
+
+    %bltz(a1, &.neg)
+    %b(&.pos)
+
+    :.neg
+    %ldl(a0, bv)
+    %li(a1, 45)                  ; '-'
+    %call(&str_putc)
+    %ldl(t0, value)
+    %li(t1, 0)
+    %sub(t0, t1, t0)
+    %stl(t0, value)
+
+    :.pos
+    %la(a0, &writer_num_buf)
+    %ldl(a1, value)
+    %call(&fmt_hex)              ; n_bytes (a0)
+
+    %mov(a2, a0)
+    %la(a1, &writer_num_buf)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+})
+
+# sym_name(idx=a0) -> (ptr=a0, len=a1). Leaf. idx is the untagged sym
+# slot index; both fields come straight out of the symtab entry.
+:sym_name
+    %ld_global(t0, &symtab_buf_ptr)
+    %lda_array(a1, t1, t0, %SYMENT.SIZE, a0, %SYMENT.name_len)
+    %ld(a0, t1, %SYMENT.name_ptr)
+    %ret
+
+# write_to_bv(val=a0, bv=a1, mode=a2) -> bv (a0). Recursively appends
+# val's printed representation to bv. mode = 0 emits bytevectors as raw
+# bytes (display); mode = 1 emits them as `"..."` (write). Pairs are
+# delegated to write_pair_to_bv so the recursion through PAIR has its
+# own frame.
+#
+# Output is treated as a string by callers (display / write / error /
+# format), so all internal append calls go through the str_* family --
+# the result has cap > length and a trailing NUL.
+
+%fn2(write_to_bv, {val bv mode pad}, {
+    %stl(a0, val)
+    %stl(a1, bv)
+    %stl(a2, mode)
+
+    %tagof(t0, a0)
+    %bieq(t0, %TAG.PAIR, &.pair, t1)
+    %bieq(t0, %TAG.SYM,  &.sym,  t1)
+    %bieq(t0, %TAG.HEAP, &.heap, t1)
+    %bieq(t0, %TAG.IMM,  &.imm,  t1)
+
+    # Fall-through: FIXNUM (the only remaining tag).
+    %ldl(a0, bv)
+    %ldl(a1, val)
+    %sari(a1, a1, 3)
+    %tail(&str_putint)
+
+    :.sym
+    %ldl(a0, val)
+    %sari(a0, a0, 3)
+    %call(&sym_name)
+    %mov(a2, a1)
+    %mov(a1, a0)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+
+    :.pair
+    %ldl(a0, val)
+    %ldl(a1, bv)
+    %ldl(a2, mode)
+    %tail(&write_pair_to_bv)
+
+    :.heap
+    %hdr_type(t0, a0)
+    %bieq(t0, %HDR.BV,      &.heap_bv,      t1)
+    %bieq(t0, %HDR.CLOSURE, &.heap_closure, t1)
+    %bieq(t0, %HDR.PRIM,    &.heap_prim,    t1)
+    %bieq(t0, %HDR.TD,      &.heap_td,      t1)
+    %bieq(t0, %HDR.REC,     &.heap_rec,     t1)
+    %b(&.heap_unknown)
+
+    :.heap_bv
+    %ldl(t0, mode)
+    %beqz(t0, &.heap_bv_raw)
+    # write mode: emit `"`, then the raw bytes, then `"`.
+    %ldl(a0, bv)
+    %li(a1, 34)
+    %call(&str_putc)
+    %ldl(t0, val)
+    %heap_ld(a1, t0, %BV.data)
+    %heap_ld(a2, t0, %BV.hdr)
+    %shri(a2, a2, 8)
+    %call(&str_putn)
+    %li(a1, 34)
+    %tail(&str_putc)
+
+    :.heap_bv_raw
+    %ldl(t0, val)
+    %heap_ld(a1, t0, %BV.data)
+    %heap_ld(a2, t0, %BV.hdr)
+    %shri(a2, a2, 8)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+
+    :.heap_closure
+    %la(a1, &str_closure)
+    %li(a2, 10)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+
+    :.heap_prim
+    %la(a1, &str_prim)
+    %li(a2, 7)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+
+    :.heap_td
+    %la(a1, &str_td)
+    %li(a2, 11)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+
+    :.heap_rec
+    %la(a1, &str_rec)
+    %li(a2, 9)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+
+    :.heap_unknown
+    %la(a1, &str_unknown)
+    %li(a2, 10)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+
+    :.imm
+    %ldl(a0, val)
+    %sari(a0, a0, 3)
+    %beqz(a0, &.imm_false)
+    %addi(t0, a0, -1)
+    %beqz(t0, &.imm_true)
+    %addi(t0, a0, -2)
+    %beqz(t0, &.imm_nil)
+    %addi(t0, a0, -3)
+    %beqz(t0, &.imm_unspec)
+    %addi(t0, a0, -4)
+    %beqz(t0, &.imm_unbound)
+    # EOF (idx == 5) is the only remaining IMM.
+    %la(a1, &str_eof)
+    %li(a2, 5)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+
+    :.imm_false
+    %la(a1, &str_false)
+    %li(a2, 2)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+
+    :.imm_true
+    %la(a1, &str_true)
+    %li(a2, 2)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+
+    :.imm_nil
+    %la(a1, &str_nil)
+    %li(a2, 2)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+
+    :.imm_unspec
+    %la(a1, &str_unspec)
+    %li(a2, 8)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+
+    :.imm_unbound
+    %la(a1, &str_unbound)
+    %li(a2, 9)
+    %ldl(a0, bv)
+    %tail(&str_putn)
+})
+
+# write_pair_to_bv(pair=a0, bv=a1, mode=a2) -> bv (a0). Emits `(elt elt
+# ...)` form, with `( . )` for non-list cdrs (dotted pair). The walker
+# advances `pair` along the spine; cdr's tag determines whether we emit
+# a separator and continue, emit ` . val)` for a dotted tail, or just
+# emit `)` for a proper-list NIL.
+#
+# Locals:
+#   pair  walk
+#   bv  (stable wrapper; reused across recursive calls)
+#   mode
+#   pad
+%fn2(write_pair_to_bv, {pair bv mode pad}, {
+    %stl(a0, pair)
+    %stl(a1, bv)
+    %stl(a2, mode)
+
+    %ldl(a0, bv)
+    %li(a1, 40)
+    %call(&str_putc)
+
+    :.loop
+    %ldl(t0, pair)
+    %car(a0, t0)
+    %ldl(a1, bv)
+    %ldl(a2, mode)
+    %call(&write_to_bv)
+
+    %ldl(t0, pair)
+    %cdr(t0, t0)
+    %stl(t0, pair)
+
+    %if_nil(t1, t0, &.done)
+    %tagof(t1, t0)
+    %li(t2, %TAG.PAIR)
+    %beq(t1, t2, &.cont)
+
+    # Dotted tail: emit ` . ` then write_to_bv(cdr).
+    %ldl(a0, bv)
+    %li(a1, 32)
+    %call(&str_putc)
+    %ldl(a0, bv)
+    %li(a1, 46)
+    %call(&str_putc)
+    %ldl(a0, bv)
+    %li(a1, 32)
+    %call(&str_putc)
+    %ldl(a0, pair)
+    %ldl(a1, bv)
+    %ldl(a2, mode)
+    %call(&write_to_bv)
+    %b(&.done)
+
+    :.cont
+    %ldl(a0, bv)
+    %li(a1, 32)
+    %call(&str_putc)
+    %b(&.loop)
+
+    :.done
+    %ldl(a0, bv)
+    %li(a1, 41)
+    %tail(&str_putc)
+})
+
+# value_to_bv(val=a0, mode=a1) -> bv (a0). Allocate an empty NUL-
+# terminated bv and delegate to write_to_bv; helper for display / write
+# / error / format. write_to_bv internally uses str_*, so the result
+# has cap > length and a trailing NUL -- safe to hand to syscalls or
+# runtime_error as a C string.
+
+%fn2(value_to_bv, {val mode}, {
+    %stl(a0, val)
+    %stl(a1, mode)
+    %li(a0, 0)
+    %call(&str_alloc)
+    %mov(a1, a0)
+    %ldl(a0, val)
+    %ldl(a2, mode)
+    %tail(&write_to_bv)
+})
+
+# (display val) and (write val): build the printed representation in a
+# fresh bv, sys_write the raw bytes to fd 1, return UNSPEC. Partial
+# writes are not retried -- libp1pp's wrapper streams its own buffer
+# but the kernel may chunk a giant single write; in practice
+# scheme1 outputs are short and we accept the simple path.
+%fn(prim_display_entry, 0, {
+    %car(a0, a0)
+    %li(a1, 0)
+    %call(&value_to_bv)
+    %heap_ld(a1, a0, %BV.data)
+    %heap_ld(a2, a0, %BV.hdr)
+    %shri(a2, a2, 8)
+    %li(a0, 1)
+    %call(&sys_write)
+    %li(a0, %imm_val(%IMM.UNSPEC))
+})
+
+%fn(prim_write_entry, 0, {
+    %car(a0, a0)
+    %li(a1, 1)
+    %call(&value_to_bv)
+    %heap_ld(a1, a0, %BV.data)
+    %heap_ld(a2, a0, %BV.hdr)
+    %shri(a2, a2, 8)
+    %li(a0, 1)
+    %call(&sys_write)
+    %li(a0, %imm_val(%IMM.UNSPEC))
+})
+
+# (error msg-bv irritant ...). Builds `scheme1: error: <msg> <irr> ...`
+# in a string-bv (irritants joined by single spaces, all rendered with
+# display semantics) and tails into runtime_error. str_alloc + str_*
+# guarantee cap > length and a trailing NUL, making the bv's data_ptr
+# a valid C string for panic's eprint_cstr.
+#
+# Locals:
+#   walk  (initially args; advances over irritants)
+#   bv
+%fn2(prim_error_entry, {walk bv}, {
+    %stl(a0, walk)
+
+    %li(a0, 0)
+    %call(&str_alloc)
+    %stl(a0, bv)
+
+    %la(a1, &str_error_prefix)
+    %li(a2, 16)
+    %ldl(a0, bv)
+    %call(&str_putn)
+
+    # First arg (the message) goes through write_to_bv with display mode.
+    %ldl(t0, walk)
+    %car(a0, t0)
+    %ldl(a1, bv)
+    %li(a2, 0)
+    %call(&write_to_bv)
+
+    %ldl(t0, walk)
+    %cdr(t0, t0)
+    %stl(t0, walk)
+
+    :.loop
+    %ldl(t0, walk)
+    %if_nil(t1, t0, &.done)
+
+    %ldl(a0, bv)
+    %li(a1, 32)
+    %call(&str_putc)
+
+    %ldl(t0, walk)
+    %car(a0, t0)
+    %ldl(a1, bv)
+    %li(a2, 0)
+    %call(&write_to_bv)
+
+    %ldl(t0, walk)
+    %cdr(t0, t0)
+    %stl(t0, walk)
+    %b(&.loop)
+
+    :.done
+    %ldl(t0, bv)
+    %heap_ld(a0, t0, %BV.data)
+    %tail(&runtime_error)
+})
+
+# (format template-bv arg ...). Walks the template bv byte by byte;
+# `~X` consumes the next byte as a directive: a (display), s (write),
+# d (decimal fixnum), x (lowercase hex fixnum, signed), % (newline),
+# ~ (literal tilde). Unknown specs pass through verbatim. Returns the
+# assembled bv; the caller decides how to consume it (e.g.
+# (display (format ...))).
+#
+# Locals:
+#   out  bv
+#   template  bv
+#   args  walk
+#   idx  (current byte offset into template)
+%fn2(prim_format_entry, {out template args idx}, {
+    %stl(a0, args)             ; spill incoming args while we set up
+
+    %li(a0, 0)
+    %call(&str_alloc)
+    %stl(a0, out)
+
+    %ldl(t0, args)
+    %car(t1, t0)
+    %stl(t1, template)
+    %cdr(t0, t0)
+    %stl(t0, args)
+
+    %li(t0, 0)
+    %stl(t0, idx)
+
+    :.loop
+    %ldl(t1, template)
+    %heap_ld(t2, t1, %BV.hdr)
+    %shri(t2, t2, 8)            ; template length
+    %ldl(t0, idx)
+    %beq(t0, t2, &.done)
+
+    %heap_ld(a3, t1, %BV.data)
+    %add(a3, a3, t0)
+    %lb(a3, a3, 0)               ; byte = template.data[idx]
+
+    %addi(t1, a3, -126)         ; '~'
+    %beqz(t1, &.tilde)
+
+    # Plain byte: emit and advance.
+    %ldl(a0, out)
+    %mov(a1, a3)
+    %call(&str_putc)
+    %ldl(t0, idx)
+    %addi(t0, t0, 1)
+    %stl(t0, idx)
+    %b(&.loop)
+
+    :.tilde
+    %ldl(t0, idx)
+    %addi(t0, t0, 1)
+    %ldl(t1, template)
+    %heap_ld(t2, t1, %BV.hdr)
+    %shri(t2, t2, 8)
+    %beq(t0, t2, &.tilde_lit)
+
+    %heap_ld(t1, t1, %BV.data)
+    %add(t1, t1, t0)
+    %lb(a3, t1, 0)               ; spec
+
+    %addi(t0, t0, 1)             ; advance past spec
+    %stl(t0, idx)
+
+    %addi(t1, a3, -97)          ; 'a'
+    %beqz(t1, &.spec_a)
+    %addi(t1, a3, -115)         ; 's'
+    %beqz(t1, &.spec_s)
+    %addi(t1, a3, -100)         ; 'd'
+    %beqz(t1, &.spec_d)
+    %addi(t1, a3, -120)         ; 'x'
+    %beqz(t1, &.spec_x)
+    %addi(t1, a3, -37)          ; '%'
+    %beqz(t1, &.spec_pct)
+    %addi(t1, a3, -126)         ; '~'
+    %beqz(t1, &.spec_tilde)
+
+    # Unknown directive: emit `~` then the spec byte verbatim. Re-read
+    # the spec byte from the template since str_putc may clobber a3.
+    %ldl(a0, out)
+    %li(a1, 126)
+    %call(&str_putc)
+    %ldl(t0, template)
+    %heap_ld(t1, t0, %BV.data)
+    %ldl(t0, idx)
+    %addi(t0, t0, -1)
+    %add(t1, t1, t0)
+    %lb(a1, t1, 0)
+    %ldl(a0, out)
+    %call(&str_putc)
+    %b(&.loop)
+
+    :.tilde_lit
+    # `~` at end of template: emit literal `~` and finish next iter.
+    %ldl(a0, out)
+    %li(a1, 126)
+    %call(&str_putc)
+    %ldl(t0, idx)
+    %addi(t0, t0, 1)
+    %stl(t0, idx)
+    %b(&.loop)
+
+    :.spec_a
+    %ldl(t0, args)
+    %car(a0, t0)
+    %cdr(t0, t0)
+    %stl(t0, args)
+    %ldl(a1, out)
+    %li(a2, 0)
+    %call(&write_to_bv)
+    %b(&.loop)
+
+    :.spec_s
+    %ldl(t0, args)
+    %car(a0, t0)
+    %cdr(t0, t0)
+    %stl(t0, args)
+    %ldl(a1, out)
+    %li(a2, 1)
+    %call(&write_to_bv)
+    %b(&.loop)
+
+    :.spec_d
+    %ldl(t0, args)
+    %car(t1, t0)
+    %cdr(t0, t0)
+    %stl(t0, args)
+    %sari(a1, t1, 3)
+    %ldl(a0, out)
+    %call(&str_putint)
+    %b(&.loop)
+
+    :.spec_x
+    %ldl(t0, args)
+    %car(t1, t0)
+    %cdr(t0, t0)
+    %stl(t0, args)
+    %sari(a1, t1, 3)
+    %ldl(a0, out)
+    %call(&str_puthex)
+    %b(&.loop)
+
+    :.spec_pct
+    %ldl(a0, out)
+    %li(a1, 10)
+    %call(&str_putc)
+    %b(&.loop)
+
+    :.spec_tilde
+    %ldl(a0, out)
+    %li(a1, 126)
+    %call(&str_putc)
+    %b(&.loop)
+
+    :.done
+    %ldl(a0, out)
+})
+
+# =========================================================================
+# Syscall primitives
+# =========================================================================
+#
+# Each syscall primitive untags the args list, calls a thin libp1pp- or
+# scheme1-local syscall wrapper, and routes the raw return through
+# wrap_syscall_result: r >= 0 -> (#t . r), r < 0 -> (#f . -r).
+#
+# Bytevector args (paths, buffers) are passed by their raw data_ptr (slot
+# +5 from the tagged wrapper). For syscalls that read data_ptr as a C
+# string (paths, argv elements), the caller must produce the bv via the
+# str_* family so cap > length and data[length] == 0. Callers that only
+# expose the bv as a (data_ptr, count) pair (sys-read, sys-write buffers)
+# can pass plain bytevectors -- no NUL needed.
+
+# wrap_syscall_result(raw=a0) -> (#t . r) or (#f . errno).
+
+%fn2(wrap_syscall_result, {raw pad}, {
+    %stl(a0, raw)
+    %bltz(a0, &.err)
+    %mkfix(a1, a0)
+    %li(a0, %imm_val(%IMM.TRUE))
+    %tail(&cons)
+
+    :.err
+    %ldl(t0, raw)
+    %li(t1, 0)
+    %sub(t0, t1, t0)
+    %mkfix(a1, t0)
+    %li(a0, %imm_val(%IMM.FALSE))
+    %tail(&cons)
+})
+
+# sys_openat(dirfd=a0, path=a1, flags=a2, mode=a3) -> r (a0). Leaf.
+:sys_openat
+    %mov(t0, a3)
+    %mov(a3, a2)
+    %mov(a2, a1)
+    %mov(a1, a0)
+    %li(a0, %p1_sys_openat)
+    %syscall
+    %ret
+
+# sys_clone() -> r (a0). Linux clone(SIGCHLD, 0, 0, 0, 0) -- fork-style.
+# Saves and restores s0 around the syscall because %p1_syscall reads s0
+# as the 5th OS-syscall argument.
+
+%fn2(sys_clone, {saved_s0 pad}, {
+    %stl(s0, saved_s0)
+    %li(s0, 0)
+
+    %li(a1, 17)
+    %li(a2, 0)
+    %li(a3, 0)
+    %li(t0, 0)
+    %li(a0, %p1_sys_clone)
+    %syscall
+
+    %ldl(s0, saved_s0)
+})
+
+# sys_execve(path=a0, argv=a1, envp=a2) -> -errno (a0). Only returns on
+# failure; on success the new image takes over.
+:sys_execve
+    %mov(a3, a2)
+    %mov(a2, a1)
+    %mov(a1, a0)
+    %li(a0, %p1_sys_execve)
+    %syscall
+    %ret
+
+# sys_spawn(path=a0, argv=a1) -> r (a0). Atomic clone+execve, single
+# syscall: kernel saves parent state, swaps user pool with no copy,
+# loads the ELF, builds the user stack, and erets into the child. The
+# parent's spawn() returns child_pid only after the child exit_groups.
+# Provided by the seed kernel (private syscall 1024). On Linux this
+# number is unmapped so the kernel returns -ENOSYS, which the prelude
+# uses to detect environment and fall back to sys_clone+sys_execve.
+:sys_spawn
+    %mov(a2, a1)
+    %mov(a1, a0)
+    %li(a0, %p1_sys_spawn)
+    %syscall
+    %ret
+
+# sys_waitid(idtype=a0, id=a1, infop=a2, options=a3) -> r (a0). Leaf.
+:sys_waitid
+    %mov(t0, a3)
+    %mov(a3, a2)
+    %mov(a2, a1)
+    %mov(a1, a0)
+    %li(a0, %p1_sys_waitid)
+    %syscall
+    %ret
+
+# build_execve_argv(list=a0) -> raw NULL-terminated array (a0).
+# Walks `list` (cons-list of bytevectors), allocates (count+1)*8 bytes,
+# writes each bv's data_ptr, terminates with NULL.
+#
+# Locals:
+#   list
+#   count
+#   array  ptr (raw)
+%fn2(build_execve_argv, {list count array}, {
+    %stl(a0, list)
+    %call(&list_length)     ; clobbers a0 -> count
+    %stl(a0, count)
+
+    %addi(a0, a0, 1)
+    %shli(a0, a0, 3)
+    %call(&alloc_bytes)
+    %stl(a0, array)
+
+    %ldl(t0, list)
+    %ldl(t1, array)
+
+    :.fill_loop
+    %if_nil(t2, t0, &.fill_done)
+    %car(a3, t0)
+    %heap_ld(a2, a3, %BV.data)
+    %st(a2, t1, 0)
+    %addi(t1, t1, 8)
+    %cdr(t0, t0)
+    %b(&.fill_loop)
+
+    :.fill_done
+    %li(t2, 0)
+    %st(t2, t1, 0)
+
+    %ldl(a0, array)
+})
+
+# (sys-read fd buf offset count). Passes (buf.data_ptr + offset) to the
+# kernel; offset lets callers read into the middle of a bv without first
+# slicing/copying.
+%fn(prim_sys_read_entry, 0, {
+    %args4(t0, t1, t2, a3, a0)
+    %sari(t0, t0, 3)        ; fd
+    %heap_ld(t1, t1, %BV.data)  ; buf data ptr
+    %sari(t2, t2, 3)        ; offset
+    %add(t1, t1, t2)        ; data_ptr + offset
+    %sari(t2, a3, 3)        ; count
+    %mov(a0, t0)
+    %mov(a1, t1)
+    %mov(a2, t2)
+    %call(&sys_read)
+    %tail(&wrap_syscall_result)
+})
+
+# (sys-write fd buf offset count). Passes (buf.data_ptr + offset) to the
+# kernel; offset lets callers retry the unwritten tail of a partial
+# write without bytevector-copy.
+%fn(prim_sys_write_entry, 0, {
+    %args4(t0, t1, t2, a3, a0)
+    %sari(t0, t0, 3)        ; fd
+    %heap_ld(t1, t1, %BV.data)  ; buf data ptr
+    %sari(t2, t2, 3)        ; offset
+    %add(t1, t1, t2)        ; data_ptr + offset
+    %sari(t2, a3, 3)        ; count
+    %mov(a0, t0)
+    %mov(a1, t1)
+    %mov(a2, t2)
+    %call(&sys_write)
+    %tail(&wrap_syscall_result)
+})
+
+# (sys-close fd)
+%fn(prim_sys_close_entry, 0, {
+    %car_fix(a0, a0)
+    %call(&sys_close)
+    %tail(&wrap_syscall_result)
+})
+
+# (sys-openat dirfd path flags mode)
+%fn(prim_sys_openat_entry, 0, {
+    %args4(t0, t1, t2, a3, a0)
+    %sari(t0, t0, 3)        ; dirfd
+    %heap_ld(t1, t1, %BV.data)  ; path data_ptr
+    %sari(t2, t2, 3)        ; flags
+    %sari(a3, a3, 3)        ; mode
+    %mov(a0, t0)
+    %mov(a1, t1)
+    %mov(a2, t2)
+    %call(&sys_openat)
+    %tail(&wrap_syscall_result)
+})
+
+# (sys-clone). Linux POSIX-style fork; only used as a fallback path on
+# Linux since the seed kernel doesn't implement clone (it offers
+# sys-spawn instead).
+%fn(prim_sys_clone_entry, 0, {
+    %call(&sys_clone)
+    %tail(&wrap_syscall_result)
+})
+
+# (sys-execve path argv-list)
+
+%fn2(prim_sys_execve_entry, {path pad}, {
+    %args2(t0, a0, a0)      ; t0 = path bv, a0 = argv-list
+    %stl(t0, path)
+    %call(&build_execve_argv)
+    %mov(a1, a0)
+    %ldl(a0, path)
+    %heap_ld(a0, a0, %BV.data)  ; path data ptr
+    %li(a2, 0)
+    %call(&sys_execve)
+    %tail(&wrap_syscall_result)
+})
+
+# (sys-spawn path argv-list). Same calling convention as sys-execve, but
+# wraps the seed kernel's atomic spawn syscall: returns (#t . child-pid)
+# after the child has exit_grouped (the kernel suspends the parent for
+# the lifetime of the child), or (#f . -errno) on failure (notably
+# -ENOSYS=38 on Linux, which the prelude probes for at init time).
+%fn2(prim_sys_spawn_entry, {path pad}, {
+    %args2(t0, a0, a0)      ; t0 = path bv, a0 = argv-list
+    %stl(t0, path)
+    %call(&build_execve_argv)
+    %mov(a1, a0)
+    %ldl(a0, path)
+    %heap_ld(a0, a0, %BV.data)  ; path data ptr
+    %call(&sys_spawn)
+    %tail(&wrap_syscall_result)
+})
+
+# (sys-waitid idtype id infop options)
+%fn(prim_sys_waitid_entry, 0, {
+    %args4(t0, t1, t2, a3, a0)
+    %sari(t0, t0, 3)        ; idtype
+    %sari(t1, t1, 3)        ; id
+    %heap_ld(t2, t2, %BV.data)  ; infop bv data ptr
+    %sari(a3, a3, 3)        ; options
+    %mov(a0, t0)
+    %mov(a1, t1)
+    %mov(a2, t2)
+    %call(&sys_waitid)
+    %tail(&wrap_syscall_result)
+})
+
+# (sys-argv) -> list of bytevectors. Walks saved_argv, strlen-ing each
+# NUL-terminated entry into a fresh bytevector and consing them in order
+# via the head/tail trick.
+#
+# Locals:
+#   argv  ptr (advancing 8 bytes per iteration)
+#   count  remaining (decrementing from saved_argc)
+#   head
+#   tail
+#   bv
+%fn2(prim_sys_argv_entry, {argv count head tail bv}, {
+    %ld_global(t0, &saved_argv)
+    %stl(t0, argv)
+    %ld_global(t0, &saved_argc)
+    %stl(t0, count)
+    %li(t0, %imm_val(%IMM.NIL))
+    %stl(t0, head)
+    %stl(t0, tail)
+
+    :.loop
+    %ldl(t0, count)
+    %beqz(t0, &.done)
+
+    # len = strlen(*argv)
+    %ldl(t0, argv)
+    %ld(a0, t0, 0)
+    %call(&libp1pp__strlen)
+
+    # bv = str_alloc(len). argv entries flow into syscalls (sys-openat,
+    # sys-execve) that read data_ptr as a C string, so the trailing NUL
+    # is required.
+    %call(&str_alloc)
+    %stl(a0, bv)
+
+    # memcpy(bv.data_ptr, *argv, len-from-bv-hdr).
+    %ldl(t0, bv)
+    %heap_ld(a0, t0, %BV.data)
+    %ldl(t1, argv)
+    %ld(a1, t1, 0)
+    %heap_ld(t1, t0, %BV.hdr)
+    %shri(a2, t1, 8)
+    %call(&memcpy)
+
+    # cell = cons(bv, NIL); append to list head/tail.
+    %ldl(a0, bv)
+    %li(a1, %imm_val(%IMM.NIL))
+    %call(&cons)
+
+    %ldl(t0, head)
+    %if_nil(t1, t0, &.first)
+    %ldl(t0, tail)
+    %set_cdr(a0, t0)
+    %stl(a0, tail)
+    %b(&.advance)
+
+    :.first
+    %stl(a0, head)
+    %stl(a0, tail)
+
+    :.advance
+    %ldl(t0, argv)
+    %addi(t0, t0, 8)
+    %stl(t0, argv)
+    %ldl(t0, count)
+    %addi(t0, t0, -1)
+    %stl(t0, count)
+    %b(&.loop)
+
+    :.done
+    %ldl(a0, head)
+})
+
+# (eof? x). The `eof` value itself is bound at startup in p1_main as a
+# direct global -> IMM.EOF, not via a primitive thunk.
+:prim_eofq_entry
+.scope
+    %car(t0, a0)
+    %li(t1, %imm_val(%IMM.EOF))
+    %li(a0, %imm_val(%IMM.FALSE))
+    %bne(t0, t1, &.end)
+    %li(a0, %imm_val(%IMM.TRUE))
+    :.end
+    %ret
+.endscope
+
+# (heap-usage) -> tagged fixnum: bytes consumed since heap_init
+# (heap_next - heap_buf_ptr). Used by cc to instrument per-phase
+# allocation cost. Args list ignored.
+:prim_heap_usage_entry
+    %ld_global(t0, &heap_next)
+    %ld_global(t1, &heap_buf_ptr)
+    %sub(a0, t0, t1)
+    %mkfix(a0, a0)
+    %ret
+
+# (heap-mark) -> tagged fixnum: absolute current_*_next pointer.
+# Capture before transient allocations; pass to (heap-rewind! m) to
+# discard everything allocated after the mark. UNSAFE: any pointer
+# referencing the rewound region becomes dangling. Caller must keep only
+# fixnums / symbols / pointers into surviving (pre-mark) heap across the
+# rewind. Operates on whichever heap is current; mark and rewind must
+# pair within the same heap context.
+:prim_heap_mark_entry
+    %ld_global(t0, &current_heap_next_ptr)
+    %ld(t0, t0, 0)
+    %mkfix(a0, t0)
+    %ret
+
+# (heap-rewind! mark) -> unspec. Restores current_*_next to mark.
+# UNSAFE: subsequent allocations overwrite the freed region; any
+# surviving reference into it is dangling. No bounds check -- caller
+# passes a value previously returned by (heap-mark) on the same heap.
+:prim_heap_rewind_bang_entry
+    %car(t0, a0)
+    %untag_fix(t0, t0)
+    %ld_global(t1, &current_heap_next_ptr)
+    %st(t0, t1, 0)
+    %li(a0, %imm_val(%IMM.UNSPEC))
+    %ret
+
+# (use-scratch-heap!) -> unspec. Repoints current_heap_*_ptr at the
+# scratch heap's next/end slots. Subsequent cons / alloc_hdr /
+# alloc_bytes bump scratch_next; alloc that would cross scratch_end
+# dies via heap_oom_die ("scratch exhausted").
+:prim_use_scratch_heap_bang_entry
+    %la(t0, &scratch_next)
+    %st_global(t0, &current_heap_next_ptr, t1)
+    %la(t0, &scratch_end)
+    %st_global(t0, &current_heap_end_ptr, t1)
+    %li(a0, %imm_val(%IMM.UNSPEC))
+    %ret
+
+# (use-main-heap!) -> unspec. Repoints current_heap_*_ptr at the main
+# heap's next/end slots. Default at heap_init.
+:prim_use_main_heap_bang_entry
+    %la(t0, &heap_next)
+    %st_global(t0, &current_heap_next_ptr, t1)
+    %la(t0, &heap_end)
+    %st_global(t0, &current_heap_end_ptr, t1)
+    %li(a0, %imm_val(%IMM.UNSPEC))
+    %ret
+
+# (reset-scratch-heap!) -> unspec. Resets scratch_next to the start of
+# the scratch arena (8-byte aligned). UNSAFE: any reference into scratch
+# becomes dangling. Caller is responsible for having promoted survivors
+# to main first.
+:prim_reset_scratch_heap_bang_entry
+    %ld_global(t0, &scratch_buf_ptr)
+    %alignup(t0, t0, 8, t1)
+    %st_global(t0, &scratch_next, t1)
+    %li(a0, %imm_val(%IMM.UNSPEC))
+    %ret
+
+# (heap-in-main? obj) -> bool. True iff obj's masked pointer falls
+# inside the main heap arena [heap_buf_ptr, heap_buf_ptr +
+# HEAP_CAP_BYTES). Used by promote walkers to skip already-promoted /
+# scratch-resident objects. Tag bits are masked off so callers can pass
+# tagged pointers directly. Non-pointer objects (fixnums, immediates,
+# small sym indices) yield false because their masked values are far
+# below heap_buf_ptr.
+:prim_heap_in_main_q_entry
+.scope
+    %car(t0, a0)
+    %li(t1, -8)
+    %and(t0, t0, t1)
+    %ld_global(t1, &heap_buf_ptr)
+    %bltu(t0, t1, &.false)
+    %li(t2, %HEAP_CAP_BYTES)
+    %add(t1, t1, t2)
+    %bltu(t0, t1, &.true)
+    :.false
+    %li(a0, %imm_val(%IMM.FALSE))
+    %ret
+    :.true
+    %li(a0, %imm_val(%IMM.TRUE))
+    %ret
+.endscope
+
+# (heap-in-current? obj) -> bool. True iff obj's masked pointer falls
+# inside whichever heap is currently selected (main or scratch).
+# Generalizes heap-in-main? -- the two agree when main is current, and
+# heap-in-current? returns #t for scratch-resident objects iff scratch
+# is current. Tag bits are masked off; non-pointer values yield #f.
+# Used by deep-copy as the "already in target arena" short-circuit.
+:prim_heap_in_current_q_entry
+.scope
+    %car(t0, a0)
+    %li(t1, -8)
+    %and(t0, t0, t1)
+    %ld_global(t1, &current_heap_next_ptr)
+    %la(t2, &heap_next)
+    %bne(t1, t2, &.scratch)
+    %ld_global(t1, &heap_buf_ptr)
+    %bltu(t0, t1, &.false)
+    %li(t2, %HEAP_CAP_BYTES)
+    %add(t1, t1, t2)
+    %bltu(t0, t1, &.true)
+    %b(&.false)
+    :.scratch
+    %ld_global(t1, &scratch_buf_ptr)
+    %bltu(t0, t1, &.false)
+    %li(t2, %SCRATCH_CAP_BYTES)
+    %add(t1, t1, t2)
+    %bltu(t0, t1, &.true)
+    :.false
+    %li(a0, %imm_val(%IMM.FALSE))
+    %ret
+    :.true
+    %li(a0, %imm_val(%IMM.TRUE))
+    %ret
+.endscope
+
+# Record introspection. Surfaces the unsafe %record-* helpers (heap
+# layout: [HDR.REC][td][f0..fN-1], field i at tagged + 13 + 8*i;
+# nfields lives at TD's offset 13 raw). All primitives below trust
+# their inputs -- no bounds check, no kind check on record-ref /
+# record-set! / record-td. Same unsafe-by-convention status as
+# heap-rewind! / reset-scratch-heap!. See docs/DEEP-COPY.md.
+
+# (record? obj) -> bool. True iff obj is HEAP-tagged with HDR.REC.
+:prim_recordq_entry
+.scope
+    %car(t0, a0)
+    %li(a0, %imm_val(%IMM.FALSE))
+    %tagof(t1, t0)
+    %li(t2, %TAG.HEAP)
+    %bne(t1, t2, &.end)
+    %hdr_type(t1, t0)
+    %li(t2, %HDR.REC)
+    %bne(t1, t2, &.end)
+    %li(a0, %imm_val(%IMM.TRUE))
+    :.end
+    %ret
+.endscope
+
+# (record-td rec) -> td. Reads the TD slot from the record header. No
+# kind check; caller is expected to gate with record? if needed.
+:prim_record_td_entry
+    %car(t0, a0)
+    %heap_ld(a0, t0, %REC.td)
+    %ret
+
+# (record-ref rec idx) -> field value. idx is a tagged fixnum; since
+# tagged_fixnum = raw_idx * 8 (fixnum tag bits are 0), the byte offset
+# is exactly idx + 13 from the tagged record pointer. No bounds check.
+:prim_record_ref_entry
+    %args2(t0, t1, a0)         ; t0=rec, t1=idx (tagged fixnum = raw*8)
+    %addi(t0, t0, 13)
+    %add(t0, t0, t1)
+    %ld(a0, t0, 0)
+    %ret
+
+# (record-set! rec idx val) -> unspec. In-place store at slot idx.
+:prim_record_set_bang_entry
+.scope
+    %car(t0, a0)               ; rec
+    %cdr(a0, a0)
+    %car(t1, a0)               ; idx (tagged fixnum)
+    %cdr(a0, a0)
+    %car(t2, a0)               ; val
+    %addi(t0, t0, 13)
+    %add(t0, t0, t1)
+    %st(t2, t0, 0)
+    %li(a0, %imm_val(%IMM.UNSPEC))
+    %ret
+.endscope
+
+# (make-record/td td) -> fresh record allocated in the current heap.
+# Reads td.nfields, allocates 16 + nfields*8 bytes with HDR.REC, sets
+# the td slot, and zero-fills field slots to IMM.UNSPEC. Mirrors
+# eval_define_record_type's ctor allocation but driven by the TD's
+# nfields rather than a runtime args list. Used by deep-copy as a
+# pre-fill stand-in before recursive slot promotion.
+#
+# Locals:
+#   td      (the TD pointer; saved across alloc_hdr)
+#   record  (the new record pointer)
+%fn2(prim_make_record_td_entry, {td record}, {
+    %car(t0, a0)               ; td
+    %stl(t0, td)
+
+    %heap_ld(a0, t0, %TD.nfields)  ; raw nfields
+    %shli(a0, a0, 3)               ; nfields * 8
+    %addi(a0, a0, 16)              ; + REC header (hdr + td slot)
+    %li(a1, %HDR.REC)
+    %call(&alloc_hdr)
+    %stl(a0, record)
+
+    %ldl(t0, td)
+    %heap_st(t0, a0, %REC.td)
+
+    # Zero-fill field slots to IMM.UNSPEC. Cursor starts at first slot
+    # (tagged + 13); count = nfields read again from the TD.
+    %heap_ld(t0, t0, %TD.nfields)
+    %addi(t1, a0, 13)
+    %li(t2, %imm_val(%IMM.UNSPEC))
+
+    :.fill_loop
+    %beqz(t0, &.fill_done)
+    %st(t2, t1, 0)
+    %addi(t1, t1, 8)
+    %addi(t0, t0, -1)
+    %b(&.fill_loop)
+
+    :.fill_done
+    %ldl(a0, record)
+})
+
+# (td-nfields td) -> tagged fixnum count of fields.
+:prim_td_nfields_entry
+    %car(t0, a0)
+    %heap_ld(a0, t0, %TD.nfields)  ; raw count
+    %mkfix(a0, a0)
+    %ret
+
+# (td-name td) -> symbol bound at define-record-type time.
+:prim_td_name_entry
+    %car(t0, a0)
+    %heap_ld(a0, t0, %TD.name)
+    %ret
+
+# Debug primitives. UNSAFE: peek-u8 dereferences arbitrary addresses.
+# Intended for diagnosing heap-layout bugs from scheme1 user code; not
+# part of the surface contract.
+
+# (tagged-value obj) -> fixnum. Returns the raw byte address of obj
+# with tag bits masked off, encoded as a tagged fixnum so format /
+# display can print it. Pass the result back into peek-u8 to read raw
+# bytes. For non-pointer values (fixnums, immediates, syms) the masked
+# value is small but still encodable; the result is meaningful only for
+# heap-tagged inputs.
+:prim_tagged_value_entry
+    %car(t0, a0)
+    %li(t1, -8)
+    %and(t0, t0, t1)
+    %mkfix(a0, t0)
+    %ret
+
+# (peek-u8 addr) -> fixnum. Reads one byte at the given raw byte
+# address (tagged fixnum input, untagged inside). UNSAFE: no bounds
+# check; a wild address segfaults the process.
+:prim_peek_u8_entry
+    %car(t0, a0)
+    %sari(t0, t0, 3)
+    %lb(a0, t0, 0)
+    %mkfix(a0, a0)
+    %ret
+
+# (current-heap-next) -> fixnum. Returns the current heap's bump
+# pointer (raw byte address) as a tagged fixnum. Used to inspect where
+# the next allocation will land.
+:prim_current_heap_next_entry
+    %ld_global(t0, &current_heap_next_ptr)
+    %ld(t0, t0, 0)
+    %mkfix(a0, t0)
+    %ret
+
+# heap_oom_die() -> never returns. Reached from cons / alloc_hdr /
+# alloc_bytes when current_*_next would pass current_*_end. Selects
+# msg_heap_full vs msg_scratch_full by comparing current_heap_next_ptr
+# against &heap_next, then tails into runtime_error via %die.
+:heap_oom_die
+.scope
+    %ld_global(t0, &current_heap_next_ptr)
+    %la(t1, &heap_next)
+    %beq(t0, t1, &.main)
+    %die(msg_scratch_full)
+    :.main
+    %die(msg_heap_full)
+.endscope
+
+# (values . xs) -- multiple-values producer. Single-arg case returns the
+# arg unchanged so (values x) is interchangeable with x in any 1-value
+# context; 0 or 2+ args materialize an MV-pack.
+:prim_values_entry
+.scope
+    %if_nil(t0, a0, &.pack)
+    %cdr(t0, a0)
+    %if_nil(t1, t0, &.single)
+    :.pack
+    %b(&list_to_mv)
+    :.single
+    %car(a0, a0)
+    %ret
+.endscope
+
+# (call-with-values producer consumer) -- apply producer to no args, then
+# normalize its result (via mv_to_list) and tail-apply the consumer to the
+# resulting argument list.
+#
+# Locals:
+#   consumer  (saved across apply(producer) and mv_to_list)
+%fn2(prim_call_with_values_entry, {consumer pad}, {
+    %args2(t0, t1, a0)              ; t0 = producer, t1 = consumer
+    %stl(t1, consumer)
+
+    %mov(a0, t0)
+    %li(a1, %imm_val(%IMM.NIL))
+    %call(&apply)
+
+    %call(&mv_to_list)
+
+    %mov(a1, a0)
+    %ldl(a0, consumer)
+    %tail(&apply)
+})
+
+# =========================================================================
+# Startup -- heap_init
+# =========================================================================
+
+# heap_init() -> none. Initializes the main heap (heap_next /
+# heap_end), the scratch heap (scratch_next / scratch_end), and points
+# current_heap_*_ptr at the main slots so cons / alloc_hdr /
+# alloc_bytes default to allocating in main. Both _next slots are
+# rounded up to 8-byte alignment so every PAIR/HEAP tag bit is exact;
+# &ELF_end's alignment depends on the data section above it. cons /
+# alloc_hdr / alloc_bytes test (*current_next + bytes <= *current_end)
+# on every allocation and abort via runtime_error on overflow. Leaf.
+:heap_init
+    %ld_global(t0, &heap_buf_ptr)
+    %alignup(t0, t0, 8, t1)
+    %st_global(t0, &heap_next, t1)
+
+    %ld_global(t0, &heap_buf_ptr)
+    %li(t1, %HEAP_CAP_BYTES)
+    %add(t0, t0, t1)
+    %st_global(t0, &heap_end, t1)
+
+    %ld_global(t0, &scratch_buf_ptr)
+    %alignup(t0, t0, 8, t1)
+    %st_global(t0, &scratch_next, t1)
+
+    %ld_global(t0, &scratch_buf_ptr)
+    %li(t1, %SCRATCH_CAP_BYTES)
+    %add(t0, t0, t1)
+    %st_global(t0, &scratch_end, t1)
+
+    %la(t0, &heap_next)
+    %st_global(t0, &current_heap_next_ptr, t1)
+    %la(t0, &heap_end)
+    %st_global(t0, &current_heap_end_ptr, t1)
+
+    %ret
+
+# Sentinel: marks the boundary between executable text and rodata.
+# Read by scripts/disasm-elf.sh (via scripts/m1-symbols.py) to bound
+# disassembly so trailing strings don't decode as bogus instructions.
+:_text_end
+
+.align 8
+
+# Primitive surface names.
+:name_sys_exit    %cstr8("sys-exit")
+:name_cons        %cstr8("cons")
+:name_car         %cstr8("car")
+:name_cdr         %cstr8("cdr")
+:name_nullq       %cstr8("null?")
+:name_pairq       %cstr8("pair?")
+:name_stringq     %cstr8("string?")
+:name_set_car     %cstr8("set-car!")
+:name_set_cdr     %cstr8("set-cdr!")
+:name_length      %cstr8("length")
+:name_list_ref    %cstr8("list-ref")
+:name_assq        %cstr8("assq")
+:name_assoc       %cstr8("assoc")
+:name_reverse     %cstr8("reverse")
+:name_str_to_sym  %cstr8("string->symbol")
+:name_sym_to_str  %cstr8("symbol->string")
+:name_num_to_str  %cstr8("number->string")
+:name_str_to_num  %cstr8("string->number")
+:name_bv_append   %cstr8("bytevector-append")
+:name_booleanq    %cstr8("boolean?")
+:name_integerq    %cstr8("integer?")
+:name_symbolq     %cstr8("symbol?")
+:name_procedureq  %cstr8("procedure?")
+:name_zeroq       %cstr8("zero?")
+:name_not         %cstr8("not")
+:name_eqq         %cstr8("eq?")
+:name_equal       %cstr8("equal?")
+:name_plus        %cstr8("+")
+:name_minus       %cstr8("-")
+:name_mult        %cstr8("*")
+:name_eq          %cstr8("=")
+:name_lt          %cstr8("<")
+:name_gt          %cstr8(">")
+:name_quotient    %cstr8("quotient")
+:name_remainder   %cstr8("remainder")
+:name_bit_and     %cstr8("bit-and")
+:name_bit_or      %cstr8("bit-or")
+:name_bit_xor     %cstr8("bit-xor")
+:name_bit_not     %cstr8("bit-not")
+:name_arith_shift %cstr8("arithmetic-shift")
+:name_apply       %cstr8("apply")
+:name_make_bv     %cstr8("make-bytevector")
+:name_bv_length   %cstr8("bytevector-length")
+:name_string_length %cstr8("string-length")
+:name_bv_u8_ref   %cstr8("bytevector-u8-ref")
+:name_bv_u8_set   %cstr8("bytevector-u8-set!")
+:name_bv_copy     %cstr8("bytevector-copy")
+:name_bv_copy_b   %cstr8("bytevector-copy!")
+:name_bv_eq       %cstr8("bytevector=?")
+
+:name_sys_read    %cstr8("sys-read")
+:name_sys_write   %cstr8("sys-write")
+:name_sys_close   %cstr8("sys-close")
+:name_sys_openat  %cstr8("sys-openat")
+:name_sys_clone   %cstr8("sys-clone")
+:name_sys_execve  %cstr8("sys-execve")
+:name_sys_spawn   %cstr8("sys-spawn")
+:name_sys_waitid  %cstr8("sys-waitid")
+:name_sys_argv    %cstr8("sys-argv")
+:name_eof         %cstr8("eof")
+:name_eofq        %cstr8("eof?")
+:name_values      %cstr8("values")
+:name_call_with_values %cstr8("call-with-values")
+:name_display     %cstr8("display")
+:name_write       %cstr8("write")
+:name_error       %cstr8("error")
+:name_format      %cstr8("format")
+:name_heap_mark   %cstr8("heap-mark")
+:name_heap_rewind_bang %cstr8("heap-rewind!")
+:name_heap_usage  %cstr8("heap-usage")
+:name_use_scratch_heap_bang %cstr8("use-scratch-heap!")
+:name_use_main_heap_bang    %cstr8("use-main-heap!")
+:name_reset_scratch_heap_bang %cstr8("reset-scratch-heap!")
+:name_heap_in_main_q        %cstr8("heap-in-main?")
+:name_heap_in_current_q     %cstr8("heap-in-current?")
+:name_recordq               %cstr8("record?")
+:name_record_td             %cstr8("record-td")
+:name_record_ref            %cstr8("record-ref")
+:name_record_set_bang       %cstr8("record-set!")
+:name_make_record_td        %cstr8("make-record/td")
+:name_td_nfields            %cstr8("td-nfields")
+:name_td_name               %cstr8("td-name")
+:name_tagged_value          %cstr8("tagged-value")
+:name_peek_u8               %cstr8("peek-u8")
+:name_current_heap_next     %cstr8("current-heap-next")
+
+# Writer string constants. Lengths are hard-coded at the str_putn call
+# sites (write_to_bv branches). They are emitted through cstr8 so the
+# labels remain aligned and are also safe as C strings if reused later.
+:str_false        %cstr8("#f")
+:str_true         %cstr8("#t")
+:str_nil          %cstr8("()")
+:str_unspec       %cstr8("#!unspec")
+:str_unbound      %cstr8("#!unbound")
+:str_eof          %cstr8("#!eof")
+:str_closure      %cstr8("#<closure>")
+:str_prim         %cstr8("#<prim>")
+:str_td           %cstr8("#<rec-type>")
+:str_rec          %cstr8("#<record>")
+:str_unknown      %cstr8("#<unknown>")
+:str_error_prefix %cstr8("scheme1: error: ")
+
+# Primitive registration table. Each entry: 8-byte name_ptr (4-byte label
+# ref + 4 pad), 8-byte name_len, 8-byte entry_label (4 ref + 4 pad).
+:prim_table
+&name_sys_exit    %(0)  $(8)   &prim_sys_exit_entry     %(0)
+&name_cons        %(0)  $(4)   &prim_cons_entry         %(0)
+&name_car         %(0)  $(3)   &prim_car_entry          %(0)
+&name_cdr         %(0)  $(3)   &prim_cdr_entry          %(0)
+&name_nullq       %(0)  $(5)   &prim_nullq_entry        %(0)
+&name_pairq       %(0)  $(5)   &prim_pairq_entry        %(0)
+&name_stringq     %(0)  $(7)   &prim_stringq_entry      %(0)
+&name_set_car     %(0)  $(8)   &prim_set_car_entry      %(0)
+&name_set_cdr     %(0)  $(8)   &prim_set_cdr_entry      %(0)
+&name_length      %(0)  $(6)   &prim_length_entry       %(0)
+&name_list_ref    %(0)  $(8)   &prim_list_ref_entry     %(0)
+&name_assq        %(0)  $(4)   &prim_assq_entry         %(0)
+&name_assoc       %(0)  $(5)   &prim_assoc_entry        %(0)
+&name_reverse     %(0)  $(7)   &prim_reverse_entry      %(0)
+&name_str_to_sym  %(0)  $(14)  &prim_string_to_symbol_entry %(0)
+&name_sym_to_str  %(0)  $(14)  &prim_symbol_to_string_entry %(0)
+&name_num_to_str  %(0)  $(14)  &prim_number_to_string_entry %(0)
+&name_str_to_num  %(0)  $(14)  &prim_string_to_number_entry %(0)
+&name_bv_append   %(0)  $(17)  &prim_bv_append_entry    %(0)
+&name_booleanq    %(0)  $(8)   &prim_booleanq_entry     %(0)
+&name_integerq    %(0)  $(8)   &prim_integerq_entry     %(0)
+&name_symbolq     %(0)  $(7)   &prim_symbolq_entry      %(0)
+&name_procedureq  %(0)  $(10)  &prim_procedureq_entry   %(0)
+&name_zeroq       %(0)  $(5)   &prim_zeroq_entry        %(0)
+&name_not         %(0)  $(3)   &prim_not_entry          %(0)
+&name_eqq         %(0)  $(3)   &prim_eqq_entry          %(0)
+&name_equal       %(0)  $(6)   &prim_equal_entry        %(0)
+&name_plus        %(0)  $(1)   &prim_plus_entry         %(0)
+&name_minus       %(0)  $(1)   &prim_minus_entry        %(0)
+&name_mult        %(0)  $(1)   &prim_mult_entry         %(0)
+&name_eq          %(0)  $(1)   &prim_eq_entry           %(0)
+&name_lt          %(0)  $(1)   &prim_lt_entry           %(0)
+&name_gt          %(0)  $(1)   &prim_gt_entry           %(0)
+&name_quotient    %(0)  $(8)   &prim_quotient_entry     %(0)
+&name_remainder   %(0)  $(9)   &prim_remainder_entry    %(0)
+&name_bit_and     %(0)  $(7)   &prim_bit_and_entry      %(0)
+&name_bit_or      %(0)  $(6)   &prim_bit_or_entry       %(0)
+&name_bit_xor     %(0)  $(7)   &prim_bit_xor_entry      %(0)
+&name_bit_not     %(0)  $(7)   &prim_bit_not_entry      %(0)
+&name_arith_shift %(0)  $(16)  &prim_arith_shift_entry  %(0)
+&name_apply       %(0)  $(5)   &prim_apply_entry        %(0)
+&name_make_bv     %(0)  $(15)  &prim_make_bytevector_entry %(0)
+&name_bv_length   %(0)  $(17)  &prim_bv_length_entry    %(0)
+&name_string_length %(0) $(13) &prim_string_length_entry %(0)
+&name_bv_u8_ref   %(0)  $(17)  &prim_bv_u8_ref_entry    %(0)
+&name_bv_u8_set   %(0)  $(18)  &prim_bv_u8_set_entry    %(0)
+&name_bv_copy     %(0)  $(15)  &prim_bv_copy_entry      %(0)
+&name_bv_copy_b   %(0)  $(16)  &prim_bv_copy_bang_entry %(0)
+&name_bv_eq       %(0)  $(12)  &prim_bytevector_eq_entry %(0)
+&name_sys_read    %(0)  $(8)   &prim_sys_read_entry     %(0)
+&name_sys_write   %(0)  $(9)   &prim_sys_write_entry    %(0)
+&name_sys_close   %(0)  $(9)   &prim_sys_close_entry    %(0)
+&name_sys_openat  %(0)  $(10)  &prim_sys_openat_entry   %(0)
+&name_sys_clone   %(0)  $(9)   &prim_sys_clone_entry    %(0)
+&name_sys_execve  %(0)  $(10)  &prim_sys_execve_entry   %(0)
+&name_sys_spawn   %(0)  $(9)   &prim_sys_spawn_entry    %(0)
+&name_sys_waitid  %(0)  $(10)  &prim_sys_waitid_entry   %(0)
+&name_sys_argv    %(0)  $(8)   &prim_sys_argv_entry     %(0)
+&name_eofq        %(0)  $(4)   &prim_eofq_entry         %(0)
+&name_display     %(0)  $(7)   &prim_display_entry      %(0)
+&name_write       %(0)  $(5)   &prim_write_entry        %(0)
+&name_error       %(0)  $(5)   &prim_error_entry        %(0)
+&name_format      %(0)  $(6)   &prim_format_entry       %(0)
+&name_heap_usage  %(0)  $(10)  &prim_heap_usage_entry   %(0)
+&name_heap_mark   %(0)  $(9)   &prim_heap_mark_entry    %(0)
+&name_heap_rewind_bang %(0) $(12) &prim_heap_rewind_bang_entry %(0)
+&name_use_scratch_heap_bang %(0) $(17) &prim_use_scratch_heap_bang_entry %(0)
+&name_use_main_heap_bang    %(0) $(14) &prim_use_main_heap_bang_entry %(0)
+&name_reset_scratch_heap_bang %(0) $(19) &prim_reset_scratch_heap_bang_entry %(0)
+&name_heap_in_main_q %(0) $(13) &prim_heap_in_main_q_entry %(0)
+&name_heap_in_current_q %(0) $(16) &prim_heap_in_current_q_entry %(0)
+&name_recordq         %(0) $(7)  &prim_recordq_entry         %(0)
+&name_record_td       %(0) $(9)  &prim_record_td_entry       %(0)
+&name_record_ref      %(0) $(10) &prim_record_ref_entry      %(0)
+&name_record_set_bang %(0) $(11) &prim_record_set_bang_entry %(0)
+&name_make_record_td  %(0) $(14) &prim_make_record_td_entry  %(0)
+&name_td_nfields      %(0) $(10) &prim_td_nfields_entry      %(0)
+&name_td_name         %(0) $(7)  &prim_td_name_entry         %(0)
+&name_tagged_value    %(0) $(12) &prim_tagged_value_entry    %(0)
+&name_peek_u8         %(0) $(7)  &prim_peek_u8_entry         %(0)
+&name_current_heap_next %(0) $(17) &prim_current_heap_next_entry %(0)
+&name_values      %(0)  $(6)   &prim_values_entry       %(0)
+&name_call_with_values %(0) $(16) &prim_call_with_values_entry %(0)
+:prim_table_end
+
+;; Error messages are NUL-terminated C strings. The embedded newline
+;; keeps the old stderr formatting; runtime_error's panic path appends
+;; another newline, which shell command substitution trims in tests.
+:msg_usage          %cstr8("scheme1: usage: scheme1 SOURCE.scm\n")
+:msg_load_fail      %cstr8("scheme1: failed to read source\n")
+:msg_symtab_full    %cstr8("scheme1: symbol table full\n")
+:msg_unexp_rparen   %cstr8("scheme1: unexpected ')'\n")
+:msg_bad_hash       %cstr8("scheme1: bad #-syntax\n")
+:msg_unexp_eof      %cstr8("scheme1: unexpected EOF in form\n")
+:msg_unterm_list    %cstr8("scheme1: unterminated list\n")
+:msg_unbound        %cstr8("scheme1: unbound variable\n")
+:msg_not_proc       %cstr8("scheme1: not a procedure\n")
+:msg_heap_full      %cstr8("scheme1: heap exhausted\n")
+:msg_scratch_full   %cstr8("scheme1: scratch exhausted\n")
+:msg_readbuf_full   %cstr8("scheme1: source buffer overflow\n")
+:msg_bv_oob         %cstr8("scheme1: bytevector index out of range\n")
+:msg_unterm_string  %cstr8("scheme1: unterminated string literal\n")
+:msg_bad_escape     %cstr8("scheme1: bad string escape\n")
+:msg_bad_char       %cstr8("scheme1: bad #\\ character literal\n")
+:msg_bad_number     %cstr8("scheme1: bad number literal\n")
+:msg_bad_ident      %cstr8("scheme1: bad identifier\n")
+:msg_internal_define %cstr8("scheme1: internal define is not supported\n")
+:msg_pmatch_no_match %cstr8("scheme1: pmatch: no clause matched\n")
+:msg_bad_unquote_pattern %cstr8("scheme1: pmatch: malformed ,-pattern\n")
+
+:name_ch_tab      %cstr8("tab")
+:name_ch_null     %cstr8("null")
+:name_ch_space    %cstr8("space")
+:name_ch_return   %cstr8("return")
+:name_ch_newline  %cstr8("newline")
+
+# =========================================================================
+# BSS arena table
+# =========================================================================
+#
+# (slot, size) rows for libp1pp's init_arenas, walked once at startup.
+# init_arenas threads a running offset, so each arena starts where the
+# previous one ended.
+:arena_table
+%arena_entry(&readbuf_buf_ptr, %READBUF_CAP_BYTES)
+%arena_entry(&symtab_buf_ptr,  (* %SYMTAB_CAP_SLOTS %SYMENT.SIZE))
+%arena_entry(&heap_buf_ptr,    %HEAP_CAP_BYTES)
+%arena_entry(&scratch_buf_ptr, %SCRATCH_CAP_BYTES)
+:arena_table_end
+
+# =========================================================================
+# Scalar BSS (file-resident, zero-initialized)
+# =========================================================================
+
+# heap_next: bump pointer; written once by p1_main, then by cons/alloc_hdr.
+:heap_next        $(0)
+
+# heap_end: one byte past the last valid heap address (= heap_buf_ptr +
+# HEAP_CAP_BYTES). Read on every allocation.
+:heap_end         $(0)
+
+# scratch_next / scratch_end: bump pointer and limit for the scratch
+# heap (= scratch_buf_ptr .. + SCRATCH_CAP_BYTES). Selected via
+# (use-scratch-heap!); reset to scratch_buf_ptr by
+# (reset-scratch-heap!).
+:scratch_next     $(0)
+:scratch_end      $(0)
+
+# current_heap_next_ptr / current_heap_end_ptr: pointer-of-pointer
+# slots holding either &heap_next/&heap_end or
+# &scratch_next/&scratch_end. cons / alloc_hdr / alloc_bytes /
+# heap-mark / heap-rewind! double-deref through these slots so the
+# heap selection is a single store of two addresses.
+:current_heap_next_ptr $(0)
+:current_heap_end_ptr  $(0)
+
+# Source-buffer cursor and slurped length.
+:readbuf_pos      $(0)
+:readbuf_len      $(0)
+
+# Symbol table count (number of entries used).
+:symtab_count     $(0)
+
+# Cached tagged-symbol values for special forms (filled by
+# intern_special_forms at startup).
+:sym_quote        $(0)
+:sym_if           $(0)
+:sym_lambda       $(0)
+:sym_define       $(0)
+:sym_begin        $(0)
+:sym_cond         $(0)
+:sym_else         $(0)
+:sym_arrow        $(0)
+:sym_let          $(0)
+:sym_letstar      $(0)
+:sym_let_values   $(0)
+:sym_letstar_values $(0)
+:sym_and          $(0)
+:sym_or           $(0)
+:sym_when         $(0)
+:sym_case         $(0)
+:sym_setbang     $(0)
+:sym_define_record_type $(0)
+:sym_pmatch       $(0)
+:sym_do           $(0)
+:sym_unquote      $(0)
+:sym_guard        $(0)
+:sym_underscore   $(0)
+:sym_dollar       $(0)
+
+# Process startup state, captured by p1_main and read by sys-argv.
+:saved_argc       $(0)
+:saved_argv       $(0)
+
+# Scratch buffer for bv_putint / str_putint -> fmt_dec. fmt_dec writes
+# at most 20 bytes for a 64-bit signed integer; 24 bytes (three words)
+# is comfortable room and keeps following slots word-aligned.
+:writer_num_buf   $(0) $(0) $(0)
+
+# Pointer slots for the past-:ELF_end arenas.
+:readbuf_buf_ptr  $(0)
+:heap_buf_ptr     $(0)
+:symtab_buf_ptr   $(0)
+:scratch_buf_ptr  $(0)
+
+:ELF_end

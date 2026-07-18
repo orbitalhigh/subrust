@@ -1,0 +1,649 @@
+# SPDX-FileCopyrightText: © 2017 Jeremiah Orians
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+	# Register usage:
+	# EAX, EDX, ECX, EBX => Temps
+	# EDI => IP
+	# EBP => MALLOC
+	# ESI => HEAD
+
+	# Struct format: (size 24)
+	# NEXT => 0
+	# TARGET => 8
+	# NAME => 16
+
+DEFINE add_ebp, 83C5
+DEFINE add_ebx, 83C3
+DEFINE add_ecx, 83C1
+DEFINE add_edi, 83C7
+DEFINE add_edx, 83C2
+DEFINE addd_ebx, 81C3
+DEFINE add_eax,[DWORD] 0305
+DEFINE call E8
+DEFINE cmp_al,bl 38D8
+DEFINE cmp_al, 3C
+DEFINE cmp_eax, 83F8
+DEFINE cmp_ebx, 83FB
+DEFINE cmp_ecx, 83F9
+DEFINE cmp_esi, 83FE
+DEFINE int CD
+DEFINE je 0F84
+DEFINE jg 0F8F
+DEFINE jl 0F8C
+DEFINE jmp E9
+DEFINE jne 0F85
+DEFINE mov_eax, B8
+DEFINE mov_ebx, BB
+DEFINE mov_ecx, B9
+DEFINE mov_edi, BF
+DEFINE mov_edx, BA
+DEFINE mov_esi, BE
+DEFINE mov_eax,ebp 89E8
+DEFINE mov_ebp,eax 89C5
+DEFINE mov_ebp,ebx 89DD
+DEFINE mov_ebx,eax 89C3
+DEFINE mov_ebx,ebp 89EB
+DEFINE mov_edx,eax 89C2
+DEFINE mov_edx,edi 89FA
+DEFINE mov_esi,eax 89C6
+DEFINE mov_al,[ecx] 8A01
+DEFINE mov_bl,[edx] 8A1A
+DEFINE mov_ecx,[ebx] 8B0B
+DEFINE mov_esi,[esi] 8B36
+DEFINE mov_[eax],esi 8930
+DEFINE mov_[ebx],al 8803
+DEFINE mov_[ebx],ecx 890B
+DEFINE mov_[DWORD],al A2
+DEFINE mov_[DWORD],eax A3
+DEFINE mov_al,[DWORD] A0
+DEFINE mov_eax,[DWORD] A1
+DEFINE mov_ebx,[DWORD] 8B1D
+DEFINE mov_[eax+BYTE],edi 8978
+DEFINE mov_[esi+BYTE],ebp 896E
+DEFINE mov_eax,[esi+BYTE] 8B46
+DEFINE mov_edx,[esi+BYTE] 8B56
+DEFINE movzx_eax,al 0FB6C0
+DEFINE movzx_ebx,bl 0FB6DB
+DEFINE not_eax F7D0
+DEFINE pop_eax 58
+DEFINE pop_ebx 5B
+DEFINE pop_ecx 59
+DEFINE pop_edi 5F
+DEFINE pop_edx 5A
+DEFINE pop_esi 5E
+DEFINE push_eax 50
+DEFINE push_ebx 53
+DEFINE push_ecx 51
+DEFINE push_edi 57
+DEFINE push_edx 52
+DEFINE push_esi 56
+DEFINE ret C3
+DEFINE shl_eax, C1E0
+DEFINE sub_eax, 83E8
+DEFINE sub_eax,edx 29D0
+DEFINE test_eax,eax 85C0
+
+# Where the ELF Header is going to hit
+# Simply jump to _start
+# Our main function
+
+:_start
+	mov_ebx, %0                 # Get current pointer
+	call %malloc                # Get current HEAP
+	mov_ebx,eax                 # Using current
+	mov_ebp,eax                 # Setup MALLOC
+	addd_ebx, %12582912         # Create space for temp [12M]
+	call %malloc                # Give ourselves 8192000 bytes to work with
+
+	pop_eax                     # Get the number of arguments
+	pop_ebx                     # Get the program name
+	pop_ebx                     # Get the actual input name
+	mov_ecx, %0                 # prepare read_only
+	mov_edx, %0                 # Really sure
+	mov_eax, %5                 # the syscall number for open()
+	int !0x80                   # Now open that damn file
+	mov_[DWORD],eax &Input      # Preserve the file pointer we were given
+
+	pop_ebx                     # Get the actual output name
+	mov_ecx, %577               # Prepare file as O_WRONLY|O_CREAT|O_TRUNC
+	mov_edx, %448               # Prepare file as RWX for owner only (700 in octal)
+	mov_eax, %5                 # the syscall number for open()
+	int !0x80                   # Now open that damn file
+	cmp_eax, !0                 # Check for missing output
+	jg %_start_out              # Have real input
+	mov_eax, %1                 # Use stdout
+
+:_start_out
+	mov_[DWORD],eax &Output     # Preserve the file pointer we were given
+
+	call %ClearScratch          # Zero scratch
+	mov_eax, %-1                # Our flag for byte processing
+	mov_[DWORD],eax &Flag       # Set
+	mov_eax, %0                 # temp storage for the sum
+	mov_[DWORD],eax &High       # Set
+	mov_edi, %0x8048000         # Our starting IP
+	mov_esi, %0                 # HEAD = NULL
+	call %First_pass            # Process it
+
+	# rewind input file
+	mov_ebx,[DWORD] &Input      # Using our input file
+	mov_ecx, %0                 # Offset Zero
+	mov_edx, %0                 # Whence Zero
+	mov_eax, %19                # lseek
+	push_esi                    # Protect HEAD
+	int !0x80
+	pop_esi                     # Restore HEAD
+
+	mov_eax, %-1                # Our flag for byte processing
+	mov_[DWORD],eax &Flag       # Set
+	mov_eax, %0                 # temp storage for the sum
+	mov_[DWORD],eax &High       # Set
+	mov_edi, %0x8048000         # Our starting IP
+	call %Second_pass           # Process it
+
+	jmp %Done
+
+:First_pass
+	call %Read_byte
+
+	# Deal with EOF
+	cmp_eax, !-4
+	je %First_pass_done
+
+	# Check for :
+	cmp_eax, !0x3A
+	jne %First_pass_0
+
+	# Deal with label
+	jmp %StoreLabel
+
+:First_pass_0
+	# Check for !
+	cmp_eax, !0x21
+	je %First_pass_pointer
+
+	# Check for @
+	cmp_eax, !0x40
+	je %First_pass_pointer
+
+	# Check for $
+	cmp_eax, !0x24
+	je %First_pass_pointer
+
+	# Check for %
+	cmp_eax, !0x25
+	je %First_pass_pointer
+
+	# Check for &
+	cmp_eax, !0x26
+	je %First_pass_pointer
+
+	# Deal with everything else
+	call %hex                   # Process our char
+
+	# Deal with EOF
+	cmp_eax, !-4
+	je %First_pass_done
+
+	# deal with -1 values
+	cmp_eax, !0
+	jl %First_pass
+
+	# deal with toggle
+	mov_eax,[DWORD] &Flag
+	cmp_eax, !0
+	je %First_pass_1
+	add_edi, !1                 # Increment IP
+
+:First_pass_1
+	not_eax
+	mov_[DWORD],eax &Flag
+	jmp %First_pass
+
+:Update_Pointer
+	# Check for !
+	cmp_eax, !0x21
+	je %Update_Pointer_1
+
+	# Check for @
+	cmp_eax, !0x40
+	je %Update_Pointer_2
+
+	# Check for $
+	cmp_eax, !0x24
+	je %Update_Pointer_2
+
+	# Check for %
+	cmp_eax, !0x25
+	je %Update_Pointer_4
+
+	# Check for &
+	cmp_eax, !0x26
+	je %Update_Pointer_4
+
+	# deal with bad input
+	call %fail
+
+:Update_Pointer_4
+	add_edi, !2                 # Increment IP
+:Update_Pointer_2
+	add_edi, !1                 # Increment IP
+:Update_Pointer_1
+	add_edi, !1                 # Increment IP
+	ret
+
+:First_pass_pointer
+	# Deal with Pointer to label
+	call %Update_Pointer        # Increment IP
+	mov_ebx, &table             # Using scratch
+	call %consume_token         # Read token
+	call %ClearScratch          # Throw away token
+	cmp_eax, !0x3E              # check for '>'
+	jne %First_pass             # Loop again
+
+	# Deal with %label>label case
+	mov_ebx, &table             # Write to scratch
+	call %consume_token         # get token
+	call %ClearScratch          # Clean up after ourselves
+	jmp %First_pass             # Loop again
+
+:First_pass_done
+	ret
+
+:hex
+	# deal with EOF
+	cmp_eax, !-4
+	je %EOF
+	# deal with line comments starting with #
+	cmp_eax, !0x23
+	je %ascii_comment
+	# deal with line comments starting with ;
+	cmp_eax, !0x3B
+	je %ascii_comment
+	# deal all ascii less than 0
+	cmp_eax, !0x30
+	jl %ascii_other
+	# deal with 0-9
+	cmp_eax, !0x3A
+	jl %ascii_num
+	# deal with all ascii less than A
+	cmp_eax, !0x41
+	jl %ascii_other
+	# deal with A-F
+	cmp_eax, !0x47
+	jl %ascii_high
+	# deal with all ascii less than a
+	cmp_eax, !0x61
+	jl %ascii_other
+	# deal with a-f
+	cmp_eax, !0x67
+	jl %ascii_low
+	# The rest that remains needs to be ignored
+	jmp %ascii_other
+
+:Second_pass
+	call %Read_byte
+
+	# Deal with EOF
+	cmp_eax, !-4
+	je %Second_pass_done
+
+	# Simply drop the label
+	cmp_eax, !0x3A
+	jne %Second_pass_0
+
+	mov_ebx, &table             # Using scratch
+	call %consume_token         # Read token
+	call %ClearScratch          # Throw away token
+
+	jmp %Second_pass
+
+:Second_pass_0
+	# Deal with % pointer
+	cmp_eax, !0x25
+	je %StorePointer_rel4
+
+	# Deal with @ pointer
+	cmp_eax, !0x40
+	je %StorePointer_rel2
+
+	# Deal with ! pointer
+	cmp_eax, !0x21
+	je %StorePointer_rel1
+
+	# Deal with & pointer
+	cmp_eax, !0x26
+	je %StorePointer_abs4
+
+	# Deal with $ pointer
+	cmp_eax, !0x24
+	je %StorePointer_abs2
+
+:Second_pass_1
+	# Deal with everything else
+	call %hex                   # Process our char
+
+	# Deal with EOF
+	cmp_eax, !-4
+	je %Second_pass_done
+
+	# deal with -1 values
+	cmp_eax, !0
+	jl %Second_pass
+
+	# deal with toggle
+	mov_ebx,[DWORD] &Flag
+	cmp_ebx, !0
+	je %print
+
+	# process first byte of pair
+	shl_eax, !4
+	mov_[DWORD],eax &High
+	mov_eax, %0
+	mov_[DWORD],eax &Flag
+	jmp %Second_pass
+
+:Second_pass_done
+:EOF
+	ret
+:ascii_num
+	sub_eax, !0x30
+	ret
+:ascii_low
+	sub_eax, !0x57
+	ret
+:ascii_high
+	sub_eax, !0x37
+	ret
+:ascii_other
+	mov_eax, %-1
+	ret
+:ascii_comment
+	call %Read_byte
+	cmp_eax, !0xD
+	je %ascii_comment_cr
+	cmp_eax, !0xA
+	jne %ascii_comment
+:ascii_comment_cr
+	mov_eax, %-1
+	ret
+
+# process second byte of pair
+:print
+	# update the sum and store in output
+	add_eax,[DWORD] &High
+	mov_[DWORD],al &table
+
+	# Print our first Hex
+	mov_edx, %1                 # set the size of chars we want
+	call %print_chars
+
+	# flip the toggle
+	mov_eax,[DWORD] &Flag
+	not_eax
+	mov_[DWORD],eax &Flag
+
+	add_edi, !1                 # Increment IP
+	jmp %Second_pass
+
+:Done
+	# program completed Successfully
+	mov_ebx, %0                 # All is well
+	mov_eax, %1                 # put the exit syscall number in eax
+	int !0x80                   # Call it a good day
+
+
+# Malloc isn't actually required if the program being built fits in the initial memory
+# However, it doesn't take much to add it.
+# Requires a value in EBX
+:malloc
+	mov_eax, %45                # the Syscall # for SYS_BRK
+	push_esi                    # Protect esi
+	push_edi                    # Protect edi
+	int !0x80                   # call the Kernel
+	pop_edi                     # Restore edi
+	pop_esi                     # Restore esi
+	ret
+
+
+:Read_byte
+	# Attempt to read 1 byte from STDIN
+	push_esi                    # Protect esi
+	push_edi                    # Protect edi
+	push_ebx                    # Protect ebx
+	push_ecx                    # Protect ecx
+
+	mov_edx, %1                 # set the size of chars we want
+	mov_ecx, &write             # Where to put it
+	mov_ebx,[DWORD] &Input      # Where are we reading from
+	mov_eax, %3                 # the syscall number for read
+	int !0x80                   # call the Kernel
+
+	pop_ecx                     # Restore ecx
+	pop_ebx                     # Restore ebx
+	pop_edi                     # Restore edi
+	pop_esi                     # Restore esi
+
+	test_eax,eax                # check what we got
+	je %Read_byte_1             # Got EOF call it done
+
+	# load byte
+	mov_al,[DWORD] &write       # load char
+	movzx_eax,al                # We have to zero extend it to use it
+	ret
+
+# Deal with EOF
+:Read_byte_1
+	mov_eax, %-4                # Put EOF in eax
+	ret
+
+:print_chars
+	push_esi                    # Protect esi
+	push_edi                    # Protect edi
+	push_ebx                    # Protect ebx
+	push_ecx                    # Protect ecx
+
+	mov_ecx, &table             # What we are writing
+	mov_ebx,[DWORD] &Output     # Write to target file
+	mov_eax, %4                 # the syscall number for write
+	# edx contains the number of bytes to write
+	int !0x80                   # call the Kernel
+
+	pop_ecx                     # Restore ecx
+	pop_ebx                     # Restore ebx
+	pop_edi                     # Restore edi
+	pop_esi                     # Restore esi
+	ret
+
+# Receives pointer in EBX
+# Writes out char and updates EBX
+:consume_token
+	call %Read_byte             # Consume_token
+
+	# Check for \t
+	cmp_eax, !0x09
+	je %consume_token_done
+
+	# Check for \n
+	cmp_eax, !0x0A
+	je %consume_token_done
+
+	# Check for ' '
+	cmp_eax, !0x20
+	je %consume_token_done
+
+	# Check for '>'
+	cmp_eax, !0x3E
+	je %consume_token_done
+
+	# Looks like we are still reading token
+	mov_[ebx],al                # Store char
+	add_ebx, !1                 # Point to next spot
+	jmp %consume_token          # loop until done
+
+:consume_token_done
+	mov_ecx, %0                 # Pad with nulls
+	mov_[ebx],ecx
+	add_ebx, !4
+	ret
+
+:StoreLabel
+	mov_eax,ebp                 # ENTRY
+	add_ebp, !24                # CALLOC
+	mov_[eax+BYTE],edi !8       # ENTRY->TARGET = IP
+	mov_[eax],esi               # ENTRY->NEXT = JUMP_TABLE
+	mov_esi,eax                 # JUMP_TABLE = ENTRY
+	mov_[esi+BYTE],ebp !16      # ENTRY->NAME = TOKEN
+	mov_ebx,ebp                 # Write Starting after struct
+	call %consume_token         # Collect whole string
+	mov_ebp,ebx                 # Update HEAP
+	jmp %First_pass
+
+:GetTarget
+	push_ebx                    # protect ebx
+	push_ecx                    # protect ecx
+	push_edx                    # protect edx
+	push_esi                    # protect JUMP_TABLE
+	mov_ecx, &table             # Reset scratch
+	mov_edx,[esi+BYTE] !16      # I->NAME
+:GetTarget_loop
+	mov_al,[ecx]                # I->NAME[0]
+	mov_bl,[edx]                # scratch[0]
+	movzx_ebx,bl                # Zero extend
+	movzx_eax,al                # Zero extend
+	cmp_al,bl                   # IF TOKEN == I->NAME
+	jne %GetTarget_miss         # Oops
+
+	add_ecx, !1
+	add_edx, !1
+	cmp_al, !0
+	jne %GetTarget_loop         # Loop until
+	jmp %GetTarget_done         # Match
+
+	# Miss
+:GetTarget_miss
+	mov_esi,[esi]               # I = I->NEXT
+	cmp_esi, !0                 # IF NULL == I
+	je %fail                    # Abort hard
+
+	mov_edx,[esi+BYTE] !16      # I->NAME
+	mov_ecx, &table             # Reset scratch
+	jmp %GetTarget_loop
+
+:GetTarget_done
+	mov_eax,[esi+BYTE] !8       # Get address
+	pop_esi                     # Restore JUMP_TABLE
+	pop_edx                     # Restore edx
+	pop_ecx                     # Restore ecx
+	pop_ebx                     # Restore ebx
+	ret
+
+:ClearScratch
+	push_eax                    # Protect against changes
+	push_ebx                    # And overwrites
+	push_ecx                    # While we work
+	mov_ebx, &table             # Where our table is
+	mov_eax, %0                 # Using null
+
+:ClearScratch_loop
+	mov_ecx,[ebx]               # Get current value
+	mov_[ebx],al                # Because we want null
+	add_ebx, !1                 # Increment
+	cmp_ecx, !0                 # Check if we hit null
+	jne %ClearScratch_loop      # Keep looping
+
+	pop_ecx                     # Restore
+	pop_ebx                     # Damage
+	pop_eax                     # Entirely
+	ret
+
+:StorePointer
+	call %Update_Pointer        # Increment IP
+	mov_ebx, &table             # Write to scratch
+	call %consume_token         # get token
+	push_eax                    # Protect base_sep_p
+	mov_eax, &table             # Pointer to scratch
+	call %GetTarget             # Get address of pointer
+	call %ClearScratch          # Clean up after ourselves
+	mov_edx,edi                 # base = IP
+	pop_ebx                     # Restore base_sep_p
+	cmp_ebx, !0x3E              # If base_sep_p == '>'
+	jne %StorePointer_done      # If not
+
+	# Deal with %label>label case
+	push_eax                    # We need to preserve main target
+	mov_ebx, &table             # Write to scratch
+	call %consume_token         # get token
+	mov_eax, &table             # Pointer to scratch
+	call %GetTarget             # Get address of pointer
+	call %ClearScratch          # Clean up after ourselves
+	mov_edx,eax                 # Use our new base
+	pop_eax                     # Restore main target
+
+:StorePointer_done
+	ret
+
+:StorePointer_rel4
+	call %StorePointer          # Do Common
+	sub_eax,edx                 # target - ip
+	mov_[DWORD],eax &table      # put value in output
+	mov_edx, %4                 # set the size of chars we want
+	call %print_chars
+	call %ClearScratch          # Clean up after ourselves
+	jmp %Second_pass
+
+:StorePointer_rel2
+	call %StorePointer          # Do Common
+	sub_eax,edx                 # target - ip
+	mov_[DWORD],eax &table      # put value in output
+	mov_edx, %2                 # set the size of chars we want
+	call %print_chars
+	call %ClearScratch          # Clean up after ourselves
+	jmp %Second_pass
+
+:StorePointer_rel1
+	call %StorePointer          # Do Common
+	sub_eax,edx                 # target - ip
+	mov_[DWORD],eax &table      # put value in output
+	mov_edx, %1                 # set the size of chars we want
+	call %print_chars
+	call %ClearScratch          # Clean up after ourselves
+	jmp %Second_pass
+
+:StorePointer_abs4
+	call %StorePointer          # Do Common
+	mov_[DWORD],eax &table      # put value in output
+	mov_edx, %4                 # set the size of chars we want
+	call %print_chars
+	call %ClearScratch          # Clean up after ourselves
+	jmp %Second_pass
+
+:StorePointer_abs2
+	call %StorePointer          # Do Common
+	mov_[DWORD],eax &table      # put value in output
+	mov_edx, %2                 # set the size of chars we want
+	call %print_chars
+	call %ClearScratch          # Clean up after ourselves
+	jmp %Second_pass
+
+:fail
+	# Something went wrong
+	mov_ebx, %1                 # All is wrong
+	mov_eax, %1                 # put the exit syscall number in eax
+	int !0x80                   # Call it a good day
+
+:ELF_data
+:High
+	%0
+:Flag
+	%0
+:Input
+	%0
+:Output
+	%0
+:write
+	%0
+:table
+	%0
+:ELF_end

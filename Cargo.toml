@@ -1,0 +1,28 @@
+[package]
+name = "subrust"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "A tiny, dependency-free interpreter for a strict subset of Rust — every accepted program is valid Rust and behaves identically under rustc."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/orbitalhigh/subrust"
+homepage = "https://github.com/orbitalhigh/subrust"
+readme = "README.md"
+keywords = ["interpreter", "rust-subset", "no_std", "sandbox", "scripting"]
+categories = ["compilers", "no-std", "embedded"]
+exclude = ["subrust-boot/vendor/", "self/", "/tests/data/"]
+
+[features]
+default = ["profile-host"]
+profile-host = []
+
+[lib]
+name = "subrust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "subrust"
+path = "src/main.rs"
+
+[dependencies]
+# none, by design.

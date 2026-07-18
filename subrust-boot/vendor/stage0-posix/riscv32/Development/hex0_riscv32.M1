@@ -1,0 +1,148 @@
+## Copyright (C) 2021 Ekaitz Zarraga
+## Copyright (C) 2021 Andrius Štikonas
+## Copyright (C) 2022 Gabriel Wicki
+## This file is part of stage0.
+##
+## stage0 is free software: you can redistribute it and/or modify
+## it under the terms of the GNU General Public License as published by
+## the Free Software Foundation, either version 3 of the License, or
+## (at your option) any later version.
+##
+## stage0 is distributed in the hope that it will be useful,
+## but WITHOUT ANY WARRANTY; without even the implied warranty of
+## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+## GNU General Public License for more details.
+##
+## You should have received a copy of the GNU General Public License
+## along with stage0.  If not, see <http://www.gnu.org/licenses/>.
+# Compile this thing with -nostdlib
+
+
+; Register use:
+; s2: input fd
+; s3: output fd
+; s4: toggle
+; s5: hold
+
+; Uses top of the stack as i/o buffer
+
+:_start
+    rd_s4 mv                 ; Initialize register
+    rd_a1 rs1_sp !8 lw       ; Input file name
+
+    ; Open input file and store FD in s2
+    rd_a7 !56 addi           ; sys_openat
+    rd_a0 !-100 addi         ; AT_FDCWD
+    rd_a2 mv                 ; read only
+    ecall
+    rd_s2 rs1_a0 mv          ; Save fd in s2 for later
+
+    ; Open output file and store the FD in s3
+    rd_a0 !-100 addi         ; AT_FDCWD
+    rd_a1 rs1_sp !12 lw      ; Output file (argument 3)
+    rd_a2 !577 addi          ; octal 00001101
+    ; O_TRUNC   00001000
+    ; O_CREAT   00000100
+    ; O_WRONLY  00000001
+    ; OCTAL!
+    rd_a3 !448 addi          ; Set read, write, execute permission on user
+    ; S_IRWXU  00700
+    ; OCTAL!
+    ecall
+    rd_s3 rs1_a0 mv          ; Save fd in s3 for later
+
+:next_byte
+    rd_a7 !63 addi           ; sys_read
+    rd_a0 rs1_s2 mv          ; File descriptor
+    rd_a1 rs1_sp mv          ; Buffer
+    rd_a2 !1 addi            ; Size of what we want to read (set for all subsequent syscalls)
+    ecall
+
+    ; If the file ended (0 bytes read) terminate
+    rs1_a0 @terminate beqz
+
+    ; Check if it's a comment
+    rd_a0 rs1_sp lb
+    rd_t0 !0x23 addi
+    rs1_a0 rs2_t0 @loop beq  ; a0 eq to '#'
+    rd_t0 !0x3B addi
+    rs1_a0 rs2_t0 @loop beq  ; a0 eq to ';'
+    $not_comment jal
+:loop
+        rd_a0 rs1_s2 mv              ; File descriptor
+        ecall                        ; sys_read
+
+        ; If the file ended (0 bytes read) terminate
+        rs1_a0 @terminate beqz
+        ; Check if read byte is the end of the comment,
+        ; in the case it is continue processing
+        rd_a0 rs1_sp lb
+        rd_t0 !0xA addi
+        rs1_a0 rs2_t0 @next_byte beq ; a0 eq to \n
+        rd_t0 !0xD addi
+        rs1_a0 rs2_t0 @next_byte beq ; a0 eq to \r
+    $loop jal
+
+:not_comment
+    ; Check if it's a hex character:
+    ; in the case it's not, ignores and reads next byte
+    rd_a0 rs1_sp LB
+
+    ; Is it between '0' and '9'?
+    rd_t0 !48 addi           ; '0' character
+    rs1_a0 rs2_t0 @uppercase_alpha blt
+    rd_t0 !57 addi           ; '9' character
+    rs1_t0 rs2_a0 @uppercase_alpha blt
+    rd_a0 rs1_a0 !-48 addi
+    $hex_read jal
+:uppercase_alpha
+    ; Is it between 'A' and 'F'?
+    rd_t0 !65 addi           ; 'A' character
+    rs1_a0 rs2_t0 @lowercase_alpha blt
+    rd_t0 !70 addi           ; 'F' character
+    rs1_t0 rs2_a0 @lowercase_alpha blt
+    rd_a0 rs1_a0 !-55 addi
+    $hex_read jal
+:lowercase_alpha
+    ; Is it between 'a' and 'f'?
+    rd_t0 !97 addi           ; 'a' character
+    rs1_a0 rs2_t0 @next_byte blt ; Not hex, continue reading
+    rd_t0 !102 addi          ; 'f' character
+    rs1_t0 rs2_a0 @next_byte blt ; Not hex, continue reading
+    rd_a0 rs1_a0 !-87 addi
+:hex_read
+    ; END check hex -- leaves the half byte in a0
+
+    rs1_s4 @combine bnez     ; if toggle != 0 -> combine
+    ; Toggle == 0, we need to prepare for later
+    rd_s5 rs1_a0 mv          ; Load hold
+    rd_s4 !1 addi            ; Set toggle
+    $next_byte jal           ; Read next byte
+
+:combine
+    ; Combine half bytes
+    rd_a1 rs1_s5 rs2_x4 slli ; Shift logical left 4 times
+    rd_a0 rs1_a0 rs2_a1 add  ; Combine two half bytes
+    ; Leaves the full byte in a0
+
+    ; Values are combined, now we write in the file
+    rs1_sp rs2_a0 sb         ; Store prepared byte in buffer
+    rd_a7 !64 addi           ; sys_write
+    rd_a0 rs1_s3 mv          ; file descriptor (stdout)
+    rd_a1 rs1_sp mv          ; string address
+    ecall
+
+    ; Update globals
+    rd_s4 mv                 ; Clear toggle
+    rd_s5 mv                 ; Clear hold
+
+    ; Read next byte
+    $next_byte jal
+
+:terminate
+    ; Terminate program with 0 return code
+    rd_a7 !93 addi           ; sys_exit
+    ecall
+# PROGRAM END
+
+:ELF_end

@@ -1,0 +1,114 @@
+# f_amd64.hex2 — amd64 machine code for the BOOT_API IEEE-f64 backend.
+# Auditable bytes + disassembly; built ONLY by the seed-built hex2 (no host
+# assembler in the build path). Concatenated after AMD64/ELF-amd64.hex2,
+# whose e_entry is &_start. Source of truth: f_amd64.s (kept in sync by
+# verify-fasm.sh). See README.md.
+:_start
+48 83 ec 30                # sub $0x30,%rsp
+48 89 e5                   # mov %rsp,%rbp
+4d 31 ed                   # xor %r13,%r13
+31 c0                      # xor %eax,%eax
+31 ff                      # xor %edi,%edi
+4a 8d 74 2d 00             # lea 0x0(%rbp,%r13,1),%rsi
+48 c7 c2 11 00 00 00       # mov $0x11,%rdx
+4c 29 ea                   # sub %r13,%rdx
+0f 05                      # syscall
+48 85 c0                   # test %rax,%rax
+0f 8e 45 01 00 00          # jle 40116d <_start+0x16d>
+49 01 c5                   # add %rax,%r13
+49 83 fd 11                # cmp $0x11,%r13
+72 d9                      # jb 40100a <_start+0xa>
+0f b6 45 00                # movzbl 0x0(%rbp),%eax
+f3 0f 7e 45 01             # movq 0x1(%rbp),%xmm0
+f3 0f 7e 4d 09             # movq 0x9(%rbp),%xmm1
+48 8b 4d 01                # mov 0x1(%rbp),%rcx
+83 f8 00                   # cmp $0x0,%eax
+74 3c                      # je 401084 <_start+0x84>
+83 f8 01                   # cmp $0x1,%eax
+74 45                      # je 401092 <_start+0x92>
+83 f8 02                   # cmp $0x2,%eax
+74 4e                      # je 4010a0 <_start+0xa0>
+83 f8 03                   # cmp $0x3,%eax
+74 57                      # je 4010ae <_start+0xae>
+83 f8 04                   # cmp $0x4,%eax
+74 5d                      # je 4010b9 <_start+0xb9>
+83 f8 05                   # cmp $0x5,%eax
+74 7c                      # je 4010dd <_start+0xdd>
+83 f8 06                   # cmp $0x6,%eax
+0f 84 80 00 00 00          # je 4010ea <_start+0xea>
+83 f8 07                   # cmp $0x7,%eax
+0f 84 84 00 00 00          # je 4010f7 <_start+0xf7>
+83 f8 08                   # cmp $0x8,%eax
+0f 84 87 00 00 00          # je 401103 <_start+0x103>
+48 31 c0                   # xor %rax,%rax
+e9 b4 00 00 00             # jmp 401138 <_start+0x138>
+f2 0f 58 c1                # addsd %xmm1,%xmm0
+66 48 0f 7e c0             # movq %xmm0,%rax
+e9 a6 00 00 00             # jmp 401138 <_start+0x138>
+f2 0f 5c c1                # subsd %xmm1,%xmm0
+66 48 0f 7e c0             # movq %xmm0,%rax
+e9 98 00 00 00             # jmp 401138 <_start+0x138>
+f2 0f 59 c1                # mulsd %xmm1,%xmm0
+66 48 0f 7e c0             # movq %xmm0,%rax
+e9 8a 00 00 00             # jmp 401138 <_start+0x138>
+f2 0f 5e c1                # divsd %xmm1,%xmm0
+66 48 0f 7e c0             # movq %xmm0,%rax
+eb 7f                      # jmp 401138 <_start+0x138>
+f2 0f 11 4d 18             # movsd %xmm1,0x18(%rbp)
+dd 45 18                   # fldl 0x18(%rbp)
+f2 0f 11 45 18             # movsd %xmm0,0x18(%rbp)
+dd 45 18                   # fldl 0x18(%rbp)
+d9 f8                      # fprem
+df e0                      # fnstsw %ax
+f6 c4 04                   # test $0x4,%ah
+75 f7                      # jne 4010c9 <_start+0xc9>
+dd 5d 18                   # fstpl 0x18(%rbp)
+dd d8                      # fstp %st(0)
+48 8b 45 18                # mov 0x18(%rbp),%rax
+eb 5b                      # jmp 401138 <_start+0x138>
+31 c0                      # xor %eax,%eax
+66 0f 2f c1                # comisd %xmm1,%xmm0
+7a 53                      # jp 401138 <_start+0x138>
+0f 92 c0                   # setb %al
+eb 4e                      # jmp 401138 <_start+0x138>
+31 c0                      # xor %eax,%eax
+66 0f 2e c1                # ucomisd %xmm1,%xmm0
+7a 46                      # jp 401138 <_start+0x138>
+0f 94 c0                   # sete %al
+eb 41                      # jmp 401138 <_start+0x138>
+f2 48 0f 2a c1             # cvtsi2sd %rcx,%xmm0
+66 48 0f 7e c0             # movq %xmm0,%rax
+eb 35                      # jmp 401138 <_start+0x138>
+f2 48 0f 2c c0             # cvttsd2si %xmm0,%rax
+48 b9 00 00 00 00 00       # movabs $0x8000000000000000,%rcx
+00 00 80                   # 
+48 39 c8                   # cmp %rcx,%rax
+75 21                      # jne 401138 <_start+0x138>
+66 0f 2e c0                # ucomisd %xmm0,%xmm0
+7a 16                      # jp 401133 <_start+0x133>
+66 48 0f 7e c2             # movq %xmm0,%rdx
+48 85 d2                   # test %rdx,%rdx
+78 11                      # js 401138 <_start+0x138>
+48 b8 ff ff ff ff ff       # movabs $0x7fffffffffffffff,%rax
+ff ff 7f                   # 
+eb 05                      # jmp 401138 <_start+0x138>
+48 31 c0                   # xor %rax,%rax
+eb 00                      # jmp 401138 <_start+0x138>
+48 89 45 18                # mov %rax,0x18(%rbp)
+4d 31 ed                   # xor %r13,%r13
+b8 01 00 00 00             # mov $0x1,%eax
+bf 01 00 00 00             # mov $0x1,%edi
+4a 8d 74 2d 18             # lea 0x18(%rbp,%r13,1),%rsi
+48 c7 c2 08 00 00 00       # mov $0x8,%rdx
+4c 29 ea                   # sub %r13,%rdx
+0f 05                      # syscall
+48 85 c0                   # test %rax,%rax
+7e 0e                      # jle 40116d <_start+0x16d>
+49 01 c5                   # add %rax,%r13
+49 83 fd 08                # cmp $0x8,%r13
+72 d7                      # jb 40113f <_start+0x13f>
+e9 9a fe ff ff             # jmp 401007 <_start+0x7>
+b8 3c 00 00 00             # mov $0x3c,%eax
+31 ff                      # xor %edi,%edi
+0f 05                      # syscall
+:ELF_end

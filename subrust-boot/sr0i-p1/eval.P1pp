@@ -1,0 +1,472 @@
+# eval.P1pp — SR-seed evaluator in P1pp, faithful port of sr0i.c's eval().
+# Cat AFTER lex.P1pp + parse.P1pp (uses g_tok/g_node/g_fn + p_nget/lbyte/slice_eq).
+# STEP 3a: minimal vertical slice — N_INT/N_BOOL/N_UNARY/N_BIN(do_bin)/N_BLOCK/
+# N_EXPR/N_CALL(host putb) + run_main. Control flow, locals, user calls, and
+# the rest of the host API land in 3b/3c/3d. All helpers prefixed e_.
+#
+# eval() returns a WORD (u64). g_signal 0/1/2 (normal/break/continue), g_trap.
+
+:g_signal    $(0)
+:g_trap      $(0)
+:g_locn      $(0)
+:g_framebase $(0)
+:g_loctok    $(0)
+:g_locval    $(0)
+:g_argstk    $(0)
+:g_argsp     $(0)
+:g_wmem      $(0)
+:g_constval  $(0)
+:g_constready $(0)
+:e_str_main  "main"
+:e_str_putb  "putb"
+:e_str_getb  "getb"
+:e_str_ld    "ld"
+:e_str_st    "st"
+:e_putbuf    $(0)
+:e_getbuf    $(0)
+
+# ---- e_udivmod(a=a0, b=a1) -> (q=a0, r=a1) : binary long division ----------
+%fn(e_udivmod, 40, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16) %st(s3, sp, 24)
+    %mov(s0, a0) %mov(s1, a1) %li(s2, 0) %li(s3, 0) %li(t0, 63)
+:.dloop
+    %shri(t1, s3, 63) %shli(s3, s3, 1) %shr(t2, s0, t0) %andi(t2, t2, 1) %or(s3, s3, t2)
+    %bnez(t1, &.dsub) %bltu(s3, s1, &.dskip)
+:.dsub
+    %sub(s3, s3, s1) %li(t2, 1) %shl(t2, t2, t0) %or(s2, s2, t2)
+:.dskip
+    %addi(t0, t0, -1) %bltz(t0, &.ddone) %b(&.dloop)
+:.ddone
+    %mov(a0, s2) %mov(a1, s3)
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16) %ld(s3, sp, 24)
+})
+
+# ---- e_do_bin(op=a0, a=a1, b=a2) -> (flag=a0, result=a1) : u64 trap-arith --
+%fn(e_do_bin, 40, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16)
+    %mov(s0, a0) %mov(s1, a1) %mov(s2, a2)
+    %li(t0, 1)  %beq(s0, t0, &.add)
+    %li(t0, 2)  %beq(s0, t0, &.sub)
+    %li(t0, 3)  %beq(s0, t0, &.mul)
+    %li(t0, 4)  %beq(s0, t0, &.divop)
+    %li(t0, 5)  %beq(s0, t0, &.remop)
+    %li(t0, 8)  %beq(s0, t0, &.band)
+    %li(t0, 9)  %beq(s0, t0, &.bor)
+    %li(t0, 10) %beq(s0, t0, &.bxor)
+    %li(t0, 11) %beq(s0, t0, &.shlop)
+    %li(t0, 12) %beq(s0, t0, &.shrop)
+    %li(t0, 13) %beq(s0, t0, &.eq)
+    %li(t0, 14) %beq(s0, t0, &.ne)
+    %li(t0, 15) %beq(s0, t0, &.lt)
+    %li(t0, 16) %beq(s0, t0, &.le)
+    %li(t0, 17) %beq(s0, t0, &.gt)
+    %li(t0, 18) %beq(s0, t0, &.ge)
+    %b(&.trap)
+:.add
+    %add(a1, s1, s2) %bltu(a1, s1, &.trap) %b(&.ok)
+:.sub
+    %bltu(s1, s2, &.trap) %sub(a1, s1, s2) %b(&.ok)
+:.mul
+    %mul(a1, s1, s2) %beqz(s1, &.ok)
+    %st(a1, sp, 24) %mov(a0, a1) %mov(a1, s1) %call(&e_udivmod)
+    %bne(a0, s2, &.trap) %ld(a1, sp, 24) %b(&.ok)
+:.divop
+    %beqz(s2, &.trap) %mov(a0, s1) %mov(a1, s2) %call(&e_udivmod) %mov(a1, a0) %b(&.ok)
+:.remop
+    %beqz(s2, &.trap) %mov(a0, s1) %mov(a1, s2) %call(&e_udivmod) %b(&.ok)
+:.band %and(a1, s1, s2) %b(&.ok)
+:.bor  %or(a1, s1, s2) %b(&.ok)
+:.bxor %xor(a1, s1, s2) %b(&.ok)
+:.shlop
+    %li(t0, 64) %bltu(s2, t0, &.shldo) %b(&.trap)
+:.shldo %shl(a1, s1, s2) %b(&.ok)
+:.shrop
+    %li(t0, 64) %bltu(s2, t0, &.shrdo) %b(&.trap)
+:.shrdo %shr(a1, s1, s2) %b(&.ok)
+:.eq %li(a1, 0) %bne(s1, s2, &.ok) %li(a1, 1) %b(&.ok)
+:.ne %li(a1, 0) %beq(s1, s2, &.ok) %li(a1, 1) %b(&.ok)
+:.lt %li(a1, 1) %bltu(s1, s2, &.ok) %li(a1, 0) %b(&.ok)
+:.ge %li(a1, 0) %bltu(s1, s2, &.ok) %li(a1, 1) %b(&.ok)
+:.gt %li(a1, 1) %bltu(s2, s1, &.ok) %li(a1, 0) %b(&.ok)
+:.le %li(a1, 0) %bltu(s2, s1, &.ok) %li(a1, 1) %b(&.ok)
+:.trap %li(a0, 1) %li(a1, 0) %b(&.ret)
+:.ok   %li(a0, 0)
+:.ret
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16)
+})
+
+# ---- e_tok_eq(tok_a=a0, tok_b=a1) -> 0/1 : same source text ----------------
+%fn(e_tok_eq, 48, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16) %st(s3, sp, 24)
+    %la(t0, &g_tok) %ld(t2, t0, 0)
+    %li(t1, 32) %mul(t1, a0, t1) %add(t1, t2, t1) %ld(s0, t1, 16) %ld(s1, t1, 24)   # pos_a, len_a
+    %li(t1, 32) %mul(t1, a1, t1) %add(t1, t2, t1) %ld(s2, t1, 16) %ld(s3, t1, 24)   # pos_b, len_b
+    %bne(s1, s3, &.no)
+    %li(t2, 0)
+:.lp
+    %beq(t2, s1, &.yes)
+    %la(t0, &g_src) %ld(t0, t0, 0)
+    %add(t1, t0, s0) %add(t1, t1, t2) %lb(a0, t1, 0)
+    %add(t1, t0, s2) %add(t1, t1, t2) %lb(a1, t1, 0)
+    %bne(a0, a1, &.no)
+    %addi(t2, t2, 1) %b(&.lp)
+:.yes %li(a0, 1) %b(&.r)
+:.no  %li(a0, 0)
+:.r
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16) %ld(s3, sp, 24)
+})
+
+# ---- e_streq_str(tok=a0, ptr=a1, len=a2) -> 0/1 : token source == str -----
+%fn(e_streq_str, 16, {
+    %st(s0, sp, 0) %st(s1, sp, 8)
+    %mov(s0, a1) %mov(s1, a2)
+    %la(t0, &g_tok) %ld(t1, t0, 0) %li(t2, 32) %mul(t2, a0, t2) %add(t1, t1, t2)
+    %ld(a0, t1, 16) %ld(a1, t1, 24)
+    %mov(a2, s0) %mov(a3, s1) %call(&slice_eq)
+    %ld(s0, sp, 0) %ld(s1, sp, 8)
+})
+
+# ---- e_find_fn(nametok=a0) -> fn index or NIL -----------------------------
+%fn(e_find_fn, 32, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16)
+    %mov(s0, a0) %li(s1, 0) %la(t0, &g_fnn) %ld(s2, t0, 0)
+:.lp
+    %bltu(s1, s2, &.body) %b(&.none)
+:.body
+    %la(t0, &g_fn) %ld(t0, t0, 0) %li(t1, 32) %mul(t1, s1, t1) %add(t0, t0, t1) %ld(a1, t0, 0)
+    %mov(a0, s0) %call(&e_tok_eq) %bnez(a0, &.found)
+    %addi(s1, s1, 1) %b(&.lp)
+:.found %mov(a0, s1) %b(&.r)
+:.none  %li(a0, -1)
+:.r
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16)
+})
+
+# ---- e_find_local(nametok=a0) -> loc index or NIL -------------------------
+# scan i = loc_n-1 down to frame_base (most-recent binding wins). SIGNED cmp.
+%fn(e_find_local, 32, {
+    %st(s0, sp, 0) %st(s1, sp, 8)
+    %mov(s0, a0)
+    %la(t0, &g_locn) %ld(s1, t0, 0) %addi(s1, s1, -1)   # i = loc_n-1
+:.lp
+    %la(t0, &g_framebase) %ld(t1, t0, 0)
+    %blt(s1, t1, &.none)                     # i < frame_base -> none
+    %la(t0, &g_loctok) %ld(t0, t0, 0) %shli(t1, s1, 3) %add(t0, t0, t1) %ld(a0, t0, 0)   # loc_tok[i]
+    %mov(a1, s0) %call(&e_tok_eq) %bnez(a0, &.found)
+    %addi(s1, s1, -1) %b(&.lp)
+:.found %mov(a0, s1) %b(&.r)
+:.none  %li(a0, -1)
+:.r
+    %ld(s0, sp, 0) %ld(s1, sp, 8)
+})
+
+# ---- e_find_const(nametok=a0) -> const index or NIL (scan up to ready) ----
+%fn(e_find_const, 32, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16)
+    %mov(s0, a0) %li(s1, 0) %la(t0, &g_constready) %ld(s2, t0, 0)
+:.lp
+    %bltu(s1, s2, &.body) %b(&.none)
+:.body
+    %la(t0, &g_const) %ld(t0, t0, 0) %shli(t1, s1, 4) %add(t0, t0, t1) %ld(a0, t0, 0)   # const_tok[i]
+    %mov(a1, s0) %call(&e_tok_eq) %bnez(a0, &.found)
+    %addi(s1, s1, 1) %b(&.lp)
+:.found %mov(a0, s1) %b(&.r)
+:.none  %li(a0, -1)
+:.r
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16)
+})
+
+# ---- e_host_call(nametok=a0, argnode=a1) -> WORD --------------------------
+%fn(e_host_call, 48, {
+    %st(s0, sp, 0) %st(s1, sp, 8)
+    %mov(s0, a0) %mov(s1, a1)                # nametok, argnode(first arg)
+    %mov(a0, s0) %la(a1, &e_str_putb) %li(a2, 4) %call(&e_streq_str) %bnez(a0, &.putb)
+    %mov(a0, s0) %la(a1, &e_str_getb) %li(a2, 4) %call(&e_streq_str) %bnez(a0, &.getb)
+    %mov(a0, s0) %la(a1, &e_str_ld)   %li(a2, 2) %call(&e_streq_str) %bnez(a0, &.ld)
+    %mov(a0, s0) %la(a1, &e_str_st)   %li(a2, 2) %call(&e_streq_str) %bnez(a0, &.st)
+    %li(a0, 10) %call(&sys_exit)             # f_* / unknown -> trap
+:.putb
+    %mov(a0, s1) %call(&e_eval)
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.retz)
+    %li(t0, 255) %and(a0, a0, t0) %la(t1, &e_putbuf) %st(a0, t1, 0)
+    %li(a0, 1) %la(a1, &e_putbuf) %li(a2, 1) %call(&sys_write)
+    %b(&.retz)
+:.getb
+    %li(a0, 0) %la(a1, &e_getbuf) %li(a2, 1) %call(&sys_read)
+    %beqz(a0, &.getb_eof) %bltz(a0, &.getb_eof)
+    %la(t0, &e_getbuf) %lb(a0, t0, 0) %b(&.ret)
+:.getb_eof
+    %li(a0, -1) %b(&.ret)
+:.ld
+    %mov(a0, s1) %call(&e_eval)              # v0 = eval(arg0)
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.retz)
+    %li(t0, 1048576) %bltu(a0, t0, &.ld_ok)
+    %la(t0, &g_trap) %li(t1, 1) %st(t1, t0, 0) %b(&.retz)   # OOB -> trap
+:.ld_ok
+    %la(t0, &g_wmem) %ld(t0, t0, 0) %shli(a0, a0, 3) %add(t0, t0, a0) %ld(a0, t0, 0)   # wmem[v0]
+    %b(&.ret)
+:.st
+    %mov(a0, s1) %call(&e_eval) %st(a0, sp, 16)   # v0
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.retz)
+    %mov(a0, s1) %li(a1, 48) %call(&p_nget) %call(&e_eval) %mov(s1, a0)   # v1 = eval(nd_link[arg0])
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.retz)
+    %ld(a0, sp, 16)                          # v0
+    %li(t0, 1048576) %bltu(a0, t0, &.st_ok)
+    %la(t0, &g_trap) %li(t1, 1) %st(t1, t0, 0) %b(&.retz)
+:.st_ok
+    %la(t0, &g_wmem) %ld(t0, t0, 0) %shli(a0, a0, 3) %add(t0, t0, a0) %st(s1, t0, 0)   # wmem[v0]=v1
+    %b(&.retz)
+:.retz
+    %li(a0, 0)
+:.ret
+    %ld(s0, sp, 0) %ld(s1, sp, 8)
+})
+
+# ---- e_eval(node=a0) -> WORD (a0) -----------------------------------------
+# s0=node s1=kind/op/scratch ; frame slots 16/24/32/40/48 scratch (call path).
+%fn(e_eval, 64, {
+    %st(s0, sp, 0) %st(s1, sp, 8)
+    %la(t0, &g_trap)   %ld(t1, t0, 0) %bnez(t1, &.zero)
+    %la(t0, &g_signal) %ld(t1, t0, 0) %bnez(t1, &.zero)
+    %mov(s0, a0)
+    %mov(a0, s0) %li(a1, 0) %call(&p_nget) %mov(s1, a0)   # kind
+    %li(t0, 1)  %beq(s1, t0, &.int)
+    %li(t0, 2)  %beq(s1, t0, &.bool)
+    %li(t0, 3)  %beq(s1, t0, &.name)
+    %li(t0, 5)  %beq(s1, t0, &.unary)
+    %li(t0, 6)  %beq(s1, t0, &.bin)
+    %li(t0, 7)  %beq(s1, t0, &.ifn)
+    %li(t0, 8)  %beq(s1, t0, &.block)
+    %li(t0, 9)  %beq(s1, t0, &.letn)
+    %li(t0, 10) %beq(s1, t0, &.assign)
+    %li(t0, 11) %beq(s1, t0, &.while)
+    %li(t0, 12) %beq(s1, t0, &.loopn)
+    %li(t0, 13) %beq(s1, t0, &.break)
+    %li(t0, 14) %beq(s1, t0, &.continue)
+    %li(t0, 15) %beq(s1, t0, &.expr)
+    %li(t0, 4)  %beq(s1, t0, &.call)
+    %li(a0, 7) %call(&sys_exit)              # unhandled node kind
+:.zero
+    %li(a0, 0) %b(&.ret)
+:.int
+    %mov(a0, s0) %li(a1, 8) %call(&p_nget)   # nd_a = token index
+    %la(t0, &g_tok) %ld(t0, t0, 0) %shli(a0, a0, 5) %add(t0, t0, a0) %ld(a0, t0, 8)   # tk_ival
+    %b(&.ret)
+:.bool
+    %mov(a0, s0) %li(a1, 8) %call(&p_nget) %b(&.ret)
+:.unary
+    %mov(a0, s0) %li(a1, 40) %call(&p_nget) %call(&e_eval) %mov(s1, a0)   # v
+    %beqz(s1, &.un1) %li(t0, 1) %beq(s1, t0, &.un0)
+    %li(t0, -1) %xor(a0, s1, t0) %b(&.ret)   # ~v
+:.un1 %li(a0, 1) %b(&.ret)
+:.un0 %li(a0, 0) %b(&.ret)
+:.bin
+    %mov(a0, s0) %li(a1, 8) %call(&p_nget) %mov(s1, a0)   # op
+    %li(t0, 6) %beq(s1, t0, &.and)
+    %li(t0, 7) %beq(s1, t0, &.or)
+    %mov(a0, s0) %li(a1, 32) %call(&p_nget) %call(&e_eval) %st(a0, sp, 16)   # a = eval(lhs)
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.zero)
+    %mov(a0, s0) %li(a1, 40) %call(&p_nget) %call(&e_eval) %mov(a2, a0)      # b = eval(rhs)
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.zero)
+    %mov(a0, s1) %ld(a1, sp, 16) %call(&e_do_bin)   # (flag,result)
+    %bnez(a0, &.settrap) %mov(a0, a1) %b(&.ret)
+:.settrap
+    %la(t0, &g_trap) %li(t1, 1) %st(t1, t0, 0) %li(a0, 0) %b(&.ret)
+:.and
+    %mov(a0, s0) %li(a1, 32) %call(&p_nget) %call(&e_eval)
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.zero)
+    %beqz(a0, &.zret)
+    %mov(a0, s0) %li(a1, 40) %call(&p_nget) %call(&e_eval) %b(&.ret)
+:.or
+    %mov(a0, s0) %li(a1, 32) %call(&p_nget) %call(&e_eval)
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.zero)
+    %bnez(a0, &.oneret)
+    %mov(a0, s0) %li(a1, 40) %call(&p_nget) %call(&e_eval) %b(&.ret)
+:.zret  %li(a0, 0) %b(&.ret)
+:.oneret %li(a0, 1) %b(&.ret)
+:.block
+    %la(t0, &g_locn) %ld(a0, t0, 0) %st(a0, sp, 16)      # save = loc_n
+    %mov(a0, s0) %li(a1, 16) %call(&p_nget) %mov(s1, a0) # s = first stmt
+:.blk_lp
+    %li(t0, -1) %beq(s1, t0, &.blk_tail)
+    %mov(a0, s1) %call(&e_eval)
+    %la(t0, &g_trap)   %ld(t1, t0, 0) %bnez(t1, &.blk_abort)
+    %la(t0, &g_signal) %ld(t1, t0, 0) %bnez(t1, &.blk_abort)
+    %mov(a0, s1) %li(a1, 48) %call(&p_nget) %mov(s1, a0) # s = nd_link[s]
+    %b(&.blk_lp)
+:.blk_abort
+    %ld(a0, sp, 16) %la(t0, &g_locn) %st(a0, t0, 0) %li(a0, 0) %b(&.ret)
+:.blk_tail
+    %mov(a0, s0) %li(a1, 40) %call(&p_nget) %mov(s1, a0) # tail = nd_e
+    %li(t0, -1) %beq(s1, t0, &.blk_notail)
+    %mov(a0, s1) %call(&e_eval) %st(a0, sp, 24) %b(&.blk_done)
+:.blk_notail
+    %li(t0, 0) %st(t0, sp, 24)
+:.blk_done
+    %ld(a0, sp, 16) %la(t0, &g_locn) %st(a0, t0, 0)      # loc_n = save
+    %ld(a0, sp, 24) %b(&.ret)
+:.expr
+    %mov(a0, s0) %li(a1, 40) %call(&p_nget) %call(&e_eval) %li(a0, 0) %b(&.ret)
+:.call
+    %mov(a0, s0) %li(a1, 8) %call(&p_nget) %mov(s1, a0)  # name tok
+    %mov(a0, s1) %call(&e_find_fn) %st(a0, sp, 24)       # fi
+    %li(t0, -1) %ld(t1, sp, 24) %bne(t1, t0, &.call_user)
+    %mov(a0, s0) %li(a1, 16) %call(&p_nget) %mov(a1, a0) # argnode = nd_b
+    %mov(a0, s1) %call(&e_host_call) %b(&.ret)
+:.call_user
+    # base = g_argsp ; eval each arg L-to-R onto the global arg stack
+    %la(t0, &g_argsp) %ld(a0, t0, 0) %st(a0, sp, 16)     # base
+    %mov(a0, s0) %li(a1, 16) %call(&p_nget) %mov(s1, a0) # s1 = arg node (nd_b)
+:.arg_lp
+    %li(t0, -1) %beq(s1, t0, &.arg_done)
+    %mov(a0, s1) %call(&e_eval)                          # v = eval(arg)
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.zero)
+    %la(t0, &g_argsp) %ld(t1, t0, 0)                     # argsp
+    %la(t2, &g_argstk) %ld(t2, t2, 0) %shli(a1, t1, 3) %add(t2, t2, a1) %st(a0, t2, 0)   # argstk[argsp]=v
+    %addi(t1, t1, 1) %la(t0, &g_argsp) %st(t1, t0, 0)    # argsp++
+    %mov(a0, s1) %li(a1, 48) %call(&p_nget) %mov(s1, a0) # arg = nd_link[arg]
+    %b(&.arg_lp)
+:.arg_done
+    %la(t0, &g_framebase) %ld(a0, t0, 0) %st(a0, sp, 32) # save_base
+    %la(t0, &g_locn) %ld(a0, t0, 0) %st(a0, sp, 40)      # save_top
+    %la(t1, &g_framebase) %st(a0, t1, 0)                 # frame_base = loc_n
+    # bind params: fn[fi].np, fn[fi].poff
+    %ld(t2, sp, 24) %la(t0, &g_fn) %ld(t0, t0, 0) %li(t1, 32) %mul(t1, t2, t1) %add(t0, t0, t1)
+    %ld(s1, t0, 16) %ld(a3, t0, 24)                      # s1 = np, a3 = poff
+    %li(t2, 0)                                           # pi
+:.bind_lp
+    %beq(t2, s1, &.bind_done)
+    %la(t0, &g_fnptok) %ld(t0, t0, 0) %add(t1, a3, t2) %shli(t1, t1, 3) %add(t0, t0, t1) %ld(t1, t0, 0)   # fn_ptok[poff+pi]
+    %la(t0, &g_locn) %ld(a0, t0, 0)                      # loc_n
+    %la(t0, &g_loctok) %ld(t0, t0, 0) %shli(a1, a0, 3) %add(t0, t0, a1) %st(t1, t0, 0)   # loc_tok[loc_n]=ptok
+    %ld(t1, sp, 16) %add(t1, t1, t2) %la(t0, &g_argstk) %ld(t0, t0, 0) %shli(t1, t1, 3) %add(t0, t0, t1) %ld(t1, t0, 0)   # argstk[base+pi]
+    %la(t0, &g_locval) %ld(t0, t0, 0) %shli(a1, a0, 3) %add(t0, t0, a1) %st(t1, t0, 0)   # loc_val[loc_n]=arg
+    %addi(a0, a0, 1) %la(t0, &g_locn) %st(a0, t0, 0)     # loc_n++
+    %addi(t2, t2, 1) %b(&.bind_lp)
+:.bind_done
+    %ld(t2, sp, 24) %la(t0, &g_fn) %ld(t0, t0, 0) %li(t1, 32) %mul(t1, t2, t1) %add(t0, t0, t1) %ld(a0, t0, 8)   # fn_body[fi]
+    %call(&e_eval) %st(a0, sp, 48)                       # ret
+    %ld(a0, sp, 40) %la(t0, &g_locn) %st(a0, t0, 0)      # loc_n = save_top
+    %ld(a0, sp, 32) %la(t0, &g_framebase) %st(a0, t0, 0) # frame_base = save_base
+    %ld(a0, sp, 16) %la(t0, &g_argsp) %st(a0, t0, 0)     # g_argsp = base
+    %ld(a0, sp, 48) %b(&.ret)
+:.name
+    %mov(a0, s0) %li(a1, 8) %call(&p_nget) %call(&e_find_local)   # li
+    %li(t0, -1) %beq(a0, t0, &.name_nl)
+    %la(t0, &g_locval) %ld(t0, t0, 0) %shli(a0, a0, 3) %add(t0, t0, a0) %ld(a0, t0, 0)   # loc_val[li]
+    %b(&.ret)
+:.name_nl
+    %mov(a0, s0) %li(a1, 8) %call(&p_nget) %call(&e_find_const)   # ci
+    %li(t0, -1) %beq(a0, t0, &.name_undef)
+    %la(t0, &g_constval) %ld(t0, t0, 0) %shli(a0, a0, 3) %add(t0, t0, a0) %ld(a0, t0, 0)   # const_val[ci]
+    %b(&.ret)
+:.name_undef
+    %li(a0, 11) %call(&sys_exit)             # undefined name
+:.letn
+    %mov(a0, s0) %li(a1, 40) %call(&p_nget) %call(&e_eval) %mov(s1, a0)   # v = eval(init)
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.zero)
+    %mov(a0, s0) %li(a1, 8) %call(&p_nget)   # nd_a = name token
+    %la(t0, &g_locn) %ld(t1, t0, 0) %shli(a2, t1, 3)
+    %la(t2, &g_loctok) %ld(t2, t2, 0) %add(t2, t2, a2) %st(a0, t2, 0)   # loc_tok[loc_n] = name
+    %la(t2, &g_locval) %ld(t2, t2, 0) %add(t2, t2, a2) %st(s1, t2, 0)   # loc_val[loc_n] = v
+    %addi(t1, t1, 1) %la(t0, &g_locn) %st(t1, t0, 0)   # loc_n++
+    %li(a0, 0) %b(&.ret)
+:.assign
+    %mov(a0, s0) %li(a1, 40) %call(&p_nget) %call(&e_eval) %st(a0, sp, 16)   # rhs
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.zero)
+    %mov(a0, s0) %li(a1, 32) %call(&p_nget) %call(&e_find_local) %st(a0, sp, 24)   # li
+    %li(t0, -1) %ld(t1, sp, 24) %beq(t1, t0, &.asgn_undef)
+    %mov(a0, s0) %li(a1, 8) %call(&p_nget) %mov(s1, a0)   # op
+    %beqz(s1, &.asgn_plain)
+    %ld(a0, sp, 24) %la(t0, &g_locval) %ld(t0, t0, 0) %shli(a0, a0, 3) %add(t0, t0, a0) %ld(a1, t0, 0)   # cur
+    %mov(a0, s1) %ld(a2, sp, 16) %call(&e_do_bin)   # do_bin(op, cur, rhs)
+    %bnez(a0, &.asgn_trap)
+    %ld(t2, sp, 24) %la(t0, &g_locval) %ld(t0, t0, 0) %shli(t2, t2, 3) %add(t0, t0, t2) %st(a1, t0, 0)
+    %li(a0, 0) %b(&.ret)
+:.asgn_plain
+    %ld(a1, sp, 16) %ld(t2, sp, 24) %la(t0, &g_locval) %ld(t0, t0, 0) %shli(t2, t2, 3) %add(t0, t0, t2) %st(a1, t0, 0)
+    %li(a0, 0) %b(&.ret)
+:.asgn_trap
+    %la(t0, &g_trap) %li(t1, 1) %st(t1, t0, 0) %li(a0, 0) %b(&.ret)
+:.asgn_undef
+    %li(a0, 12) %call(&sys_exit)
+:.ifn
+    %mov(a0, s0) %li(a1, 32) %call(&p_nget) %call(&e_eval)   # c = eval(cond)
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.zero)
+    %bnez(a0, &.if_then)
+    %mov(a0, s0) %li(a1, 16) %call(&p_nget) %mov(s1, a0)   # els = nd_b
+    %li(t0, -1) %beq(s1, t0, &.if_none)
+    %mov(a0, s1) %call(&e_eval) %b(&.ret)
+:.if_then
+    %mov(a0, s0) %li(a1, 40) %call(&p_nget) %call(&e_eval) %b(&.ret)
+:.if_none
+    %li(a0, 0) %b(&.ret)
+:.while
+    %mov(a0, s0) %li(a1, 32) %call(&p_nget) %call(&e_eval)   # c = eval(cond)
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.zero)
+    %beqz(a0, &.wh_done)
+    %mov(a0, s0) %li(a1, 40) %call(&p_nget) %call(&e_eval)   # eval(body)
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.zero)
+    %la(t0, &g_signal) %ld(t1, t0, 0)
+    %li(t2, 1) %beq(t1, t2, &.wh_brk)
+    %li(t2, 2) %bne(t1, t2, &.while)
+    %li(t2, 0) %la(t0, &g_signal) %st(t2, t0, 0) %b(&.while)   # continue: clear, loop
+:.wh_brk
+    %li(t2, 0) %la(t0, &g_signal) %st(t2, t0, 0)
+:.wh_done
+    %li(a0, 0) %b(&.ret)
+:.loopn
+    %mov(a0, s0) %li(a1, 40) %call(&p_nget) %call(&e_eval)   # eval(body)
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.zero)
+    %la(t0, &g_signal) %ld(t1, t0, 0)
+    %li(t2, 1) %beq(t1, t2, &.lo_brk)
+    %li(t2, 2) %bne(t1, t2, &.loopn)
+    %li(t2, 0) %la(t0, &g_signal) %st(t2, t0, 0) %b(&.loopn)
+:.lo_brk
+    %li(t2, 0) %la(t0, &g_signal) %st(t2, t0, 0) %li(a0, 0) %b(&.ret)
+:.break
+    %li(t1, 1) %la(t0, &g_signal) %st(t1, t0, 0) %li(a0, 0) %b(&.ret)
+:.continue
+    %li(t1, 2) %la(t0, &g_signal) %st(t1, t0, 0) %li(a0, 0) %b(&.ret)
+:.ret
+    %ld(s0, sp, 0) %ld(s1, sp, 8)
+})
+
+# ---- e_run_main() : find fn "main", eval its body -------------------------
+%fn(e_run_main, 32, {
+    %st(s0, sp, 0) %st(s1, sp, 8)
+    # const-eval: for ci in 0..const_n: frame_base=0, loc_n=0, const_val[ci]=eval(expr); ready=ci+1
+    %li(t1, 0) %la(t0, &g_constready) %st(t1, t0, 0)
+    %li(s0, 0) %la(t0, &g_constn) %ld(s1, t0, 0)
+:.ce_lp
+    %bltu(s0, s1, &.ce_body) %b(&.ce_done)
+:.ce_body
+    %li(t1, 0) %la(t0, &g_framebase) %st(t1, t0, 0)
+    %li(t1, 0) %la(t0, &g_locn) %st(t1, t0, 0)
+    %la(t0, &g_const) %ld(t0, t0, 0) %shli(t1, s0, 4) %add(t0, t0, t1) %ld(a0, t0, 8)   # const_expr[ci]
+    %call(&e_eval)
+    %la(t0, &g_trap) %ld(t1, t0, 0) %bnez(t1, &.ce_trap)
+    %la(t0, &g_constval) %ld(t0, t0, 0) %shli(t1, s0, 3) %add(t0, t0, t1) %st(a0, t0, 0)
+    %addi(t1, s0, 1) %la(t0, &g_constready) %st(t1, t0, 0)
+    %addi(s0, s0, 1) %b(&.ce_lp)
+:.ce_trap
+    %li(a0, 13) %call(&sys_exit)             # const initializer trapped
+:.ce_done
+    %li(s0, 0) %la(t0, &g_fnn) %ld(s1, t0, 0)
+:.lp
+    %bltu(s0, s1, &.body) %b(&.none)
+:.body
+    %la(t0, &g_fn) %ld(t0, t0, 0) %li(t1, 32) %mul(t1, s0, t1) %add(t0, t0, t1) %ld(a0, t0, 0)   # fn_tok[mi]
+    %la(a1, &e_str_main) %li(a2, 4) %call(&e_streq_str)
+    %bnez(a0, &.found)
+    %addi(s0, s0, 1) %b(&.lp)
+:.found
+    %li(t1, 0) %la(t0, &g_framebase) %st(t1, t0, 0)
+    %li(t1, 0) %la(t0, &g_locn) %st(t1, t0, 0)
+    %la(t0, &g_fn) %ld(t0, t0, 0) %li(t1, 32) %mul(t1, s0, t1) %add(t0, t0, t1) %ld(a0, t0, 8)   # fn_body[mi]
+    %call(&e_eval) %b(&.r)
+:.none
+    %li(a0, 9) %call(&sys_exit)              # no main
+:.r
+    %ld(s0, sp, 0) %ld(s1, sp, 8)
+})

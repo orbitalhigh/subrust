@@ -1,0 +1,646 @@
+# aarch64.M1M -- P1 aarch64 backend expressed in m1macro.
+#
+# This mirrors p1/aarch64.py using the m1macro integer builtins:
+#   %(sexpr), $(sexpr), and %select(cond, then, else).
+
+# ---- Native register numbers --------------------------------------------
+
+%macro aa64_reg_a0()
+0
+%endm
+%macro aa64_reg_a1()
+1
+%endm
+%macro aa64_reg_a2()
+2
+%endm
+%macro aa64_reg_a3()
+3
+%endm
+%macro aa64_reg_x4()
+4
+%endm
+%macro aa64_reg_x5()
+5
+%endm
+%macro aa64_reg_t0()
+9
+%endm
+%macro aa64_reg_t1()
+10
+%endm
+%macro aa64_reg_t2()
+11
+%endm
+%macro aa64_reg_s0()
+19
+%endm
+%macro aa64_reg_s1()
+20
+%endm
+%macro aa64_reg_s2()
+21
+%endm
+%macro aa64_reg_s3()
+22
+%endm
+%macro aa64_reg_sp()
+31
+%endm
+%macro aa64_reg_xzr()
+31
+%endm
+%macro aa64_reg_lr()
+30
+%endm
+%macro aa64_reg_br()
+17
+%endm
+%macro aa64_reg_scratch()
+16
+%endm
+%macro aa64_reg_x8()
+8
+%endm
+%macro aa64_reg_save0()
+23
+%endm
+%macro aa64_reg_save1()
+24
+%endm
+%macro aa64_reg_save2()
+25
+%endm
+
+%macro aa64_reg(r)
+%aa64_reg_##r
+%endm
+
+%macro aa64_is_sp_a0()
+0
+%endm
+%macro aa64_is_sp_a1()
+0
+%endm
+%macro aa64_is_sp_a2()
+0
+%endm
+%macro aa64_is_sp_a3()
+0
+%endm
+%macro aa64_is_sp_x4()
+0
+%endm
+%macro aa64_is_sp_x5()
+0
+%endm
+%macro aa64_is_sp_t0()
+0
+%endm
+%macro aa64_is_sp_t1()
+0
+%endm
+%macro aa64_is_sp_t2()
+0
+%endm
+%macro aa64_is_sp_s0()
+0
+%endm
+%macro aa64_is_sp_s1()
+0
+%endm
+%macro aa64_is_sp_s2()
+0
+%endm
+%macro aa64_is_sp_s3()
+0
+%endm
+%macro aa64_is_sp_sp()
+1
+%endm
+%macro aa64_is_sp_xzr()
+0
+%endm
+%macro aa64_is_sp_lr()
+0
+%endm
+%macro aa64_is_sp_br()
+0
+%endm
+%macro aa64_is_sp_scratch()
+0
+%endm
+%macro aa64_is_sp_x8()
+0
+%endm
+%macro aa64_is_sp_save0()
+0
+%endm
+%macro aa64_is_sp_save1()
+0
+%endm
+%macro aa64_is_sp_save2()
+0
+%endm
+
+%macro aa64_is_sp(r)
+%aa64_is_sp_##r
+%endm
+
+# ---- Low-level instruction encoders --------------------------------------
+
+%macro aa64_rrr(base, rd, ra, rb)
+%((| base (<< %aa64_reg(rb) 16) (<< %aa64_reg(ra) 5) %aa64_reg(rd)))
+%endm
+
+%macro aa64_add_imm(rd, ra, imm12)
+%((| 0x91000000 (<< (& imm12 0xFFF) 10) (<< %aa64_reg(ra) 5) %aa64_reg(rd)))
+%endm
+
+%macro aa64_sub_imm(rd, ra, imm12)
+%((| 0xD1000000 (<< (& imm12 0xFFF) 10) (<< %aa64_reg(ra) 5) %aa64_reg(rd)))
+%endm
+
+%macro aa64_add_imm_lsl12(rd, ra, imm12)
+%((| 0x91400000 (<< (& imm12 0xFFF) 10) (<< %aa64_reg(ra) 5) %aa64_reg(rd)))
+%endm
+
+%macro aa64_sub_imm_lsl12(rd, ra, imm12)
+%((| 0xD1400000 (<< (& imm12 0xFFF) 10) (<< %aa64_reg(ra) 5) %aa64_reg(rd)))
+%endm
+
+# ADD/SUB immediate with arbitrary unsigned magnitude. The native imm12
+# form covers [0, 4095]; the imm12<<12 form (optionally combined with a
+# second imm12 for the low bits) covers [4096, 0xFFFFFF]. Past 24 bits,
+# materialize the constant in scratch and emit the R-type ADD/SUB.
+# Callers must not pass `scratch` as `ra` (the materialize would
+# clobber it before the R-type read).
+%macro aa64_add_imm_any(rd, ra, imm)
+%select((<= imm 4095),
+    %aa64_add_imm(rd, ra, imm),
+    %select((<= imm 0xFFFFFF),
+        %select((= (& imm 0xFFF) 0),
+            %aa64_add_imm_lsl12(rd, ra, (>> imm 12)),
+            %aa64_add_imm_lsl12(rd, ra, (>> imm 12))
+            %aa64_add_imm(rd, rd, (& imm 0xFFF))),
+        %p1_li(scratch, imm)
+        %aa64_rrr(0x8B000000, rd, ra, scratch)))
+%endm
+
+%macro aa64_sub_imm_any(rd, ra, imm)
+%select((<= imm 4095),
+    %aa64_sub_imm(rd, ra, imm),
+    %select((<= imm 0xFFFFFF),
+        %select((= (& imm 0xFFF) 0),
+            %aa64_sub_imm_lsl12(rd, ra, (>> imm 12)),
+            %aa64_sub_imm_lsl12(rd, ra, (>> imm 12))
+            %aa64_sub_imm(rd, rd, (& imm 0xFFF))),
+        %p1_li(scratch, imm)
+        %aa64_rrr(0xCB000000, rd, ra, scratch)))
+%endm
+
+%macro aa64_mov_rr(dst, src)
+%select((= %aa64_is_sp(dst) 1),
+    %aa64_add_imm(sp, src, 0),
+    %select((= %aa64_is_sp(src) 1),
+        %aa64_add_imm(dst, sp, 16),
+        %((| 0xAA000000 (<< %aa64_reg(src) 16) (<< 31 5) %aa64_reg(dst)))))
+%endm
+
+%macro aa64_ubfm(rd, ra, immr, imms)
+%((| 0xD3400000 (<< immr 16) (<< imms 10) (<< %aa64_reg(ra) 5) %aa64_reg(rd)))
+%endm
+
+%macro aa64_sbfm(rd, ra, immr, imms)
+%((| 0x93400000 (<< immr 16) (<< imms 10) (<< %aa64_reg(ra) 5) %aa64_reg(rd)))
+%endm
+
+%macro aa64_movz(rd, imm16)
+%((| 0xD2800000 (<< (& imm16 0xFFFF) 5) %aa64_reg(rd)))
+%endm
+
+%macro aa64_movn(rd, imm16)
+%((| 0x92800000 (<< (& imm16 0xFFFF) 5) %aa64_reg(rd)))
+%endm
+
+%macro aa64_materialize_small_imm(rd, imm)
+%select((>= imm 0),
+    %aa64_movz(rd, imm),
+    %aa64_movn(rd, (& (~ imm) 0xFFFF)))
+%endm
+
+# Materialize an arbitrary 64-bit signed immediate into `rd`. Picks the
+# 1-insn MOVZ / MOVN form when the value (or its complement, for
+# negatives) fits 16 bits; otherwise emits the 4-insn MOVZ + 3*MOVK
+# chain used by %p1_li. Used by ANDI/ORI/ADDI fallbacks below to avoid
+# silently truncating to the small-imm window.
+%macro aa64_materialize_imm_any(rd, imm)
+%select((>= imm 0),
+    %select((<= imm 0xFFFF),
+        %aa64_movz(rd, imm),
+        %p1_li(rd, imm)),
+    %select((>= imm -65536),
+        %aa64_movn(rd, (& (~ imm) 0xFFFF)),
+        %p1_li(rd, imm)))
+%endm
+
+%macro aa64_ldst_uimm12(base, rt, rn, off_bytes, size_log2)
+%((| base (<< (>> off_bytes size_log2) 10) (<< %aa64_reg(rn) 5) %aa64_reg(rt)))
+%endm
+
+%macro aa64_ldst_unscaled(base, rt, rn, off)
+%((| base (<< (& off 0x1FF) 12) (<< %aa64_reg(rn) 5) %aa64_reg(rt)))
+%endm
+
+%macro aa64_mem_uimm_base_LD()
+0xF9400000
+%endm
+%macro aa64_mem_uimm_base_ST()
+0xF9000000
+%endm
+%macro aa64_mem_uimm_base_LB()
+0x39400000
+%endm
+%macro aa64_mem_uimm_base_SB()
+0x39000000
+%endm
+
+%macro aa64_mem_unscaled_base_LD()
+0xF8400000
+%endm
+%macro aa64_mem_unscaled_base_ST()
+0xF8000000
+%endm
+%macro aa64_mem_unscaled_base_LB()
+0x38400000
+%endm
+%macro aa64_mem_unscaled_base_SB()
+0x38000000
+%endm
+
+%macro aa64_mem_size_LD()
+3
+%endm
+%macro aa64_mem_size_ST()
+3
+%endm
+%macro aa64_mem_size_LB()
+0
+%endm
+%macro aa64_mem_size_SB()
+0
+%endm
+
+%macro aa64_mem_uimm_base(op)
+%aa64_mem_uimm_base_##op
+%endm
+
+%macro aa64_mem_unscaled_base(op)
+%aa64_mem_unscaled_base_##op
+%endm
+
+%macro aa64_mem_size(op)
+%aa64_mem_size_##op
+%endm
+
+%macro aa64_mem_fallback(op, rt, rn, off)
+%select((>= off 0),
+    %aa64_add_imm_any(scratch, rn, off)
+    %aa64_ldst_uimm12(%aa64_mem_uimm_base(op), rt, scratch, 0, %aa64_mem_size(op)),
+    %aa64_sub_imm_any(scratch, rn, (- 0 off))
+    %aa64_ldst_uimm12(%aa64_mem_uimm_base(op), rt, scratch, 0, %aa64_mem_size(op)))
+%endm
+
+%macro aa64_mem_after_uimm(op, rt, rn, off)
+%select((>= off -256),
+    %select((<= off 255),
+        %aa64_ldst_unscaled(%aa64_mem_unscaled_base(op), rt, rn, off),
+        %aa64_mem_fallback(op, rt, rn, off)),
+    %aa64_mem_fallback(op, rt, rn, off))
+%endm
+
+%macro aa64_mem_after_nonneg(op, rt, rn, off)
+%select((= (& off (- (<< 1 %aa64_mem_size(op)) 1)) 0),
+    %select((< off (<< 4096 %aa64_mem_size(op))),
+        %aa64_ldst_uimm12(%aa64_mem_uimm_base(op), rt, rn, off, %aa64_mem_size(op)),
+        %aa64_mem_after_uimm(op, rt, rn, off)),
+    %aa64_mem_after_uimm(op, rt, rn, off))
+%endm
+
+%macro aa64_mem(op, rt, rn, off)
+%select((>= off 0),
+    %aa64_mem_after_nonneg(op, rt, rn, off),
+    %aa64_mem_after_uimm(op, rt, rn, off))
+%endm
+
+%macro aa64_cmp_skip(cond, ra, rb)
+%((| 0xEB000000 (<< %aa64_reg(rb) 16) (<< %aa64_reg(ra) 5) 31))
+%((| 0x54000040 cond))
+%endm
+
+%macro aa64_br(reg)
+%((| 0xD61F0000 (<< %aa64_reg(reg) 5)))
+%endm
+
+%macro aa64_blr(reg)
+%((| 0xD63F0000 (<< %aa64_reg(reg) 5)))
+%endm
+
+%macro aa64_ret()
+%(0xD65F03C0)
+%endm
+
+%macro aa64_lit64_prefix(rd)
+# 64-bit literal-pool prefix for LI: ldr xN, [pc,#8]; b PC+12.
+# The 8 bytes that follow in source become the literal; b skips them.
+%((| 0x58000040 %aa64_reg(rd)))
+%(0x14000003)
+%endm
+
+%macro aa64_lit32_prefix(rd)
+# 32-bit literal-pool prefix for LA / LA_BR: ldr wN, [pc,#8]; b PC+8.
+# ldr w zero-extends into the full 64-bit register, so a 4-byte literal
+# is enough for any address in the stage0 layout. Lets source use
+# `&label` directly without padding to 8 bytes.
+%((| 0x18000040 %aa64_reg(rd)))
+%(0x14000002)
+%endm
+
+# ---- P1 register-register op lowering -----------------------------------
+
+%macro aa64_rrr_ADD(rd, ra, rb)
+%aa64_rrr(0x8B000000, rd, ra, rb)
+%endm
+%macro aa64_rrr_SUB(rd, ra, rb)
+%aa64_rrr(0xCB000000, rd, ra, rb)
+%endm
+%macro aa64_rrr_AND(rd, ra, rb)
+%aa64_rrr(0x8A000000, rd, ra, rb)
+%endm
+%macro aa64_rrr_OR(rd, ra, rb)
+%aa64_rrr(0xAA000000, rd, ra, rb)
+%endm
+%macro aa64_rrr_XOR(rd, ra, rb)
+%aa64_rrr(0xCA000000, rd, ra, rb)
+%endm
+%macro aa64_rrr_SHL(rd, ra, rb)
+%aa64_rrr(0x9AC02000, rd, ra, rb)
+%endm
+%macro aa64_rrr_SHR(rd, ra, rb)
+%aa64_rrr(0x9AC02400, rd, ra, rb)
+%endm
+%macro aa64_rrr_SAR(rd, ra, rb)
+%aa64_rrr(0x9AC02800, rd, ra, rb)
+%endm
+%macro aa64_rrr_DIV(rd, ra, rb)
+%aa64_rrr(0x9AC00C00, rd, ra, rb)
+%endm
+%macro aa64_rrr_MUL(rd, ra, rb)
+%((| 0x9B000000 (<< %aa64_reg(rb) 16) (<< 31 10) (<< %aa64_reg(ra) 5) %aa64_reg(rd)))
+%endm
+%macro aa64_rrr_REM(rd, ra, rb)
+%((| 0x9AC00C00 (<< %aa64_reg(rb) 16) (<< %aa64_reg(ra) 5) %aa64_reg(scratch)))
+%((| 0x9B008000 (<< %aa64_reg(rb) 16) (<< %aa64_reg(ra) 10) (<< %aa64_reg(scratch) 5) %aa64_reg(rd)))
+%endm
+
+%macro aa64_rrr_op(op, rd, ra, rb)
+%aa64_rrr_##op(rd, ra, rb)
+%endm
+
+# ---- P1 operation lowering -----------------------------------------------
+
+# MOVZ + 3 MOVK chain for 64-bit immediate. 4 instructions, 16 bytes — same
+# size as the prior LDR-literal-pool lowering. Pure instructions, no inline
+# data, which is the standard aarch64 codegen for materializing constants.
+%macro aa64_movk_lsl16(rd, imm16)
+%((| 0xF2A00000 (<< (& imm16 0xFFFF) 5) %aa64_reg(rd)))
+%endm
+%macro aa64_movk_lsl32(rd, imm16)
+%((| 0xF2C00000 (<< (& imm16 0xFFFF) 5) %aa64_reg(rd)))
+%endm
+%macro aa64_movk_lsl48(rd, imm16)
+%((| 0xF2E00000 (<< (& imm16 0xFFFF) 5) %aa64_reg(rd)))
+%endm
+
+%macro p1_li(rd, imm)
+%aa64_movz(rd, (& imm 0xFFFF))
+%aa64_movk_lsl16(rd, (& (>> imm 16) 0xFFFF))
+%aa64_movk_lsl32(rd, (& (>> imm 32) 0xFFFF))
+%aa64_movk_lsl48(rd, (& (>> imm 48) 0xFFFF))
+%endm
+
+%macro p1_la(rd)
+%aa64_lit32_prefix(rd)
+%endm
+
+%macro p1_labr()
+%aa64_lit32_prefix(br)
+%endm
+
+%macro p1_mov(rd, rs)
+%aa64_mov_rr(rd, rs)
+%endm
+
+%macro p1_rrr(op, rd, ra, rb)
+%aa64_rrr_op(op, rd, ra, rb)
+%endm
+
+%macro p1_addi(rd, ra, imm)
+%select((>= imm 0),
+    %aa64_add_imm_any(rd, ra, imm),
+    %aa64_sub_imm_any(rd, ra, (- 0 imm)))
+%endm
+
+%macro p1_logi_ANDI(rd, ra, imm)
+%aa64_materialize_imm_any(scratch, imm)
+%aa64_rrr(0x8A000000, rd, ra, scratch)
+%endm
+%macro p1_logi_ORI(rd, ra, imm)
+%aa64_materialize_imm_any(scratch, imm)
+%aa64_rrr(0xAA000000, rd, ra, scratch)
+%endm
+%macro p1_logi(op, rd, ra, imm)
+%p1_logi_##op(rd, ra, imm)
+%endm
+
+%macro p1_shifti_SHLI(rd, ra, imm)
+%aa64_ubfm(rd, ra, (& (- 0 imm) 63), (- 63 imm))
+%endm
+%macro p1_shifti_SHRI(rd, ra, imm)
+%aa64_ubfm(rd, ra, imm, 63)
+%endm
+%macro p1_shifti_SARI(rd, ra, imm)
+%aa64_sbfm(rd, ra, imm, 63)
+%endm
+%macro p1_shifti(op, rd, ra, imm)
+%p1_shifti_##op(rd, ra, imm)
+%endm
+
+%macro p1_mem(op, rt, rn, off)
+%select((= %aa64_is_sp(rn) 1),
+    %aa64_mem(op, rt, rn, (+ off 16)),
+    %aa64_mem(op, rt, rn, off))
+%endm
+
+%macro p1_ldarg(rd, slot)
+%aa64_mem(LD, scratch, sp, 8)
+%aa64_mem(LD, rd, scratch, (+ 16 (* 8 slot)))
+%endm
+
+%macro p1_b()
+%aa64_br(br)
+%endm
+
+%macro p1_br(rs)
+%aa64_br(rs)
+%endm
+
+%macro p1_call()
+%aa64_blr(br)
+%endm
+
+%macro p1_callr(rs)
+%aa64_blr(rs)
+%endm
+
+%macro p1_ret()
+%aa64_ret
+%endm
+
+%macro p1_eret()
+%aa64_mem(LD, lr, sp, 0)
+%aa64_mem(LD, x8, sp, 8)
+%aa64_mov_rr(sp, x8)
+%aa64_ret
+%endm
+
+%macro p1_tail()
+%aa64_mem(LD, lr, sp, 0)
+%aa64_mem(LD, x8, sp, 8)
+%aa64_mov_rr(sp, x8)
+%aa64_br(br)
+%endm
+
+%macro p1_tailr(rs)
+%aa64_mem(LD, lr, sp, 0)
+%aa64_mem(LD, x8, sp, 8)
+%aa64_mov_rr(sp, x8)
+%aa64_br(rs)
+%endm
+
+%macro p1_condb_BEQ(ra, rb)
+%aa64_cmp_skip(1, ra, rb)
+%aa64_br(br)
+%endm
+%macro p1_condb_BNE(ra, rb)
+%aa64_cmp_skip(0, ra, rb)
+%aa64_br(br)
+%endm
+%macro p1_condb_BLT(ra, rb)
+%aa64_cmp_skip(10, ra, rb)
+%aa64_br(br)
+%endm
+%macro p1_condb_BLTU(ra, rb)
+%aa64_cmp_skip(2, ra, rb)
+%aa64_br(br)
+%endm
+%macro p1_condb(op, ra, rb)
+%p1_condb_##op(ra, rb)
+%endm
+
+%macro p1_condbz_BEQZ(ra)
+%((| 0xB5000000 (<< 2 5) %aa64_reg(ra)))
+%aa64_br(br)
+%endm
+%macro p1_condbz_BNEZ(ra)
+%((| 0xB4000000 (<< 2 5) %aa64_reg(ra)))
+%aa64_br(br)
+%endm
+%macro p1_condbz_BLTZ(ra)
+%((| 0xEB1F001F (<< %aa64_reg(ra) 5)))
+%((| 0x54000040 10))
+%aa64_br(br)
+%endm
+%macro p1_condbz(op, ra)
+%p1_condbz_##op(ra)
+%endm
+
+%macro p1_enter(size)
+%aa64_sub_imm_any(sp, sp, (& (+ (+ 16 size) 15) -16))
+%aa64_mem(ST, lr, sp, 0)
+%aa64_add_imm_any(x8, sp, (& (+ (+ 16 size) 15) -16))
+%aa64_mem(ST, x8, sp, 8)
+%endm
+
+%macro p1_entry()
+# :_start stub emitted by the aarch64 backend per the P1 program-entry
+# model. Captures argc from [sp] into a0, computes argv=sp+8 into a1,
+# calls p1_main under the one-word direct-result convention, then issues
+# a native Linux sys_exit with p1_main's return value as the exit status.
+:_start
+%aa64_mem(LD, a0, sp, 0)
+%aa64_add_imm(a1, sp, 8)
+%aa64_lit32_prefix(br)
+&p1_main
+%aa64_blr(br)
+%aa64_movz(x8, 93)
+%(0xD4000001)
+%endm
+
+%macro p1_syscall()
+%aa64_mov_rr(x8, a0)
+%aa64_mov_rr(save0, a1)
+%aa64_mov_rr(save1, a2)
+%aa64_mov_rr(save2, a3)
+%aa64_mov_rr(a0, save0)
+%aa64_mov_rr(a1, save1)
+%aa64_mov_rr(a2, save2)
+%aa64_mov_rr(a3, t0)
+%aa64_mov_rr(x4, s0)
+%aa64_mov_rr(x5, s1)
+%(0xD4000001)
+%aa64_mov_rr(a1, save0)
+%aa64_mov_rr(a2, save1)
+%aa64_mov_rr(a3, save2)
+%endm
+
+# ---- Linux aarch64 syscall numbers ---------------------------------------
+# Each macro returns the syscall number as an integer atom so callers can
+# use it inside expressions (e.g. `%li(a0, %sys_write)`).
+
+%macro p1_sys_read()
+63
+%endm
+%macro p1_sys_write()
+64
+%endm
+%macro p1_sys_close()
+57
+%endm
+%macro p1_sys_openat()
+56
+%endm
+%macro p1_sys_exit()
+93
+%endm
+%macro p1_sys_clone()
+220
+%endm
+%macro p1_sys_execve()
+221
+%endm
+%macro p1_sys_spawn()
+1024
+%endm
+%macro p1_sys_waitid()
+95
+%endm
+%macro p1_sys_lseek()
+62
+%endm
+%macro p1_sys_brk()
+214
+%endm
+%macro p1_sys_unlinkat()
+35
+%endm

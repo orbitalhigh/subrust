@@ -1,0 +1,51 @@
+# parse-main.P1pp — dump driver for the parser gate (program mode). Heap:
+# src@base, tokens@+65536, nodes@+327680, fn table@+786432 (1024*32),
+# fn_ptok@+819200 (4096*8), const table@+851968 (1024*16). Reads stdin, lexes,
+# parses a whole PROGRAM (p_program), and dumps: header [node_n,fn_n,ptok_n,
+# const_n] then node arena (56B records) then fn rows [tok,body,np,poff] (32B)
+# then fn_ptok (8B) then const rows [tok,expr] (16B). Diffed vs parse-ref.rs
+# SR_PARSE=program.
+
+%fn(p1_main, 32, {
+    %st(s0, sp, 0)
+    %li(a0, 0) %call(&sys_brk) %mov(s0, a0)          # base
+    %la(t0, &g_src)     %st(s0, t0, 0)
+    %li(t1, 65536)  %add(t1, s0, t1) %la(t0, &g_tok)     %st(t1, t0, 0)
+    %li(t1, 327680) %add(t1, s0, t1) %la(t0, &g_node)    %st(t1, t0, 0)
+    %li(t1, 786432) %add(t1, s0, t1) %la(t0, &g_fn)      %st(t1, t0, 0)
+    %li(t1, 819200) %add(t1, s0, t1) %la(t0, &g_fnptok)  %st(t1, t0, 0)
+    %li(t1, 851968) %add(t1, s0, t1) %la(t0, &g_const)   %st(t1, t0, 0)
+    %li(t1, 868352) %add(a0, s0, t1) %call(&sys_brk)     # reserve heap
+    %li(s0, 0)                                       # srcn
+:.rd
+    %li(t1, 65536) %sub(a2, t1, s0) %beqz(a2, &.rdd)
+    %la(t0, &g_src) %ld(a1, t0, 0) %add(a1, a1, s0)
+    %li(a0, 0) %call(&sys_read)
+    %beqz(a0, &.rdd) %bltz(a0, &.rdd)
+    %add(s0, s0, a0) %b(&.rd)
+:.rdd
+    %la(t0, &g_srcn) %st(s0, t0, 0)
+    %call(&lex)
+    %call(&p_program)
+    # header: node_n, fn_n, ptok_n, const_n
+    %li(a0, 1) %la(a1, &g_noden)  %li(a2, 8) %call(&sys_write)
+    %li(a0, 1) %la(a1, &g_fnn)    %li(a2, 8) %call(&sys_write)
+    %li(a0, 1) %la(a1, &g_ptokn)  %li(a2, 8) %call(&sys_write)
+    %li(a0, 1) %la(a1, &g_constn) %li(a2, 8) %call(&sys_write)
+    # node arena
+    %li(a0, 1) %la(t0, &g_node) %ld(a1, t0, 0)
+    %la(t0, &g_noden) %ld(t1, t0, 0) %li(t2, 56) %mul(a2, t1, t2) %call(&sys_write)
+    # fn rows (32B each)
+    %li(a0, 1) %la(t0, &g_fn) %ld(a1, t0, 0)
+    %la(t0, &g_fnn) %ld(t1, t0, 0) %shli(a2, t1, 5) %call(&sys_write)
+    # fn_ptok (8B each)
+    %li(a0, 1) %la(t0, &g_fnptok) %ld(a1, t0, 0)
+    %la(t0, &g_ptokn) %ld(t1, t0, 0) %shli(a2, t1, 3) %call(&sys_write)
+    # const rows (16B each)
+    %li(a0, 1) %la(t0, &g_const) %ld(a1, t0, 0)
+    %la(t0, &g_constn) %ld(t1, t0, 0) %shli(a2, t1, 4) %call(&sys_write)
+    %li(a0, 0)
+    %ld(s0, sp, 0)
+})
+
+:ELF_end

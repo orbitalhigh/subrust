@@ -1,0 +1,1922 @@
+# p1pp.P1pp -- libp1pp v1, portable utility library for P1pp programs.
+#
+# Concatenated after the P1 backend header and frontend, and before user
+# source:
+#
+#     catm P1-<arch>.M1pp P1.M1pp p1pp.P1pp usersrc.P1pp > program.M1
+#
+# Targets P1-64 only (WORD = 8). All internal labels use the
+# `libp1pp__` prefix; public entry points are unprefixed.
+#
+# See docs/LIBP1PP.md for the public contract.
+
+# =========================================================================
+# Compile-time helpers
+# =========================================================================
+
+# %alignup -- Round `rs` up to a multiple of `align` (a power of two) and
+# place the result in `rd`. `scratch` is clobbered. `align` must be a
+# constant integer expression. Two instructions plus an %li for the mask:
+#
+#     rd      = rs + (align - 1)
+#     scratch = -align          (i.e. ~(align-1) for power-of-two align)
+#     rd      = rd & scratch
+%macro alignup(rd, rs, align, scratch)
+    %addi(rd, rs, (- align 1))
+    %li(scratch, (- 0 align))
+    %and(rd, rd, scratch)
+%endm
+
+# =========================================================================
+# Global memory access
+# =========================================================================
+#
+# Shorthand for the la + ld(_,0) / la + st(_,0) idiom that dereferences a
+# pointer slot at a labeled global. `name` is a label expression in the
+# `&foo` form that %la accepts.
+#
+# %ld_global  -- rd = *name. rd doubles as the address scratch.
+# %st_global  -- *name = rs. Needs a separate `scratch` since rs holds the
+#                value being written.
+# %lda_global -- rd = *name AND raddr = &name. Use when the address is
+#                also needed afterward (e.g. load then store back).
+
+%macro ld_global(rd, name)
+    %la(rd, name)
+    %ld(rd, rd, 0)
+%endm
+
+%macro st_global(rs, name, scratch)
+    %la(scratch, name)
+    %st(rs, scratch, 0)
+%endm
+
+%macro lda_global(rd, raddr, name)
+    %la(raddr, name)
+    %ld(rd, raddr, 0)
+%endm
+
+# =========================================================================
+# Array indexing
+# =========================================================================
+#
+# Compute *(base + idx * stride + off) for register `base`, register
+# `idx`, and constant `stride` and `off`. `stride` is materialized via
+# %li and folded into idx via %mul, so it does not need to be a power of
+# two. `off` is a constant byte offset within the element (use 0 for
+# plain element access; non-zero for field access).
+#
+# All three macros need a separate scratch to hold the computed address,
+# because both `base` and `idx` are register inputs that must survive the
+# multiply. `lda_array` reuses its `raddr` output as that scratch.
+#
+# %ld_array  -- rd = *(base + idx*stride + off).
+# %st_array  -- *(base + idx*stride + off) = rs.
+# %lda_array -- rd = *addr AND raddr = base + idx*stride; ld is at
+#               offset `off`. Use when subsequent code also needs the
+#               computed address (e.g. for additional field accesses).
+
+%macro ld_array(rd, base, stride, idx, off, scratch)
+    %li(scratch, stride)
+    %mul(scratch, idx, scratch)
+    %add(scratch, base, scratch)
+    %ld(rd, scratch, off)
+%endm
+
+%macro st_array(rs, base, stride, idx, off, scratch)
+    %li(scratch, stride)
+    %mul(scratch, idx, scratch)
+    %add(scratch, base, scratch)
+    %st(rs, scratch, off)
+%endm
+
+%macro lda_array(rd, raddr, base, stride, idx, off)
+    %li(raddr, stride)
+    %mul(raddr, idx, raddr)
+    %add(raddr, base, raddr)
+    %ld(rd, raddr, off)
+%endm
+
+# =========================================================================
+# Sub-word memory access
+# =========================================================================
+#
+# P1 has only 1-byte (%lb/%sb) and 8-byte (%ld/%st) memory ops, and the
+# 8-byte ops require natural 8-byte alignment. For struct fields and
+# packed data laid out at narrower widths, sub-word access is byte-
+# decomposed: %lb-gather + shli/or for loads, %sb-scatter + shri for
+# stores. These macros encapsulate that pattern so callers do not have
+# to open-code it (and so a backend can later substitute a single
+# native sub-word load/store when alignment is statically known).
+#
+# Conventions:
+#   `rd` is the destination (loads); `rs` is the source (stores).
+#   Stores preserve `rs`; loads clobber `rd`. `scratch` is a working
+#   register distinct from rd/rs and base. Bytes are little-endian:
+#   byte 0 (low) at off+0. The signed-load variants (%ld_sh, %ld_sw)
+#   sign-extend the gathered value to the canonical 64-bit form.
+#
+# %ld_h(rd, base, off, scratch)   — 2-byte zero-extending load
+# %ld_w(rd, base, off, scratch)   — 4-byte zero-extending load
+# %ld_sh(rd, base, off, scratch)  — 2-byte sign-extending load
+# %ld_sw(rd, base, off, scratch)  — 4-byte sign-extending load
+# %st_h(rs, base, off, scratch)   — 2-byte store (writes low 16 bits)
+# %st_w(rs, base, off, scratch)   — 4-byte store (writes low 32 bits)
+
+%macro ld_h(rd, base, off, scratch)
+    %lb(rd, base, off)
+    %lb(scratch, base, (+ off 1))
+    %shli(scratch, scratch, 8)
+    %or(rd, rd, scratch)
+%endm
+
+%macro ld_w(rd, base, off, scratch)
+    %lb(rd, base, off)
+    %lb(scratch, base, (+ off 1))
+    %shli(scratch, scratch, 8)
+    %or(rd, rd, scratch)
+    %lb(scratch, base, (+ off 2))
+    %shli(scratch, scratch, 16)
+    %or(rd, rd, scratch)
+    %lb(scratch, base, (+ off 3))
+    %shli(scratch, scratch, 24)
+    %or(rd, rd, scratch)
+%endm
+
+%macro ld_sh(rd, base, off, scratch)
+    %ld_h(rd, base, off, scratch)
+    %shli(rd, rd, 48)
+    %sari(rd, rd, 48)
+%endm
+
+%macro ld_sw(rd, base, off, scratch)
+    %ld_w(rd, base, off, scratch)
+    %shli(rd, rd, 32)
+    %sari(rd, rd, 32)
+%endm
+
+%macro st_h(rs, base, off, scratch)
+    %sb(rs, base, off)
+    %shri(scratch, rs, 8)
+    %sb(scratch, base, (+ off 1))
+%endm
+
+%macro st_w(rs, base, off, scratch)
+    %sb(rs, base, off)
+    %shri(scratch, rs, 8)
+    %sb(scratch, base, (+ off 1))
+    %shri(scratch, rs, 16)
+    %sb(scratch, base, (+ off 2))
+    %shri(scratch, rs, 24)
+    %sb(scratch, base, (+ off 3))
+%endm
+
+# =========================================================================
+# Sign and zero extension
+# =========================================================================
+#
+# %sextN(rd, ra)        truncate ra to N bits and sign-extend to 64.
+# %zextN(rd, ra)        truncate ra to N bits and zero-extend to 64.
+# %zext32(rd, ra, scratch)
+#                       like zextN but needs a scratch register because
+#                       0xFFFFFFFF does not fit a 16-bit movz immediate
+#                       (the path %andi takes when materializing the mask).
+#
+# rd may equal ra. The signed forms use shli/sari at the right amount;
+# zext8/zext16 ride on %andi (the mask fits movz so no caller scratch
+# needed); zext32 materializes the mask explicitly.
+
+%macro sext8(rd, ra)
+    %shli(rd, ra, 56)
+    %sari(rd, rd, 56)
+%endm
+
+%macro sext16(rd, ra)
+    %shli(rd, ra, 48)
+    %sari(rd, rd, 48)
+%endm
+
+%macro sext32(rd, ra)
+    %shli(rd, ra, 32)
+    %sari(rd, rd, 32)
+%endm
+
+%macro zext8(rd, ra)
+    %andi(rd, ra, 255)
+%endm
+
+%macro zext16(rd, ra)
+    %andi(rd, ra, 65535)
+%endm
+
+%macro zext32(rd, ra, scratch)
+    %li(scratch, 4294967295)
+    %and(rd, ra, scratch)
+%endm
+
+# =========================================================================
+# Frame-slot address
+# =========================================================================
+#
+# %lea_slot(rd, slot)   rd = address of the frame slot at byte offset
+#                       `slot`. Centralizes the "%mov(rd, sp) +
+#                       %addi(rd, rd, slot)" idiom — the backend folds
+#                       its hidden frame-header offset into %mov(rd, sp),
+#                       so callers must not bake a literal 16 into the
+#                       %addi. `slot` may be any M1pp integer expression
+#                       (a literal byte offset or a %fn__SO-relative
+#                       slot-expr).
+
+%macro lea_slot(rd, slot)
+    %mov(rd, sp)
+    %addi(rd, rd, slot)
+%endm
+
+# =========================================================================
+# Pointer scaling
+# =========================================================================
+#
+# %ptr_add(rd, ptr, idx, sz, scratch)   rd = ptr + idx*sz
+# %ptr_sub(rd, ptr, idx, sz, scratch)   rd = ptr - idx*sz
+# %ptr_diff(rd, p, q, sz, scratch)      rd = (p - q) / sz
+#
+# `sz` is an M1pp-time integer constant (the C pointee size). When
+# sz == 1 the multiply (or divide) collapses out at expansion time.
+#
+# %ptr_add and %ptr_sub clobber `scratch`. %ptr_diff clobbers `scratch`
+# (only when sz != 1) and computes through `rd`, so callers must not
+# alias `rd` with `p` or `q` in the sz != 1 path.
+
+# sz <= 1 takes the byte-stride fast path: char* (sz=1) and void*
+# (cc.scm uses sz=-1 for the void pointee, following GCC's byte-arith
+# extension) both want raw idx with no scaling.
+
+%macro ptr_add(rd, ptr, idx, sz, scratch)
+%select((< sz 2),
+    %add(rd, ptr, idx),
+    %li(scratch, sz)
+    %mul(scratch, idx, scratch)
+    %add(rd, ptr, scratch))
+%endm
+
+%macro ptr_sub(rd, ptr, idx, sz, scratch)
+%select((< sz 2),
+    %sub(rd, ptr, idx),
+    %li(scratch, sz)
+    %mul(scratch, idx, scratch)
+    %sub(rd, ptr, scratch))
+%endm
+
+%macro ptr_diff(rd, p, q, sz, scratch)
+%select((< sz 2),
+    %sub(rd, p, q),
+    %sub(rd, p, q)
+    %li(scratch, sz)
+    %div(rd, rd, scratch))
+%endm
+
+# =========================================================================
+# Memcpy-call shorthand
+# =========================================================================
+#
+# %memcpy_call(dst_reg, src_reg, n_imm)
+#   Marshal arguments into the libp1pp memcpy ABI and invoke it. Useful
+#   for fixed-size memory copies (e.g. struct copy in a code generator)
+#   where the size is known at expansion time. dst_reg and src_reg must
+#   not be a0 — the dst move would clobber a different live input.
+
+%macro memcpy_call(dst_reg, src_reg, n_imm)
+    %li(a2, n_imm)
+    %mov(a1, src_reg)
+    %mov(a0, dst_reg)
+    %call(&memcpy)
+%endm
+
+# =========================================================================
+# Compare-and-set-bool macros
+# =========================================================================
+#
+# %cmpset_<cc>(rd, ra[, rb])  rd = (ra <cc> rb) ? 1 : 0
+#
+# Two-operand: eq, ne, lt, ltu, le, leu, ge, geu (signed/unsigned).
+# Zero-operand (compare against zero): eqz, nez, ltz.
+#
+# le/ge/leu/geu lower through the same ifelse machinery with operands
+# swapped or condition flipped: a >= b iff !(a < b) iff (b <= a-1), and
+# we reach it as (b < a) ? 0 : 1 via ifelse_lt with swapped arms (and
+# the unsigned/signed pairing follows ltu/lt).
+#
+# Lower to %ifelse_<cc>(...) which itself works across all P1 backends.
+# A backend that supports a native conditional-set instruction can later
+# specialize these to a single op without touching callers.
+
+%macro cmpset_eq(rd, ra, rb)
+    %ifelse_eq(ra, rb, { %li(rd, 1) }, { %li(rd, 0) })
+%endm
+
+%macro cmpset_ne(rd, ra, rb)
+    %ifelse_ne(ra, rb, { %li(rd, 1) }, { %li(rd, 0) })
+%endm
+
+%macro cmpset_lt(rd, ra, rb)
+    %ifelse_lt(ra, rb, { %li(rd, 1) }, { %li(rd, 0) })
+%endm
+
+%macro cmpset_ltu(rd, ra, rb)
+    %ifelse_ltu(ra, rb, { %li(rd, 1) }, { %li(rd, 0) })
+%endm
+
+%macro cmpset_le(rd, ra, rb)
+    %ifelse_lt(rb, ra, { %li(rd, 0) }, { %li(rd, 1) })
+%endm
+
+%macro cmpset_leu(rd, ra, rb)
+    %ifelse_ltu(rb, ra, { %li(rd, 0) }, { %li(rd, 1) })
+%endm
+
+%macro cmpset_ge(rd, ra, rb)
+    %ifelse_lt(ra, rb, { %li(rd, 0) }, { %li(rd, 1) })
+%endm
+
+%macro cmpset_geu(rd, ra, rb)
+    %ifelse_ltu(ra, rb, { %li(rd, 0) }, { %li(rd, 1) })
+%endm
+
+%macro cmpset_eqz(rd, ra)
+    %ifelse_eqz(ra, { %li(rd, 1) }, { %li(rd, 0) })
+%endm
+
+%macro cmpset_nez(rd, ra)
+    %ifelse_nez(ra, { %li(rd, 1) }, { %li(rd, 0) })
+%endm
+
+%macro cmpset_ltz(rd, ra)
+    %ifelse_ltz(ra, { %li(rd, 1) }, { %li(rd, 0) })
+%endm
+
+# =========================================================================
+# Tiny unops
+# =========================================================================
+#
+# %neg(rd, ra, scratch)   rd = -ra        (scratch holds the zero literal)
+# %bnot(rd, ra, scratch)  rd = ~ra        (scratch holds the all-ones literal)
+# %bool(rd, ra)           rd = (ra != 0) ? 1 : 0   (alias of cmpset_nez)
+
+%macro neg(rd, ra, scratch)
+    %li(scratch, 0)
+    %sub(rd, scratch, ra)
+%endm
+
+%macro bnot(rd, ra, scratch)
+    %li(scratch, -1)
+    %xor(rd, ra, scratch)
+%endm
+
+%macro bool(rd, ra)
+    %cmpset_nez(rd, ra)
+%endm
+
+# =========================================================================
+# Switch dispatch
+# =========================================================================
+#
+# %switch_case(ctrl, scratch, key, target)
+#   If `ctrl == key`, branch to `target`. `scratch` is used to
+#   materialize the key as a register operand. `target` is the full
+#   branch target (e.g. `&.case_3`).
+#
+# A code generator emitting a switch dispatcher emits one
+# %switch_case per case, then an unconditional branch to the default.
+
+%macro switch_case(ctrl, scratch, key, target)
+    %li(scratch, key)
+    %beq(ctrl, scratch, target)
+%endm
+
+# =========================================================================
+# Control-flow macros
+# =========================================================================
+#
+# Every conditional block macro uses a uniform three-branch lowering that
+# works for all seven P1 conditions (including LT, LTU, LTZ which have no
+# inverted branch): load a "take the body" target, branch on cc, then
+# unconditionally skip past the body.
+
+# ---- %if_<cc> -----------------------------------------------------------
+
+%macro if_eq(ra, rb, body)
+    %beq(ra, rb, &@body)
+    %b(&@end)
+    :@body
+    body
+    :@end
+%endm
+
+%macro if_ne(ra, rb, body)
+    %bne(ra, rb, &@body)
+    %b(&@end)
+    :@body
+    body
+    :@end
+%endm
+
+%macro if_lt(ra, rb, body)
+    %blt(ra, rb, &@body)
+    %b(&@end)
+    :@body
+    body
+    :@end
+%endm
+
+%macro if_ltu(ra, rb, body)
+    %bltu(ra, rb, &@body)
+    %b(&@end)
+    :@body
+    body
+    :@end
+%endm
+
+%macro if_eqz(ra, body)
+    %beqz(ra, &@body)
+    %b(&@end)
+    :@body
+    body
+    :@end
+%endm
+
+%macro if_nez(ra, body)
+    %bnez(ra, &@body)
+    %b(&@end)
+    :@body
+    body
+    :@end
+%endm
+
+%macro if_ltz(ra, body)
+    %bltz(ra, &@body)
+    %b(&@end)
+    :@body
+    body
+    :@end
+%endm
+
+# ---- %ifelse_<cc> -------------------------------------------------------
+
+%macro ifelse_eq(ra, rb, tblk, fblk)
+    %beq(ra, rb, &@tblk)
+    fblk
+    %b(&@end)
+    :@tblk
+    tblk
+    :@end
+%endm
+
+%macro ifelse_ne(ra, rb, tblk, fblk)
+    %bne(ra, rb, &@tblk)
+    fblk
+    %b(&@end)
+    :@tblk
+    tblk
+    :@end
+%endm
+
+%macro ifelse_lt(ra, rb, tblk, fblk)
+    %blt(ra, rb, &@tblk)
+    fblk
+    %b(&@end)
+    :@tblk
+    tblk
+    :@end
+%endm
+
+%macro ifelse_ltu(ra, rb, tblk, fblk)
+    %bltu(ra, rb, &@tblk)
+    fblk
+    %b(&@end)
+    :@tblk
+    tblk
+    :@end
+%endm
+
+%macro ifelse_eqz(ra, tblk, fblk)
+    %beqz(ra, &@tblk)
+    fblk
+    %b(&@end)
+    :@tblk
+    tblk
+    :@end
+%endm
+
+%macro ifelse_nez(ra, tblk, fblk)
+    %bnez(ra, &@tblk)
+    fblk
+    %b(&@end)
+    :@tblk
+    tblk
+    :@end
+%endm
+
+%macro ifelse_ltz(ra, tblk, fblk)
+    %bltz(ra, &@tblk)
+    fblk
+    %b(&@end)
+    :@tblk
+    tblk
+    :@end
+%endm
+
+# ---- %while_<cc> -------------------------------------------------------
+#
+# Jump-to-test layout: the body runs iff the positive-sense test holds,
+# and the test is compiled below the body so we only emit a forward
+# branch at entry.
+
+%macro while_eq(ra, rb, body)
+    %b(&@test)
+    :@body
+    body
+    :@test
+    %beq(ra, rb, &@body)
+%endm
+
+%macro while_ne(ra, rb, body)
+    %b(&@test)
+    :@body
+    body
+    :@test
+    %bne(ra, rb, &@body)
+%endm
+
+%macro while_lt(ra, rb, body)
+    %b(&@test)
+    :@body
+    body
+    :@test
+    %blt(ra, rb, &@body)
+%endm
+
+%macro while_ltu(ra, rb, body)
+    %b(&@test)
+    :@body
+    body
+    :@test
+    %bltu(ra, rb, &@body)
+%endm
+
+%macro while_eqz(ra, body)
+    %b(&@test)
+    :@body
+    body
+    :@test
+    %beqz(ra, &@body)
+%endm
+
+%macro while_nez(ra, body)
+    %b(&@test)
+    :@body
+    body
+    :@test
+    %bnez(ra, &@body)
+%endm
+
+%macro while_ltz(ra, body)
+    %b(&@test)
+    :@body
+    body
+    :@test
+    %bltz(ra, &@body)
+%endm
+
+# ---- %do_while_<cc> ----------------------------------------------------
+
+%macro do_while_eq(ra, rb, body)
+    :@body
+    body
+    %beq(ra, rb, &@body)
+%endm
+
+%macro do_while_ne(ra, rb, body)
+    :@body
+    body
+    %bne(ra, rb, &@body)
+%endm
+
+%macro do_while_lt(ra, rb, body)
+    :@body
+    body
+    %blt(ra, rb, &@body)
+%endm
+
+%macro do_while_ltu(ra, rb, body)
+    :@body
+    body
+    %bltu(ra, rb, &@body)
+%endm
+
+%macro do_while_eqz(ra, body)
+    :@body
+    body
+    %beqz(ra, &@body)
+%endm
+
+%macro do_while_nez(ra, body)
+    :@body
+    body
+    %bnez(ra, &@body)
+%endm
+
+%macro do_while_ltz(ra, body)
+    :@body
+    body
+    %bltz(ra, &@body)
+%endm
+
+# ---- %for_lt ------------------------------------------------------------
+
+%macro for_lt(i_reg, n_reg, body)
+    %li(i_reg, 0)
+    %b(&@test)
+    :@body
+    body
+    %addi(i_reg, i_reg, 1)
+    :@test
+    %blt(i_reg, n_reg, &@body)
+%endm
+
+# ---- %loop --------------------------------------------------------------
+
+%macro loop(body)
+    :@top
+    body
+    %b(&@top)
+%endm
+
+# ---- Scoped loops -------------------------------------------------------
+#
+# Each scoped form opens a hex2++ `.scope` and defines two dotted labels
+# inside it: `.top` (where `%continue` should land) and `.end`
+# (immediately after the loop, where `%break` should land). The generic
+# `%break` and `%continue` macros below emit branches to `&.end` /
+# `&.top`; hex2++'s innermost-out scope walk binds those references to
+# the nearest enclosing scoped loop.
+#
+# Nested scoped loops shadow each other: a `%break` inside an inner loop
+# targets the inner loop's `.end`. Non-loop control-flow macros
+# (`%if_<cc>`, `%ifelse_<cc>`) do not open a `.scope`, so `%break` /
+# `%continue` inside them passes through to the enclosing scoped loop.
+
+%macro loop_scoped(body)
+    .scope
+    :.top
+    body
+    %b(&.top)
+    :.end
+    .endscope
+%endm
+
+%macro while_scoped_eq(ra, rb, body)
+    .scope
+    %b(&.top)
+    :.body
+    body
+    :.top
+    %beq(ra, rb, &.body)
+    :.end
+    .endscope
+%endm
+
+%macro while_scoped_ne(ra, rb, body)
+    .scope
+    %b(&.top)
+    :.body
+    body
+    :.top
+    %bne(ra, rb, &.body)
+    :.end
+    .endscope
+%endm
+
+%macro while_scoped_lt(ra, rb, body)
+    .scope
+    %b(&.top)
+    :.body
+    body
+    :.top
+    %blt(ra, rb, &.body)
+    :.end
+    .endscope
+%endm
+
+%macro while_scoped_ltu(ra, rb, body)
+    .scope
+    %b(&.top)
+    :.body
+    body
+    :.top
+    %bltu(ra, rb, &.body)
+    :.end
+    .endscope
+%endm
+
+%macro while_scoped_eqz(ra, body)
+    .scope
+    %b(&.top)
+    :.body
+    body
+    :.top
+    %beqz(ra, &.body)
+    :.end
+    .endscope
+%endm
+
+%macro while_scoped_nez(ra, body)
+    .scope
+    %b(&.top)
+    :.body
+    body
+    :.top
+    %bnez(ra, &.body)
+    :.end
+    .endscope
+%endm
+
+%macro while_scoped_ltz(ra, body)
+    .scope
+    %b(&.top)
+    :.body
+    body
+    :.top
+    %bltz(ra, &.body)
+    :.end
+    .endscope
+%endm
+
+%macro for_lt_scoped(i_reg, n_reg, body)
+    .scope
+    %li(i_reg, 0)
+    %b(&.test)
+    :.body
+    body
+    :.top
+    %addi(i_reg, i_reg, 1)
+    :.test
+    %blt(i_reg, n_reg, &.body)
+    :.end
+    .endscope
+%endm
+
+%macro break()
+    %b(&.end)
+%endm
+
+%macro continue()
+    %b(&.top)
+%endm
+
+# =========================================================================
+# %fn -- scope-introducing function definition
+# =========================================================================
+#
+# Opens a hex2++ `.scope` around the body so dotted local labels (`:.foo`,
+# `&.foo`) are private to this function. The body is bracketed by
+# %enter(size) and %eret, so functions defined with %fn always carry a
+# standard frame.
+
+%macro fn(name, size, body)
+    : ## name
+    .scope
+    %enter(size)
+    body
+    %eret
+    .endscope
+%endm
+
+# =========================================================================
+# %fn2 -- function with named locals
+# =========================================================================
+#
+# Like %fn, but the second argument is a braced list of local names
+# instead of a byte frame size. Synthesizes a `name_FRAME` %struct
+# (one 8-byte slot per local), opens both a hex2++ `.scope` and an
+# m1pp `%frame` named after the function, and sizes the stack frame
+# from %name_FRAME.SIZE.
+#
+# Inside the body these helpers resolve against the enclosing frame:
+#   %local(slot)     byte offset of local `slot`
+#   %stl(reg, slot)  store reg into local `slot`
+#   %ldl(reg, slot)  load local `slot` into reg
+#
+# m1pp tracks the active frame in a single slot independent of hex2++
+# scope nesting, so %local / %stl / %ldl keep resolving against the
+# function even when the body opens nested `.scope` blocks (e.g. from
+# a scoped control-flow macro).
+#
+# Locals follow the same braces convention as `body`: a multi-local
+# list must be braced (`{a, b, c}`); a zero-local function uses `{}`.
+
+%macro fn2(name, locals, body)
+    %struct name ## _FRAME { locals }
+    : ## name
+    .scope
+    %frame name
+    %enter(% ## name ## _FRAME.SIZE)
+    body
+    %eret
+    %endframe
+    .endscope
+%endm
+
+%macro stl(reg, slot) %st(reg, sp, %local(slot)) %endm
+%macro ldl(reg, slot) %ld(reg, sp, %local(slot)) %endm
+
+# =========================================================================
+# %assert_<cc> macros
+# =========================================================================
+#
+# Branch past the panic call when the condition holds; otherwise fall
+# through to `LA a0, msg; LA_BR &panic; CALL`. Each assert requires the
+# enclosing function to have an established frame.
+
+%macro assert_eq(ra, rb, msg)
+    %beq(ra, rb, &@done)
+    %la(a0, & ## msg)
+    %call(&panic)
+    :@done
+%endm
+
+%macro assert_ne(ra, rb, msg)
+    %bne(ra, rb, &@done)
+    %la(a0, & ## msg)
+    %call(&panic)
+    :@done
+%endm
+
+%macro assert_lt(ra, rb, msg)
+    %blt(ra, rb, &@done)
+    %la(a0, & ## msg)
+    %call(&panic)
+    :@done
+%endm
+
+%macro assert_ltu(ra, rb, msg)
+    %bltu(ra, rb, &@done)
+    %la(a0, & ## msg)
+    %call(&panic)
+    :@done
+%endm
+
+%macro assert_eqz(ra, msg)
+    %beqz(ra, &@done)
+    %la(a0, & ## msg)
+    %call(&panic)
+    :@done
+%endm
+
+%macro assert_nez(ra, msg)
+    %bnez(ra, &@done)
+    %la(a0, & ## msg)
+    %call(&panic)
+    :@done
+%endm
+
+%macro assert_ltz(ra, msg)
+    %bltz(ra, &@done)
+    %la(a0, & ## msg)
+    %call(&panic)
+    :@done
+%endm
+
+# =========================================================================
+# Memory and strings
+# =========================================================================
+
+# memcpy(dst=a0, src=a1, n=a2) -> dst (a0)
+# Leaf. Copies n bytes from src to dst. No overlap support where
+# dst > src && dst < src + n; use memmove for that case. These mem*
+# entries are the canonical compiler-builtin runtime — every build
+# process in this tree (cc.scm + libp1pp + libc, tcc-cc, tcc-gcc)
+# resolves bare `extern memcpy` against this implementation. The
+# vendored mes-libc is flattened with its own memcpy/memmove/memset/
+# memcmp omitted so the symbols are not duplicated at hex2++ time.
+:memcpy
+.scope
+    %mov(a3, a0)
+    %li(t0, 0)
+    :.loop
+    %beq(t0, a2, &.done)
+    %add(t1, a1, t0)
+    %lb(t1, t1, 0)
+    %add(t2, a3, t0)
+    %sb(t1, t2, 0)
+    %addi(t0, t0, 1)
+    %b(&.loop)
+    :.done
+    %mov(a0, a3)
+    %ret
+.endscope
+
+# memmove(dst=a0, src=a1, n=a2) -> dst (a0)
+# Leaf. Like memcpy but tolerates overlap by picking the safe direction.
+:memmove
+.scope
+    %mov(a3, a0)
+    %beq(a0, a1, &.done)
+    %beqz(a2, &.done)
+    %bltu(a0, a1, &.fwd)
+    # dst > src: copy from the high end down so an overlap that would
+    # clobber a yet-unread src byte is harmless.
+    %mov(t0, a2)
+    :.bwd_loop
+    %addi(t0, t0, -1)
+    %add(t1, a1, t0)
+    %lb(t1, t1, 0)
+    %add(t2, a3, t0)
+    %sb(t1, t2, 0)
+    %bnez(t0, &.bwd_loop)
+    %b(&.done)
+    :.fwd
+    # dst < src: forward copy is safe.
+    %li(t0, 0)
+    :.fwd_loop
+    %beq(t0, a2, &.done)
+    %add(t1, a1, t0)
+    %lb(t1, t1, 0)
+    %add(t2, a3, t0)
+    %sb(t1, t2, 0)
+    %addi(t0, t0, 1)
+    %b(&.fwd_loop)
+    :.done
+    %mov(a0, a3)
+    %ret
+.endscope
+
+# memset(dst=a0, byte=a1, n=a2) -> dst (a0)
+:memset
+.scope
+    %mov(a3, a0)
+    %li(t0, 0)
+    :.loop
+    %beq(t0, a2, &.done)
+    %add(t1, a3, t0)
+    %sb(a1, t1, 0)
+    %addi(t0, t0, 1)
+    %b(&.loop)
+    :.done
+    %mov(a0, a3)
+    %ret
+.endscope
+
+# memcmp(a=a0, b=a1, n=a2) -> -1/0/1 (a0)
+:memcmp
+.scope
+    %li(t0, 0)
+    :.loop
+    %beq(t0, a2, &.eq)
+    %add(t1, a0, t0)
+    %lb(t1, t1, 0)
+    %add(t2, a1, t0)
+    %lb(t2, t2, 0)
+    %bltu(t1, t2, &.lt)
+    %bltu(t2, t1, &.gt)
+    %addi(t0, t0, 1)
+    %b(&.loop)
+    :.lt
+    %li(a0, -1)
+    %ret
+    :.gt
+    %li(a0, 1)
+    %ret
+    :.eq
+    %li(a0, 0)
+    %ret
+.endscope
+
+# libp1pp__strlen(cstr=a0) -> n (a0)
+:libp1pp__strlen
+.scope
+    %mov(a1, a0)
+    :.loop
+    %lb(t0, a1, 0)
+    %beqz(t0, &.done)
+    %addi(a1, a1, 1)
+    %b(&.loop)
+    :.done
+    %sub(a0, a1, a0)
+    %ret
+.endscope
+
+# libp1pp__streq(a=a0, b=a1) -> 0 or 1
+:libp1pp__streq
+.scope
+    :.loop
+    %lb(t0, a0, 0)
+    %lb(t1, a1, 0)
+    %bne(t0, t1, &.ne)
+    %beqz(t0, &.eq)
+    %addi(a0, a0, 1)
+    %addi(a1, a1, 1)
+    %b(&.loop)
+    :.ne
+    %li(a0, 0)
+    %ret
+    :.eq
+    %li(a0, 1)
+    %ret
+.endscope
+
+# libp1pp__strcmp(a=a0, b=a1) -> -1/0/1
+:libp1pp__strcmp
+.scope
+    :.loop
+    %lb(t0, a0, 0)
+    %lb(t1, a1, 0)
+    %bltu(t0, t1, &.lt)
+    %bltu(t1, t0, &.gt)
+    %beqz(t0, &.eq)
+    %addi(a0, a0, 1)
+    %addi(a1, a1, 1)
+    %b(&.loop)
+    :.lt
+    %li(a0, -1)
+    %ret
+    :.gt
+    %li(a0, 1)
+    %ret
+    :.eq
+    %li(a0, 0)
+    %ret
+.endscope
+
+# =========================================================================
+# Integer parsing and formatting
+# =========================================================================
+
+# parse_dec(buf=a0, len=a1) -> (value=a0, consumed=a1)
+# Uses an 8-byte frame slot to save buf_start; all hot-loop state lives
+# in caller-saved registers.
+:parse_dec
+.scope
+    %enter(8)
+    %st(a0, sp, 0)
+    %add(a3, a0, a1)
+    %mov(a2, a0)
+    %li(t0, 0)
+    %li(t1, 0)
+
+    %beq(a2, a3, &.after_sign)
+    %lb(t2, a2, 0)
+    %addi(t2, t2, -45)
+    %bnez(t2, &.after_sign)
+    %li(t0, 1)
+    %addi(a2, a2, 1)
+
+    :.after_sign
+    %mov(a1, a2)
+
+    :.digit_loop
+    %beq(a2, a3, &.digits_done)
+    %lb(t2, a2, 0)
+    %addi(t2, t2, -48)
+    %bltz(t2, &.digits_done)
+    %li(a0, 9)
+    %bltu(a0, t2, &.digits_done)
+    %li(a0, 10)
+    %mul(t1, t1, a0)
+    %add(t1, t1, t2)
+    %addi(a2, a2, 1)
+    %b(&.digit_loop)
+
+    :.digits_done
+    %beq(a2, a1, &.no_digits)
+
+    %bnez(t0, &.apply_sign)
+    %b(&.compute_return)
+    :.apply_sign
+    %li(a0, 0)
+    %sub(t1, a0, t1)
+
+    :.compute_return
+    %ld(a0, sp, 0)
+    %sub(a1, a2, a0)
+    %mov(a0, t1)
+    %eret
+
+    :.no_digits
+    %li(a0, 0)
+    %li(a1, 0)
+    %eret
+.endscope
+
+# parse_hex(buf=a0, len=a1) -> (value=a0, consumed=a1)
+:parse_hex
+.scope
+    %enter(8)
+    %st(a0, sp, 0)
+    %add(a3, a0, a1)
+    %mov(a2, a0)
+    %li(t1, 0)
+    %mov(a1, a2)
+
+    :.loop
+    %beq(a2, a3, &.done)
+    %lb(t2, a2, 0)
+
+    %addi(t0, t2, -48)
+    %bltz(t0, &.check_lower)
+    %li(a0, 9)
+    %bltu(a0, t0, &.check_lower)
+    %b(&.accept)
+
+    :.check_lower
+    %addi(t0, t2, -97)
+    %bltz(t0, &.check_upper)
+    %li(a0, 5)
+    %bltu(a0, t0, &.check_upper)
+    %addi(t0, t0, 10)
+    %b(&.accept)
+
+    :.check_upper
+    %addi(t0, t2, -65)
+    %bltz(t0, &.done)
+    %li(a0, 5)
+    %bltu(a0, t0, &.done)
+    %addi(t0, t0, 10)
+
+    :.accept
+    %shli(t1, t1, 4)
+    %or(t1, t1, t0)
+    %addi(a2, a2, 1)
+    %b(&.loop)
+
+    :.done
+    %beq(a2, a1, &.no_digits)
+    %ld(a0, sp, 0)
+    %sub(a1, a2, a0)
+    %mov(a0, t1)
+    %eret
+
+    :.no_digits
+    %li(a0, 0)
+    %li(a1, 0)
+    %eret
+.endscope
+
+# fmt_dec(buf=a0, value=a1) -> n_bytes (a0)
+#
+# Unified signed formatting: digits are written from the per-iteration
+# `value % 10`, negated when value is negative. This avoids the
+# INT_MIN-overflow trap that `value = -value` would hit.
+:fmt_dec
+.scope
+    %enter(8)
+    %st(a0, sp, 0)
+
+    %bltz(a1, &.is_neg)
+    %b(&.count)
+    :.is_neg
+    %li(t0, 45)
+    %sb(t0, a0, 0)
+    %addi(a0, a0, 1)
+
+    :.count
+    %mov(t0, a1)
+    %li(a2, 1)
+    %li(t1, 10)
+    :.count_loop
+    %div(t0, t0, t1)
+    %beqz(t0, &.count_done)
+    %addi(a2, a2, 1)
+    %b(&.count_loop)
+    :.count_done
+
+    %add(a3, a0, a2)
+
+    :.dig_loop
+    %addi(a3, a3, -1)
+    %rem(t0, a1, t1)
+    %bltz(t0, &.neg_digit)
+    %b(&.write_digit)
+    :.neg_digit
+    %li(t2, 0)
+    %sub(t0, t2, t0)
+    :.write_digit
+    %addi(t0, t0, 48)
+    %sb(t0, a3, 0)
+    %div(a1, a1, t1)
+    %bnez(a1, &.dig_loop)
+
+    %ld(t2, sp, 0)
+    %add(a0, a0, a2)
+    %sub(a0, a0, t2)
+    %eret
+.endscope
+
+# fmt_hex(buf=a0, value=a1) -> n_bytes (a0)
+:fmt_hex
+.scope
+    %enter(8)
+    %st(a0, sp, 0)
+
+    %bnez(a1, &.nonzero)
+    %li(t0, 48)
+    %sb(t0, a0, 0)
+    %li(a0, 1)
+    %eret
+
+    :.nonzero
+    %mov(t0, a1)
+    %li(a2, 0)
+    :.count_loop
+    %addi(a2, a2, 1)
+    %shri(t0, t0, 4)
+    %bnez(t0, &.count_loop)
+
+    %add(a3, a0, a2)
+
+    :.dig_loop
+    %addi(a3, a3, -1)
+    %andi(t0, a1, 15)
+    %li(t1, 10)
+    %bltu(t0, t1, &.is_letter)
+    %addi(t0, t0, -10)
+    %addi(t0, t0, 97)
+    %b(&.write_digit)
+    :.is_letter
+    %addi(t0, t0, 48)
+    :.write_digit
+    %sb(t0, a3, 0)
+    %shri(a1, a1, 4)
+    %bnez(a1, &.dig_loop)
+
+    %ld(t2, sp, 0)
+    %add(a0, a0, a2)
+    %sub(a0, a0, t2)
+    %eret
+.endscope
+
+# =========================================================================
+# Character predicates
+# =========================================================================
+
+# is_digit(c=a0) -> 0 or 1
+:is_digit
+.scope
+    %addi(t0, a0, -48)
+    %li(t1, 10)
+    %li(a0, 1)
+    %bltu(t0, t1, &.done)
+    %li(a0, 0)
+    :.done
+    %ret
+.endscope
+
+# is_hex_digit(c=a0) -> 0 or 1
+:is_hex_digit
+.scope
+    %li(t2, 1)
+    %addi(t0, a0, -48)
+    %li(t1, 10)
+    %bltu(t0, t1, &.done)
+    %addi(t0, a0, -97)
+    %li(t1, 6)
+    %bltu(t0, t1, &.done)
+    %addi(t0, a0, -65)
+    %bltu(t0, t1, &.done)
+    %li(t2, 0)
+    :.done
+    %mov(a0, t2)
+    %ret
+.endscope
+
+# is_space(c=a0) -> 0 or 1
+:is_space
+.scope
+    %li(t2, 1)
+    %addi(t0, a0, -32)
+    %beqz(t0, &.done)
+    %addi(t0, a0, -9)
+    %li(t1, 5)
+    %bltu(t0, t1, &.done)
+    %li(t2, 0)
+    :.done
+    %mov(a0, t2)
+    %ret
+.endscope
+
+# is_alpha(c=a0) -> 0 or 1
+:is_alpha
+.scope
+    %li(t2, 1)
+    %addi(t0, a0, -97)
+    %li(t1, 26)
+    %bltu(t0, t1, &.done)
+    %addi(t0, a0, -65)
+    %bltu(t0, t1, &.done)
+    %li(t2, 0)
+    :.done
+    %mov(a0, t2)
+    %ret
+.endscope
+
+# is_alnum(c=a0) -> 0 or 1
+:is_alnum
+.scope
+    %li(t2, 1)
+    %addi(t0, a0, -48)
+    %li(t1, 10)
+    %bltu(t0, t1, &.done)
+    %addi(t0, a0, -97)
+    %li(t1, 26)
+    %bltu(t0, t1, &.done)
+    %addi(t0, a0, -65)
+    %bltu(t0, t1, &.done)
+    %li(t2, 0)
+    :.done
+    %mov(a0, t2)
+    %ret
+.endscope
+
+# =========================================================================
+# Raw syscall wrappers
+# =========================================================================
+#
+# Each wrapper shifts arguments into the syscall convention
+# (a0 = number, a1..a3/t0/s0/s1 = args 0..5), emits SYSCALL, and returns
+# the raw kernel result. Syscall clobbers only a0, so t0/s0/s1 do not
+# need saving.
+
+# sys_read(fd=a0, buf=a1, len=a2) -> n (a0)
+:sys_read
+    %mov(a3, a2)
+    %mov(a2, a1)
+    %mov(a1, a0)
+    %li(a0, %p1_sys_read)
+    %syscall
+    %ret
+
+# sys_write(fd=a0, buf=a1, len=a2) -> n (a0)
+:sys_write
+    %mov(a3, a2)
+    %mov(a2, a1)
+    %mov(a1, a0)
+    %li(a0, %p1_sys_write)
+    %syscall
+    %ret
+
+# sys_open(path=a0, flags=a1, mode=a2) -> fd (a0)
+# Implemented as openat(AT_FDCWD, path, flags, mode). AT_FDCWD = -100.
+:sys_open
+    %mov(t0, a2)
+    %mov(a3, a1)
+    %mov(a2, a0)
+    %li(a1, -100)
+    %li(a0, %p1_sys_openat)
+    %syscall
+    %ret
+
+# sys_close(fd=a0) -> r (a0)
+:sys_close
+    %mov(a1, a0)
+    %li(a0, %p1_sys_close)
+    %syscall
+    %ret
+
+# sys_lseek(fd=a0, off=a1, whence=a2) -> off (a0)
+:sys_lseek
+    %mov(a3, a2)
+    %mov(a2, a1)
+    %mov(a1, a0)
+    %li(a0, %p1_sys_lseek)
+    %syscall
+    %ret
+
+# sys_brk(addr=a0) -> new_break (a0). addr=0 returns the current break.
+:sys_brk
+    %mov(a1, a0)
+    %li(a0, %p1_sys_brk)
+    %syscall
+    %ret
+
+# sys_unlink(path=a0) -> 0 / -errno (a0).
+# Implemented as unlinkat(AT_FDCWD, path, 0). AT_FDCWD = -100.
+:sys_unlink
+    %li(a3, 0)
+    %mov(a2, a0)
+    %li(a1, -100)
+    %li(a0, %p1_sys_unlinkat)
+    %syscall
+    %ret
+
+# sys_exit(code=a0) -> never returns
+:sys_exit
+.scope
+    %mov(a1, a0)
+    %li(a0, %p1_sys_exit)
+    %syscall
+    :.spin
+    %b(&.spin)
+.endscope
+
+# =========================================================================
+# Print helpers
+# =========================================================================
+#
+# print(buf, len) and eprint(buf, len) loop on sys_write until all bytes
+# are written or the kernel reports an error. All other print helpers
+# compose on top of those two.
+
+%fn(print, 16, {
+    %st(s0, sp, 0)
+    %st(s1, sp, 8)
+    %mov(s0, a0)
+    %mov(s1, a1)
+
+    :.loop
+    %beqz(s1, &.done_ok)
+    %li(a0, 1)
+    %mov(a1, s0)
+    %mov(a2, s1)
+    %call(&sys_write)
+    %bltz(a0, &.done)
+    %add(s0, s0, a0)
+    %sub(s1, s1, a0)
+    %b(&.loop)
+
+    :.done_ok
+    %li(a0, 0)
+    :.done
+    %ld(s0, sp, 0)
+    %ld(s1, sp, 8)
+})
+
+%fn(eprint, 16, {
+    %st(s0, sp, 0)
+    %st(s1, sp, 8)
+    %mov(s0, a0)
+    %mov(s1, a1)
+
+    :.loop
+    %beqz(s1, &.done_ok)
+    %li(a0, 2)
+    %mov(a1, s0)
+    %mov(a2, s1)
+    %call(&sys_write)
+    %bltz(a0, &.done)
+    %add(s0, s0, a0)
+    %sub(s1, s1, a0)
+    %b(&.loop)
+
+    :.done_ok
+    %li(a0, 0)
+    :.done
+    %ld(s0, sp, 0)
+    %ld(s1, sp, 8)
+})
+
+%fn(println, 16, {
+    %st(s0, sp, 0)
+
+    %call(&print)
+    %mov(s0, a0)
+    %bltz(s0, &.done)
+
+    %la(a0, &libp1pp__newline)
+    %li(a1, 1)
+    %call(&print)
+    %mov(s0, a0)
+
+    :.done
+    %mov(a0, s0)
+    %ld(s0, sp, 0)
+})
+
+%fn(eprintln, 16, {
+    %st(s0, sp, 0)
+
+    %call(&eprint)
+    %mov(s0, a0)
+    %bltz(s0, &.done)
+
+    %la(a0, &libp1pp__newline)
+    %li(a1, 1)
+    %call(&eprint)
+    %mov(s0, a0)
+
+    :.done
+    %mov(a0, s0)
+    %ld(s0, sp, 0)
+})
+
+%fn(print_cstr, 16, {
+    %st(s0, sp, 0)
+    %mov(s0, a0)
+    %call(&libp1pp__strlen)
+    %mov(a1, a0)
+    %mov(a0, s0)
+    %call(&print)
+    %ld(s0, sp, 0)
+})
+
+%fn(eprint_cstr, 16, {
+    %st(s0, sp, 0)
+    %mov(s0, a0)
+    %call(&libp1pp__strlen)
+    %mov(a1, a0)
+    %mov(a0, s0)
+    %call(&eprint)
+    %ld(s0, sp, 0)
+})
+
+%fn(print_int, 0, {
+    %mov(a1, a0)
+    %la(a0, &libp1pp__num_buf)
+    %call(&fmt_dec)
+    %mov(a1, a0)
+    %la(a0, &libp1pp__num_buf)
+    %call(&print)
+})
+
+%fn(print_hex, 0, {
+    %mov(a1, a0)
+    %la(a0, &libp1pp__num_buf)
+    %call(&fmt_hex)
+    %mov(a1, a0)
+    %la(a0, &libp1pp__num_buf)
+    %call(&print)
+})
+
+# =========================================================================
+# File helpers
+# =========================================================================
+
+# read_file(path=a0, buf=a1, cap=a2) -> n or -1
+%fn(read_file, 32, {
+    %st(s0, sp, 0)
+    %st(s1, sp, 8)
+    %st(s2, sp, 16)
+    %st(s3, sp, 24)
+
+    %mov(s1, a1)
+    %mov(s2, a2)
+
+    %li(a1, 0)
+    %li(a2, 0)
+    %call(&sys_open)
+    %bltz(a0, &.open_fail)
+    %mov(s3, a0)
+
+    %mov(a0, s3)
+    %mov(a1, s1)
+    %mov(a2, s2)
+    %call(&sys_read)
+    %mov(s0, a0)
+
+    %mov(a0, s3)
+    %call(&sys_close)
+
+    %mov(a0, s0)
+    %bltz(a0, &.read_fail)
+    %b(&.done)
+
+    :.read_fail
+    %li(a0, -1)
+    %b(&.done)
+
+    :.open_fail
+    %li(a0, -1)
+
+    :.done
+    %ld(s0, sp, 0)
+    %ld(s1, sp, 8)
+    %ld(s2, sp, 16)
+    %ld(s3, sp, 24)
+})
+
+# libp1pp__write_all(fd=a0, buf=a1, len=a2) -> 0 or <0 on error
+#
+# Loop on sys_write until all bytes are written. Used by print / eprint
+# / write_file. Retries partial writes but returns the first negative
+# kernel return unchanged.
+%fn(libp1pp__write_all, 24, {
+    %st(s0, sp, 0)
+    %st(s1, sp, 8)
+    %st(s2, sp, 16)
+
+    %mov(s0, a0)
+    %mov(s1, a1)
+    %mov(s2, a2)
+
+    :.loop
+    %beqz(s2, &.done_ok)
+    %mov(a0, s0)
+    %mov(a1, s1)
+    %mov(a2, s2)
+    %call(&sys_write)
+    %bltz(a0, &.done)
+    %add(s1, s1, a0)
+    %sub(s2, s2, a0)
+    %b(&.loop)
+
+    :.done_ok
+    %li(a0, 0)
+    :.done
+    %ld(s0, sp, 0)
+    %ld(s1, sp, 8)
+    %ld(s2, sp, 16)
+})
+
+# write_file(path=a0, buf=a1, len=a2) -> 0 or -1
+#
+# Flags: O_WRONLY|O_CREAT|O_TRUNC. On Linux these are 0x1 | 0x40 |
+# 0x200 = 0x241. Mode 0644 octal = 0x1A4.
+%fn(write_file, 24, {
+    %st(s0, sp, 0)
+    %st(s1, sp, 8)
+    %st(s2, sp, 16)
+
+    %mov(s0, a1)
+    %mov(s1, a2)
+
+    %li(a1, 0x241)
+    %li(a2, 0x1A4)
+    %call(&sys_open)
+    %bltz(a0, &.open_fail)
+    %mov(s2, a0)
+
+    %mov(a0, s2)
+    %mov(a1, s0)
+    %mov(a2, s1)
+    %call(&libp1pp__write_all)
+
+    %mov(s0, a0)
+    %mov(a0, s2)
+    %call(&sys_close)
+
+    %mov(a0, s0)
+    %bltz(a0, &.fail_ret)
+    %li(a0, 0)
+    %b(&.done)
+
+    :.fail_ret
+    %li(a0, -1)
+    %b(&.done)
+
+    :.open_fail
+    %li(a0, -1)
+
+    :.done
+    %ld(s0, sp, 0)
+    %ld(s1, sp, 8)
+    %ld(s2, sp, 16)
+})
+
+# =========================================================================
+# BSS arena pointer-init table
+# =========================================================================
+#
+# Pattern: a program reserves a stretch of memory past :ELF_end (or any
+# base) and wants to carve it into N fixed-size arenas, each anchored
+# by a pointer slot in the data section. The table emits one
+# (slot, size) row per arena via %arena_entry; init_arenas walks the
+# table once at startup and writes base + sum of prior sizes into each
+# slot, so arena[k] starts where arena[k-1] ended.
+
+# %arena_entry(slot, size) -- one 16-byte row: 4-byte label ref + 4
+# bytes zero pad + 8-byte size. `slot` is passed as a label ref (`&foo`).
+%macro arena_entry(slot, size) slot %(0) $(size) %endm
+
+# init_arenas(base=a0, tbl=a1, tbl_end=a2) -> 0
+#
+# Walks (slot, size) pairs from `tbl` to `tbl_end`, threading a running
+# offset starting at 0. For each entry: *slot = base + offset, then
+# offset += size. Leaf.
+:init_arenas
+.scope
+    %li(t0, 0)
+    :.loop
+        %beq(a1, a2, &.done)
+        %ld(t1, a1, 0)
+        %ld(t2, a1, 8)
+        %add(a3, a0, t0)
+        %st(a3, t1, 0)
+        %add(t0, t0, t2)
+        %addi(a1, a1, 16)
+        %b(&.loop)
+    :.done
+    %li(a0, 0)
+    %ret
+.endscope
+
+# =========================================================================
+# Bump allocator
+# =========================================================================
+#
+# Single global arena, bytes carved by monotonic cursor with 8-byte
+# alignment. bump_alloc returns 0 when the request would overflow.
+
+# bump_init(base=a0, cap=a1) -> 0
+:bump_init
+    %la(t0, &libp1pp__bump_base)
+    %st(a0, t0, 0)
+    %la(t0, &libp1pp__bump_cursor)
+    %st(a0, t0, 0)
+    %la(t0, &libp1pp__bump_cap)
+    %st(a1, t0, 0)
+    %li(a0, 0)
+    %ret
+
+# bump_alloc(n=a0) -> ptr (0 on exhaustion)
+#
+# Round n up to a multiple of 8, then admit iff cursor + n_rounded does
+# not exceed base + cap. On success, advance the cursor and return the
+# pre-advance value; on failure, leave the cursor untouched and return 0.
+:bump_alloc
+.scope
+    %addi(a0, a0, 7)
+    %li(t0, -8)
+    %and(a0, a0, t0)
+    %la(t0, &libp1pp__bump_cursor)
+    %ld(t1, t0, 0)
+    %add(t2, t1, a0)
+    %la(a1, &libp1pp__bump_base)
+    %ld(a2, a1, 0)
+    %la(a1, &libp1pp__bump_cap)
+    %ld(a3, a1, 0)
+    %add(a3, a2, a3)
+    %bltu(a3, t2, &.fail)
+    %st(t2, t0, 0)
+    %mov(a0, t1)
+    %ret
+    :.fail
+    %li(a0, 0)
+    %ret
+.endscope
+
+# bump_mark() -> saved
+:bump_mark
+    %la(t0, &libp1pp__bump_cursor)
+    %ld(a0, t0, 0)
+    %ret
+
+# bump_release(saved=a0) -> 0
+:bump_release
+    %la(t0, &libp1pp__bump_cursor)
+    %st(a0, t0, 0)
+    %li(a0, 0)
+    %ret
+
+# bump_reset() -> 0
+:bump_reset
+    %la(t0, &libp1pp__bump_base)
+    %ld(t1, t0, 0)
+    %la(t0, &libp1pp__bump_cursor)
+    %st(t1, t0, 0)
+    %li(a0, 0)
+    %ret
+
+# =========================================================================
+# Panic
+# =========================================================================
+
+# panic(msg_cstr=a0) -> never returns
+%fn(panic, 0, {
+    %call(&eprint_cstr)
+    %la(a0, &libp1pp__newline)
+    %li(a1, 1)
+    %call(&eprint)
+    %li(a0, 1)
+    %call(&sys_exit)
+    :.spin
+    %b(&.spin)
+})
+
+# =========================================================================
+# Tracepoint
+# =========================================================================
+#
+# %trace(tag_addr, tag_len) — emit a runtime stderr probe at the call
+# site. Prints `[trace @0xHEX TAG]\n` to stderr, where 0xHEX is the
+# runtime address of this trace site (the address of `:@here` in this
+# site's expansion) and TAG is the byte string at
+# [tag_addr..tag_addr+tag_len).
+#
+# `tag_addr` is a label reference token (e.g. `&cc__str_3`) — the
+# caller is responsible for emitting the bytes at that label. cc.scm's
+# --cc-trace-emit interns the mangled function name through the
+# regular string pool, which already pads each entry to an 8-byte
+# multiple, so the next item past the tag stays aligned. `tag_len` is
+# the *logical* byte count to print (without trailing NUL or pad).
+#
+# To map a printed address back to source, disassemble the ELF
+# (`scripts/disasm-elf.sh`) and locate the printed address. cc.scm
+# guarantees that each function's first instruction *is* a trace call,
+# so the printed address falls on a known function-entry boundary.
+#
+# Preserves all exposed P1 registers (a0..a3, t0..t2, s0..s3) by
+# borrowing 112 aligned bytes below the current stack pointer: 16 bytes
+# for the backend frame prefix plus 88 bytes for saved registers. Use
+# only inside an active %fn body, after %enter and before %eret.
+%macro trace(tag_addr, tag_len)
+    :@here
+    %addi(sp, sp, -112)
+    %st(a0, sp, 0)
+    %st(a1, sp, 8)
+    %st(a2, sp, 16)
+    %st(a3, sp, 24)
+    %st(t0, sp, 32)
+    %st(t1, sp, 40)
+    %st(t2, sp, 48)
+    %st(s0, sp, 56)
+    %st(s1, sp, 64)
+    %st(s2, sp, 72)
+    %st(s3, sp, 80)
+    %la(a0, &@here)
+    %la(a1, tag_addr)
+    %li(a2, tag_len)
+    %call(&libp1pp__trace)
+    %ld(a0, sp, 0)
+    %ld(a1, sp, 8)
+    %ld(a2, sp, 16)
+    %ld(a3, sp, 24)
+    %ld(t0, sp, 32)
+    %ld(t1, sp, 40)
+    %ld(t2, sp, 48)
+    %ld(s0, sp, 56)
+    %ld(s1, sp, 64)
+    %ld(s2, sp, 72)
+    %ld(s3, sp, 80)
+    %addi(sp, sp, 112)
+%endm
+
+# libp1pp__trace(addr=a0, tag_addr=a1, tag_len=a2) — print
+# "[trace @0xHEX TAG]\n" to stderr.
+%fn(libp1pp__trace, 32, {
+    %st(s0, sp, 0)
+    %st(s1, sp, 8)
+    %st(s2, sp, 16)
+    %st(s3, sp, 24)
+    %mov(s0, a0)
+    %mov(s1, a1)
+    %mov(s2, a2)
+
+    %la(a0, &libp1pp__trace_pre)
+    %li(a1, 8)
+    %call(&eprint)
+
+    %la(a0, &libp1pp__num_buf)
+    %mov(a1, s0)
+    %call(&fmt_hex)
+    %mov(s3, a0)
+    %la(a0, &libp1pp__num_buf)
+    %mov(a1, s3)
+    %call(&eprint)
+
+    %la(a0, &libp1pp__trace_sep)
+    %li(a1, 1)
+    %call(&eprint)
+
+    %mov(a0, s1)
+    %mov(a1, s2)
+    %call(&eprint)
+
+    %la(a0, &libp1pp__trace_post)
+    %li(a1, 2)
+    %call(&eprint)
+
+    %ld(s0, sp, 0)
+    %ld(s1, sp, 8)
+    %ld(s2, sp, 16)
+    %ld(s3, sp, 24)
+})
+
+# Tracepoint message fragments. eprint reads only the leading
+# visible-byte count (8, 1, 2); .align 8 keeps each fragment and the
+# data labels that follow 8-byte aligned (aarch64 LDR / 4-byte
+# inline-data loads fault otherwise).
+:libp1pp__trace_pre  "[trace @"
+.align 8
+:libp1pp__trace_sep  " "
+.align 8
+:libp1pp__trace_post "]\n"
+.align 8
+
+# =========================================================================
+# Internal data
+# =========================================================================
+
+# Single newline byte for println / eprintln / panic. Emitted as an
+# 8-byte word (0x0A in the low byte, zeros above) so the following
+# buffers and the user source that comes after libp1pp stay 8-byte
+# aligned. sys_write reads only the one byte callers request.
+:libp1pp__newline $(10)
+
+# Scratch buffer used by print_int / print_hex. fmt_dec writes at most
+# 20 bytes, fmt_hex at most 16, so 32 bytes with word alignment is
+# comfortably above both.
+:libp1pp__num_buf $(0) $(0) $(0) $(0)
+
+# Bump-allocator state. Zero-initialized so bump_alloc returns 0 until
+# bump_init installs an arena.
+:libp1pp__bump_base $(0)
+:libp1pp__bump_cursor $(0)
+:libp1pp__bump_cap $(0)

@@ -1,0 +1,432 @@
+# SPDX-FileCopyrightText: 2022 Andrius Štikonas <andrius@stikonas.eu>
+# SPDX-FileCopyrightText: 2022 Jeremiah Orians <jeremiah@pdp10.guru>
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Usage: hex0 file.hex0 file
+# Does not validate the arguments or check for success
+
+# Calling convention:
+# First four arguments are passed via registers rcx, rdx, r8, r9 (if they fit in 64-bits)
+# but we need to leave stack space
+# rax, rcx, rdx, r8, r9, r10 and r11 are volatile and can be changed by called function
+# Stack must be 16-byte aligned before UEFI calls.
+
+# DOS MZ header
+4D 5A                           # Signature
+00 00                           # Number of bytes in the last page.
+00 00                           # Number of whole/partial pages
+00 00                           # Number of entries in the relocation table.
+00 00                           # Header size
+00 00                           # Minimum allocation
+00 00                           # Maximum allocation
+00 00                           # Relocatable segment address for SS
+00 00                           # Initial value for SP
+00 00                           # Checksum (I don't think is looked at)
+00 00                           # Initial value for IP (Seems ignored)
+00 00                           # Relocatable segment address for CS (Seems ignored)
+00 00                           # The (absolute) offset to the relocation table.
+00 00                           # Value used for overlay management. If zero, this is the main executable
+00 00 00 00 00 00 00 00         # Reserved in PE
+00 00                           # OEM identifier
+00 00                           # OEM info
+00 00 00 00 00 00 00 00 00 00   # The required reserved 20 bytes of NULLS
+00 00 00 00 00 00 00 00 00 00
+40 00 00 00                     # Starting address of the PE header
+
+# [0x40]
+# PE header
+50 45 00 00                     # Signature "PE"
+64 86                           # Machine
+01 00                           # number of sections
+00 00 00 00                     # Timestamp supposedly
+00 00 00 00                     # PointerToSymbolTable
+00 00 00 00                     # number of symbols
+F0 00                           # SizeOfOptionalHeader
+00 00                           # 'Characteristics'
+
+# [0x58]
+# COFF header bits
+0B 02                           # Magic PE32+ (64 bit)
+00 00                           # Linker version
+00 00 00 00                     # size of code
+00 00 00 00                     # sizeOfInitializedData
+00 00 00 00                     # SizeOfUninitializedData
+00 10 00 00                     # AddressOfEntryPoint
+00 00 00 00                     # BaseOfCode
+00 00 00 00 00 00 00 00         # ImageBase
+01 00 00 00                     # SectionAlignment
+01 00 00 00                     # FileAlignment
+00 00 00 00                     # OperatingSystemVersion
+00 00 00 00                     # ImageVersion
+00 00 00 00                     # SubsystemVersion
+00 00 00 00                     # Win32VersionValue
+00 20 00 00                     # SizeOfImage
+70 01 00 00                     # SizeOfHeaders
+00 00 00 00                     # CheckSum (isn't used at all)
+0A 00                           # Subsystem
+00 00                           # DllCharacteristics
+00 00 00 00                     # SizeOfStackReserve
+00 00 00 00                     # SizeOfStackCommit
+00 00 00 00                     # SizeOfHeapReserve
+00 00 00 00                     # SizeOfHeapCommit
+00 00 00 00                     # LoaderFlags
+00 00 00 00                     # NumberOfRvaAndSizes
+
+# [0xB8]
+# Data directories (has to be 16 entries always 16bytes per entry)
+00 00 00 00                     # Export Table
+00 00 00 00                     # Size of Export Table
+
+00 00 00 00                     # Import Table
+10 00 00 00                     # Size of Import Table
+
+00 00 00 00                     # Resource Table
+00 00 00 00                     # Size of Resource Table
+
+00 00 00 00                     # Exception Table
+00 00 00 00                     # Size of Exception Table
+
+00 00 00 00                     # Certificate Table
+00 00 00 00                     # Size of Certificate Table
+
+00 00 00 00                     # Base Relocation Table
+00 00 00 00                     # Size of Base Relocation Table
+
+00 00 00 00                     # Debug Table
+00 00 00 00                     # Size of Debug Table
+
+00 00 00 00                     # Architecture Data Table
+00 00 00 00                     # Size of Architecture Data Table
+
+00 00 00 00                     # Global Pointer
+00 00 00 00                     # NULL
+
+00 00 00 00                     # TLS Table
+00 00 00 00                     # Size of TLS Table
+
+00 00 00 00                     # Load Config Table
+00 00 00 00                     # Size of Load Config Table
+
+00 00 00 00                     # Bound Import Table
+00 00 00 00                     # Size of Bound Import Table
+
+00 00 00 00                     # Import Address Table
+00 00 00 00                     # Size of Import Address Table
+
+00 00 00 00                     # Delay Import Descriptor Table
+00 00 00 00                     # Size of Delay Import Descriptor Table
+
+00 00 00 00                     # CLR Runtime header table
+00 00 00 00                     # Size of CLR Runtime Header table
+
+00 00 00 00 00 00 00 00         # MUST BE NULL
+
+# no idea what it is yet
+00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00
+
+# [0x148]
+# Start of section headers
+00 00 00 00 00 00 00 00                 ; Name of the section (empty) but could set to ".text"
+EF 01 00 00                             ; VirtualSize
+00 10 00 00                             ; VirtualAddress
+EF 01 00 00                             ; SizeOfRawData
+70 01 00 00                             ; PointerToRawData
+00 00 00 00                             ; PointerToRelocations
+00 00 00 00                             ; PointerToLinenumbers
+00 00                                   ; NumberOfRelocations
+00 00                                   ; NumberOfLinenumbers
+00 00 00 00                             ; 'Characteristics'
+
+# [0x170]
+# Our actual program
+# efi_main(void *image_handle, struct efi_system_table *system)
+# :_start
+    # Save non-volatile registers
+    55              ; push_rbp
+    53              ; push_rbx
+    57              ; push_rdi
+    56              ; push_rsi
+    4154            ; push_r12
+    4155            ; push_r13
+    4156            ; push_r14
+    4157            ; push_r15
+
+    4989CF          ; mov_r15,rcx                                  # save image_handle
+    4C8B72 60       ; mov_r14,[rdx+BYTE] !96                       # system->boot
+
+    # Open Loaded Image protocol
+    4D89F9          ; mov_r9,r15                                   # arg4 = image_handle
+    488D15 B2010000 ; lea_rdx,[rip+DWORD] %LOADED_IMAGE_PROTOCOL   # guid = &LOADED_IMAGE_PROTOCOL
+    4C89C9          ; mov_rcx,r9                                   # arg1 = image_handle
+    50              ; push_rax                                     # allocate stack for image
+    4989E0          ; mov_r8,rsp                                   # arg3 = &image
+    6A 01           ; push !1                                      # arg6 = EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL
+    6A 00           ; push !0                                      # arg5 = NULL
+    4883EC 20       ; sub_rsp, !32                                 # allocate shadow stack space for UEFI function
+    41FF96 18010000 ; call_[r14+DWORD] %280                        # system->boot->open_protocol(image_handle, &guid, &image, image_handle, 0, EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL)
+    4883C4 30       ; add_rsp, !48                                 # deallocate stack
+    5F              ; pop_rdi                                      # get image
+
+    # Get root file system
+    4D89F9          ; mov_r9,r15                                   # arg4 = image_handle
+    488D15 9D010000 ; lea_rdx,[rip+DWORD] %SIMPLE_FS_PROTOCOL      # guid = &SIMPLE_FS_PROTOCOL
+    488B4F 18       ; mov_rcx,[rdi+BYTE] !24                       # arg1 = root_device = image->device
+    4989CD          ; mov_r13,rcx                                  # save root_device
+    50              ; push_rax                                     # allocate stack for rootfs
+    4989E0          ; mov_r8,rsp                                   # arg3 = &rootfs
+    6A 01           ; push !1                                      # arg6 = EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL
+    6A 00           ; push !0                                      # arg5 = NULL
+    4883EC 20       ; sub_rsp, !32                                 # allocate shadow stack space for UEFI function
+    41FF96 18010000 ; call_[r14+DWORD] %280                        # system->boot->open_protocol(root_device, &guid, &rootfs, image_handle, 0, EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL)
+    4883C4 30       ; add_rsp, !48                                 # deallocate stack
+    59              ; pop rcx                                      # get rootfs
+
+    # Get root directory
+    50              ; push_rax                    # allocate stack for rootdir
+    4889E2          ; mov_rdx,rsp                 # arg2 = &rootdir
+    4883EC 20       ; sub_rsp, !32                # allocate shadow stack space for UEFI function
+    FF51 08         ; call_[rcx+BYTE] !8          # rootfs->open_volume(rootfs, &rootdir)
+    4883C4 20       ; add_rsp, !32                # deallocate stack
+    5E              ; pop_rsi                     # save rootdir
+
+    # Push command line arguments onto stack
+    488B5F 38       ; mov_rbx,[rdi+BYTE] !56      # options = image->load_options
+    4889DA          ; mov_rdx,rbx                 # save beginning of load_options
+    48035F 30       ; add_rbx,[rdi+BYTE] !48      # go to the end of load_options
+# :loop_options [_start + 0x7C]
+    4839D3          ; cmp_rbx,rdx                 # Check if we are done
+    74 14           ; je !loop_options_done       # We are done
+    4883EB 02       ; sub_rbx, !2                 # --options
+    8A03            ; mov_al,[rbx]                # *options
+    3C 20           ; cmp_al, !0x20               # if *options != ' '
+    75 F1           ; jne !loop_options           # then continue looping
+    C603 00         ; mov_[rbx], !0               # zero it
+    4883C3 02       ; add_rbx, !2                 # ++options
+    53              ; push_rbx                    # push another argument onto stack
+    EB E7           ; jmp !loop_options           # next argument
+# :loop_options_done [_start + 0x95]
+
+    # Open file for reading
+    4158            ; pop_r8                      # arg3 = in
+    4883E4 F0       ; and_rsp, !-16               # align stack to 16 bytes
+    52              ; push_rdx                    # allocate stack for fin
+    4889E2          ; mov_rdx,rsp                 # arg2 = &fin
+    6A 01           ; push !1                     # arg5 = EFI_FILE_READ_ONLY
+    6A 01           ; push !1                     # prepare to set arg4 to EFI_FILE_MODE_READ
+    4159            ; pop_r9                      # arg4 = EFI_FILE_MODE_READ
+    4889F1          ; mov_rcx,rsi                 # arg1 = rootdir
+    4883EC 20       ; sub_rsp, !32                # allocate shadow stack space for UEFI function
+    FF51 08         ; call_[rcx+BYTE] !8          # rootdir->open()
+    4883C4 28       ; add_rsp, !40                # deallocate stack
+    415C            ; pop_r12                     # get fin
+
+    # Open file for writing
+    4158            ; pop_r8                      # arg3 = out
+    4155            ; push_r13                    # save root_device
+    52              ; push_rdx                    # allocate stack for fout
+    4889E2          ; mov_rdx,rsp                 # arg2 = &fout
+    6A 00           ; push !0                     # arg5 = 0
+    6A 07           ; push !7                     # to get 0x8000000000000003 we set the rightmost 3 bits
+    4159            ; pop_r9                      # and then do right rotation by 1
+    49D1C9          ; ror_r9                      # arg4 = EFI_FILE_MODE_CREATE| EFI_FILE_MODE_WRITE | EFI_FILE_MODE_READ
+    4889F1          ; mov_rcx,rsi                 # arg1 = rootdir
+    4883EC 20       ; sub_rsp, !32                # allocate shadow stack space for UEFI function
+    FF51 08         ; call_[rcx+BYTE] !8          # rootdir->open()
+    4883C4 28       ; add_rsp, !40                # deallocate stack
+    415D            ; pop_r13                     # get fout
+
+    # Save variables that are needed for cleanup
+    4156            ; push_r14                    # save system->boot
+    56              ; push_rsi                    # save rootdir
+
+    # Our flag for byte processing
+    6A FF           ; push !-1
+    5B              ; pop_rbx                     # rbx = -1
+
+    # temp storage for the sum
+    31FF            ; xor_edi,edi                 # rdi = 0
+
+# :loop [_start+0xDE]
+    # Read a byte
+    E8 72000000     ; call %read_byte
+
+    # process byte
+    E8 1C000000     ; call %hex
+
+    # deal with -1 values
+    85C0            ; test_eax,eax
+    7C F2           ; jl !loop
+
+    # deal with toggle
+    85DB            ; test_ebx,ebx                # jump if ebx >= 0
+    7D 06           ; jge !print
+
+    # process first byte of pair
+    89C7            ; mov_edi,eax
+    31DB            ; xor_ebx,ebx                 # rbx = 0
+    EB E8           ; jmp !loop
+
+# process second byte of pair
+# :print [_start+0xF6]
+    # update the sum and store in output
+    C1E7 04         ; shl_edi, !4
+    01F8            ; add_eax,edi
+
+    # flip the toggle
+    FFCB            ; dec_ebx                     # rbx = -1
+
+    E8 3B000000     ; call %write_byte
+
+    EB DA           ; jmp !loop
+
+# :hex [_start+0x104]
+    # Purge Comment Lines (#)
+    3C 23           ; cmp_al, !35
+    74 1E           ; je !purge_comment
+
+    # Purge Comment Lines (;)
+    3C 3B           ; cmp_al, !59
+    74 1A           ; je !purge_comment
+
+    # deal all ascii less than '0'
+    3C 30           ; cmp_al, !48
+    7C 21           ; jl !ascii_other
+
+    # deal with 0-9
+    3C 3A           ; cmp_al, !58
+    7C 21           ; jl !ascii_num
+
+    # deal with all ascii less than 'A'
+    3C 41           ; cmp_al, !65
+    7C 19           ; jl !ascii_other
+
+    # deal with 'A'-'F'
+    3C 47           ; cmp_al, !71
+    7C 1E           ; jl !ascii_high
+
+    # deal with all ascii less than 'a'
+    3C 61           ; cmp_al, !97
+    7C 11           ; jl !ascii_other
+
+    #deal with 'a'-'f'
+    3C 67           ; cmp_al, !103
+    7C 14           ; jl !ascii_low
+
+    # The rest that remains needs to be ignored
+    EB 0B           ; jmp !ascii_other
+
+# :purge_comment [_start+0x126]
+    53              ; push_rbx                    # align stack to 16 bytes
+    E8 29000000     ; call %read_byte             # Read a byte
+    5B              ; pop_rbx                     # deallocate stack
+
+    # Loop if not LF
+    3C 0A           ; cmp_al, !10
+    75 F5           ; jne !purge_comment
+
+    # Otherwise return -1
+
+# :ascii_other [_start+0x131]
+    6A FF           ; push !-1
+    58              ; pop_rax                     # return = -1
+    C3              ; ret
+
+# :ascii_num [_start+0x135]
+    2C 30           ; sub_al, !48
+    C3              ; ret
+
+# :ascii_low [_start+0x138]
+    2C 20           ; sub_al, !32                 # convert to uppercase
+
+# :ascii_high [_start+0x13A]
+    2C 37           ; sub_al, !55
+    C3              ; ret
+
+# Writes byte stored in al
+# :write_byte [_start+0x13D]
+    4C89E9          ; mov_rcx,r13                 # arg1 = fout
+    6A 01           ; push !1                     # size = 1
+    4889E2          ; mov_rdx,rsp                 # arg2 = &size
+    50              ; push_rax                    # allocate stack
+    4989E0          ; mov_r8,rsp                  # arg3 = &output
+    4883EC 28       ; sub_rsp, !40                # allocate shadow stack space for UEFI function
+    FF51 28         ; call_[rcx+BYTE] !40         # fout->write()
+    4883C4 38       ; add_rsp, !56                # deallocate stack
+
+    C3              ; ret                         # return
+
+# :read_byte [_start+0x155]
+    4C89E1          ; mov_rcx,r12                 # arg1 = fin
+    6A 01           ; push !1                     # size = 1
+    4889E2          ; mov_rdx,rsp                 # arg2 = &size
+    6A 00           ; push_rsi                    # allocate stack
+    4989E0          ; mov_r8,rsp                  # arg3 = &input
+    4883EC 28       ; sub_rsp, !40                # allocate shadow stack space for UEFI function
+    FF51 20         ; call_[rcx+BYTE] !32         # fin->read()
+    4883C4 28       ; add_rsp, !40                # deallocate stack
+    58              ; pop_rax                     # save input to rax
+    5E              ; pop_rsi                     # save size to rsi
+
+    # If the file ended (0 bytes read) terminate
+    85F6            ; test_esi,esi                # if size = 0
+    74 01           ; je !terminate               # then we are done
+
+    C3              ; ret                         # return
+
+# :terminate [_start+0x174]
+    58              ; pop_rax                     # deallocate stack (return code of read_byte)
+    5E              ; pop_rsi                     # restore rootdir
+    415E            ; pop_r14                     # restore system->boot
+    5B              ; pop_rbx                     # restore root_device
+
+    53              ; push_rbx                    # allocate stack
+    4C89E1          ; mov_rcx,r12                 # arg1 = fin
+    FF51 10         ; call_[rcx+BYTE] !16         # fin->close()
+    4C89E9          ; mov_rcx,r13                 # arg1 = fout
+    FF51 10         ; call_[rcx+BYTE] !16         # fout->close()
+    4889F1          ; mov_rcx,rsi                 # arg1 = rootdir
+    FF51 10         ; call_[rcx+BYTE] !16         # rootdir->close()
+
+    4D89F8          ; mov_r8,r15                  # arg3 = image_handle
+    488D15 49000000 ; lea_rdx,[rip+DWORD] %SIMPLE_FS_PROTOCOL # guid = &SIMPLE_FS_PROTOCOL
+    4889D9          ; mov_rcx,rbx                 # arg1 = root_device
+    4D31C9          ; xor_r9,r9                   # arg4 = NULL
+    4883EC 20       ; sub_rsp, !32                # allocate shadow stack space for UEFI function
+    41FF96 20010000 ; call_[r14+DWORD] %288       # system->boot->close_protocol(root_device, &guid, image_handle, 0)
+
+    4D89F8          ; mov_r8,r15                  # arg3 = image_handle
+    488D15 1E000000 ; lea_rdx,[rip+DWORD] %LOADED_IMAGE_PROTOCOL # guid = &LOADED_IMAGE_PROTOCOL
+    4C89C1          ; mov_rcx,r8                  # arg1 = image_handle
+    4D31C9          ; xor_r9,r9                   # arg4 = NULL
+    41FF96 20010000 ; call_[r14+DWORD] %288       # system->boot->close_protocol(image_handle, &guid, image_handle, 0)
+    4883C4 28       ; add_rsp, !40                # deallocate stack
+
+    # Restore non-volatile registers
+    415F            ; pop_r15
+    415E            ; pop_r14
+    415D            ; pop_r13
+    415C            ; pop_r12
+    5E              ; pop_rsi
+    5F              ; pop_rdi
+    5B              ; pop_rbx
+
+    5D              ; pop_rbp
+    C3              ; ret                         # return to UEFI
+
+
+# Protocol GUIDs
+# :LOADED_IMAGE_PROTOCOL [_start+0x1CF]
+    A1 31 1B 5B             ; %0x5b1b31a1
+    62 95                   ; $0x9562
+    D2 11                   ; $0x11d2
+    8E 3F 00 A0 C9 69 72 3B ; !0x8e !0x3f !0 !0xa0 !0xc9 !0x69 !0x72 !0x3b
+
+# :SIMPLE_FS_PROTOCOL [_start+0x1DF]
+    22 5B 4E 96             ; %0x964e5b22
+    59 64                   ; $0x6459
+    D2 11                   ; $0x11d2
+    8E 39 00 A0 C9 69 72 3B ; !0x8e !0x39 !0 !0xa0 !0xc9 !0x69 !0x72 !0x3b
+
+# :ELF_end [_start+0x1EF]

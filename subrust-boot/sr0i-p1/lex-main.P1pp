@@ -1,0 +1,39 @@
+# lex-main.P1pp — dump driver for the lexer gate. Sets up a sys_brk heap,
+# reads all of stdin into g_src, runs lex(), and writes the token array
+# (4-word records [kind,ival,pos,len]) to stdout. Diffed vs lex-ref.rs.
+# SRC_CAP = 65536 bytes ; token region = 8192 tokens * 32 bytes = 262144.
+
+%fn(p1_main, 32, {
+    %st(s0, sp, 0)
+    # heap: base = brk(0) ; carve src @ base, tokens @ base+65536 ; extend break
+    %li(a0, 0) %call(&sys_brk)
+    %la(t0, &g_src) %st(a0, t0, 0)              # g_src = base
+    %li(t1, 65536) %add(t1, a0, t1)
+    %la(t0, &g_tok) %st(t1, t0, 0)             # g_tok = base + 65536
+    %li(t1, 327680) %add(a0, a0, t1)           # base + 65536 + 262144
+    %call(&sys_brk)
+    # read all of stdin into src
+    %li(s0, 0)                                  # srcn
+:.rd
+    %li(t1, 65536) %sub(a2, t1, s0)            # len = 65536 - srcn
+    %beqz(a2, &.rd_done)
+    %la(t0, &g_src) %ld(a1, t0, 0) %add(a1, a1, s0)   # buf = src + srcn
+    %li(a0, 0)                                  # fd 0
+    %call(&sys_read)
+    %beqz(a0, &.rd_done)                        # EOF
+    %bltz(a0, &.rd_done)                        # error
+    %add(s0, s0, a0)
+    %b(&.rd)
+:.rd_done
+    %la(t0, &g_srcn) %st(s0, t0, 0)            # g_srcn = srcn
+    %call(&lex)
+    # dump: sys_write(1, g_tok, g_tokn * 32)
+    %li(a0, 1)
+    %la(t0, &g_tok) %ld(a1, t0, 0)
+    %la(t0, &g_tokn) %ld(t1, t0, 0) %shli(a2, t1, 5)
+    %call(&sys_write)
+    %li(a0, 0)
+    %ld(s0, sp, 0)
+})
+
+:ELF_end

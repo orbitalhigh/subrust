@@ -1,0 +1,953 @@
+# P1-amd64.M1pp -- P1 amd64 backend expressed in m1macro.
+#
+# Mirrors p1/P1-aarch64.M1pp. Native register mapping is backend-private;
+# see the amd_reg_* table below. amd64 is variable-length, so every op
+# emits its prefix bytes (REX / opcode) directly via the m1pp `!(…)`
+# single-byte builtin; 4-byte immediates still go through `%(…)`.
+#
+# Hidden backend regs:
+#   br      = r15   -- branch-target mechanism
+#   scratch = r9    -- per-expansion scratch (e.g. rcx save slot for SHIFT)
+#   rax            -- syscall number / return slot + retaddr spill
+#   rbp            -- spill slot for rcx / rdx when SHIFT and DIV/REM need
+#                      to preserve a3 / a2
+
+# ---- Native register numbers --------------------------------------------
+#
+# Macros emit the 4-bit native regnum 0..15. Callers use `(& N 7)` for the
+# ModRM/SIB low 3 bits and `(>> N 3)` for the REX high bit.
+
+%macro amd_reg_a0()
+7
+%endm
+%macro amd_reg_a1()
+6
+%endm
+%macro amd_reg_a2()
+2
+%endm
+%macro amd_reg_a3()
+1
+%endm
+%macro amd_reg_t0()
+10
+%endm
+%macro amd_reg_t1()
+11
+%endm
+%macro amd_reg_t2()
+8
+%endm
+%macro amd_reg_s0()
+3
+%endm
+%macro amd_reg_s1()
+12
+%endm
+%macro amd_reg_s2()
+13
+%endm
+%macro amd_reg_s3()
+14
+%endm
+%macro amd_reg_sp()
+4
+%endm
+%macro amd_reg_rax()
+0
+%endm
+%macro amd_reg_rcx()
+1
+%endm
+%macro amd_reg_rdx()
+2
+%endm
+%macro amd_reg_rbx()
+3
+%endm
+%macro amd_reg_rsp()
+4
+%endm
+%macro amd_reg_rbp()
+5
+%endm
+%macro amd_reg_rsi()
+6
+%endm
+%macro amd_reg_rdi()
+7
+%endm
+%macro amd_reg_r8()
+8
+%endm
+%macro amd_reg_r9()
+9
+%endm
+%macro amd_reg_r10()
+10
+%endm
+%macro amd_reg_r11()
+11
+%endm
+%macro amd_reg_r12()
+12
+%endm
+%macro amd_reg_r13()
+13
+%endm
+%macro amd_reg_r14()
+14
+%endm
+%macro amd_reg_r15()
+15
+%endm
+%macro amd_reg_br()
+15
+%endm
+%macro amd_reg_scratch()
+9
+%endm
+
+%macro amd_reg(r)
+%amd_reg_##r
+%endm
+
+# Per-P1-name `is this sp?` predicate. Used by p1_mem to decide whether
+# the supplied offset needs the +16 frame-header adjustment.
+
+%macro amd_is_sp_a0()
+0
+%endm
+%macro amd_is_sp_a1()
+0
+%endm
+%macro amd_is_sp_a2()
+0
+%endm
+%macro amd_is_sp_a3()
+0
+%endm
+%macro amd_is_sp_t0()
+0
+%endm
+%macro amd_is_sp_t1()
+0
+%endm
+%macro amd_is_sp_t2()
+0
+%endm
+%macro amd_is_sp_s0()
+0
+%endm
+%macro amd_is_sp_s1()
+0
+%endm
+%macro amd_is_sp_s2()
+0
+%endm
+%macro amd_is_sp_s3()
+0
+%endm
+%macro amd_is_sp_sp()
+1
+%endm
+
+%macro amd_is_sp(r)
+%amd_is_sp_##r
+%endm
+
+# ---- REX / ModRM helpers ------------------------------------------------
+
+# Short one-byte REX.B prefix (no W). Used by opcodes that don't need 64-bit
+# width — push/pop/jmp r/call r/mov r,imm32 — when the target reg is r8-r15.
+%macro amd_rex_b_short()
+!(0x41)
+%endm
+
+# No-op sentinel for %select branches that shouldn't emit anything.
+%macro amd_nobytes()
+%endm
+
+# Emit REX.B (0x41) iff r is r8-r15. Used by the short-prefix opcodes above.
+%macro amd_maybe_rex_b(r)
+%select((>= %amd_reg(r) 8),
+    %amd_rex_b_short,
+    %amd_nobytes)
+%endm
+
+# REX.WB: W=1 for 64-bit, B=(r>>3) to extend ModRM.rm / SIB.base.
+%macro amd_rex_wb(r)
+!((| 0x48 (& (>> %amd_reg(r) 3) 1)))
+%endm
+
+# REX.WRB: W=1, R=(rg>>3), B=(rm>>3). Used whenever a ModRM.reg field is
+# in use together with a ModRM.rm field.
+%macro amd_rex_wrb(rg, rm)
+!((| 0x48 (| (<< (& (>> %amd_reg(rg) 3) 1) 2) (& (>> %amd_reg(rm) 3) 1))))
+%endm
+
+# ModRM byte for register/register: mod=3, reg=rg low3, rm=rm low3.
+%macro amd_modrm_rr(rg, rm)
+!((| 0xC0 (| (<< (& %amd_reg(rg) 7) 3) (& %amd_reg(rm) 7))))
+%endm
+
+# ModRM /ext, rm: mod=3, reg=ext, rm=low3(rm). ext is 0..7.
+%macro amd_modrm_ext_r(ext, rm)
+!((| 0xC0 (| (<< ext 3) (& %amd_reg(rm) 7))))
+%endm
+
+# ---- Memory-addressing ModRM (+ SIB + disp) ----------------------------
+#
+# [base + disp] with `reg` in ModRM.reg. Bases whose low 3 bits are 100 —
+# rsp and r12 — must go through a SIB byte; all others use the plain
+# encoding. disp selects mod=1 (disp8) when it fits in [-128,127], else
+# mod=2 (disp32). We never emit mod=0 / no-disp; the extra byte is fine.
+
+%macro amd_modrm_disp8_plain(reg, base, disp)
+!((| 0x40 (| (<< (& %amd_reg(reg) 7) 3) (& %amd_reg(base) 7))))
+!((& disp 0xFF))
+%endm
+
+%macro amd_modrm_disp32_plain(reg, base, disp)
+!((| 0x80 (| (<< (& %amd_reg(reg) 7) 3) (& %amd_reg(base) 7))))
+%((& disp 0xFFFFFFFF))
+%endm
+
+%macro amd_modrm_disp8_sib(reg, disp)
+!((| 0x44 (<< (& %amd_reg(reg) 7) 3)))
+!(0x24)
+!((& disp 0xFF))
+%endm
+
+%macro amd_modrm_disp32_sib(reg, disp)
+!((| 0x84 (<< (& %amd_reg(reg) 7) 3)))
+!(0x24)
+%((& disp 0xFFFFFFFF))
+%endm
+
+%macro amd_modrm_disp_plain(reg, base, disp)
+%select((>= disp -128),
+    %select((<= disp 127),
+        %amd_modrm_disp8_plain(reg, base, disp),
+        %amd_modrm_disp32_plain(reg, base, disp)),
+    %amd_modrm_disp32_plain(reg, base, disp))
+%endm
+
+%macro amd_modrm_disp_sib(reg, disp)
+%select((>= disp -128),
+    %select((<= disp 127),
+        %amd_modrm_disp8_sib(reg, disp),
+        %amd_modrm_disp32_sib(reg, disp)),
+    %amd_modrm_disp32_sib(reg, disp))
+%endm
+
+%macro amd_modrm_disp(reg, base, disp)
+%select((= (& %amd_reg(base) 7) 4),
+    %amd_modrm_disp_sib(reg, disp),
+    %amd_modrm_disp_plain(reg, base, disp))
+%endm
+
+# ---- Register / arithmetic primitives ----------------------------------
+
+# mov dst, src -- 48 89 /r  (modrm form: source in reg, dest in rm).
+%macro amd_mov_rr(dst, src)
+%amd_rex_wrb(src, dst)
+!(0x89)
+%amd_modrm_rr(src, dst)
+%endm
+
+# op dst, src for ADD/SUB/AND/OR/XOR (same shape, different opcode byte).
+%macro amd_alu_rr(opcode, dst, src)
+%amd_rex_wrb(src, dst)
+!(opcode)
+%amd_modrm_rr(src, dst)
+%endm
+
+# op dst, imm8 -- 48 83 /ext ib.
+%macro amd_alu_ri8(ext, dst, imm)
+%amd_rex_wb(dst)
+!(0x83)
+%amd_modrm_ext_r(ext, dst)
+!((& imm 0xFF))
+%endm
+
+# op dst, imm32 -- 48 81 /ext id.
+%macro amd_alu_ri32(ext, dst, imm)
+%amd_rex_wb(dst)
+!(0x81)
+%amd_modrm_ext_r(ext, dst)
+%((& imm 0xFFFFFFFF))
+%endm
+
+# shift dst, imm8 -- 48 C1 /ext ib.  (ext: SHL=4, SHR=5, SAR=7)
+%macro amd_shift_ri8(ext, dst, imm)
+%amd_rex_wb(dst)
+!(0xC1)
+%amd_modrm_ext_r(ext, dst)
+!((& imm 0x3F))
+%endm
+
+# shift dst, cl -- 48 D3 /ext.
+%macro amd_shift_cl(ext, dst)
+%amd_rex_wb(dst)
+!(0xD3)
+%amd_modrm_ext_r(ext, dst)
+%endm
+
+# imul dst, src -- 48 0F AF /r (load source into reg, dest in rm? actually
+# the canonical form is IMUL r64, r/m64 — dest in reg, source in rm.)
+%macro amd_imul_rr(dst, src)
+%amd_rex_wrb(dst, src)
+!(0x0F)
+!(0xAF)
+%amd_modrm_rr(dst, src)
+%endm
+
+# idiv src -- 48 F7 /7.
+%macro amd_idiv_r(src)
+%amd_rex_wb(src)
+!(0xF7)
+%amd_modrm_ext_r(7, src)
+%endm
+
+# cqo -- 48 99 (sign-extend rax into rdx:rax).
+%macro amd_cqo()
+!(0x48)
+!(0x99)
+%endm
+
+# push / pop r64.  50+r / 58+r; REX.B=0x41 if r8-r15.
+%macro amd_push(r)
+%amd_maybe_rex_b(r)
+!((| 0x50 (& %amd_reg(r) 7)))
+%endm
+
+%macro amd_pop(r)
+%amd_maybe_rex_b(r)
+!((| 0x58 (& %amd_reg(r) 7)))
+%endm
+
+# mov r32, imm32 -- B8+r id.  Low-register form skips REX; r8-r15 need
+# REX.B=0x41.  The 4-byte literal the caller emits is zero-extended into
+# the full 64-bit register, matching the LA / LA_BR literal-pool contract.
+%macro amd_mov_imm32_prefix(rd)
+%amd_maybe_rex_b(rd)
+!((| 0xB8 (& %amd_reg(rd) 7)))
+%endm
+
+# mov r64, imm64 -- REX.W [+ REX.B] B8+r  followed by 8 bytes of literal.
+%macro amd_mov_imm64_prefix(rd)
+%amd_rex_wb(rd)
+!((| 0xB8 (& %amd_reg(rd) 7)))
+%endm
+
+# ---- Memory ops ---------------------------------------------------------
+
+# mov rT, [rN + off]        48 8B /r  modrm-with-disp
+%macro amd_mem_LD(rt, rn, off)
+%amd_rex_wrb(rt, rn)
+!(0x8B)
+%amd_modrm_disp(rt, rn, off)
+%endm
+
+# mov [rN + off], rT        48 89 /r
+%macro amd_mem_ST(rt, rn, off)
+%amd_rex_wrb(rt, rn)
+!(0x89)
+%amd_modrm_disp(rt, rn, off)
+%endm
+
+# mov [rN + off], rT8       48 88 /r  (REX.W forces the rD8 encoding of
+# dil/sil/bpl/spl when the byte view of those regs is needed.)
+%macro amd_mem_SB(rt, rn, off)
+%amd_rex_wrb(rt, rn)
+!(0x88)
+%amd_modrm_disp(rt, rn, off)
+%endm
+
+# movzx rT, byte ptr [rN + off]  -- 48 0F B6 /r
+%macro amd_mem_LB(rt, rn, off)
+%amd_rex_wrb(rt, rn)
+!(0x0F)
+!(0xB6)
+%amd_modrm_disp(rt, rn, off)
+%endm
+
+# ---- Control flow primitives -------------------------------------------
+
+# jmp r/m64        -- FF /4
+# call r/m64       -- FF /2
+# ret              -- C3
+# syscall          -- 0F 05
+# cmp rA, rB       -- 48 39 /r  (modrm: rB in reg, rA in rm)
+# test rA, rA      -- 48 85 /r
+# Jcc rel8         -- 7x ib
+
+%macro amd_jmp_r(r)
+%amd_maybe_rex_b(r)
+!(0xFF)
+!((| 0xE0 (& %amd_reg(r) 7)))
+%endm
+
+%macro amd_call_r(r)
+%amd_maybe_rex_b(r)
+!(0xFF)
+!((| 0xD0 (& %amd_reg(r) 7)))
+%endm
+
+%macro amd_ret()
+!(0xC3)
+%endm
+
+%macro amd_syscall()
+!(0x0F)
+!(0x05)
+%endm
+
+# cmp rA, rB -- 48 39 /r (modrm: rB in reg, rA in rm).
+%macro amd_cmp_rr(ra, rb)
+%amd_rex_wrb(rb, ra)
+!(0x39)
+%amd_modrm_rr(rb, ra)
+%endm
+
+%macro amd_test_rr(ra, rb)
+%amd_rex_wrb(rb, ra)
+!(0x85)
+%amd_modrm_rr(rb, ra)
+%endm
+
+# ---- P1 register-register op lowering ----------------------------------
+#
+# For ADD/SUB/AND/OR/XOR we honor rD=rB aliasing — the naive `mov rD,rA ;
+# op rD,rB` would clobber rB before the op reads it. Route rB through the
+# scratch reg when that aliasing shows up.
+
+%macro amd_rrr_simple_ADD(rd, ra, rb)
+%amd_rrr_simple(0x01, rd, ra, rb)
+%endm
+%macro amd_rrr_simple_SUB(rd, ra, rb)
+%amd_rrr_simple(0x29, rd, ra, rb)
+%endm
+%macro amd_rrr_simple_AND(rd, ra, rb)
+%amd_rrr_simple(0x21, rd, ra, rb)
+%endm
+%macro amd_rrr_simple_OR(rd, ra, rb)
+%amd_rrr_simple(0x09, rd, ra, rb)
+%endm
+%macro amd_rrr_simple_XOR(rd, ra, rb)
+%amd_rrr_simple(0x31, rd, ra, rb)
+%endm
+
+%macro amd_rrr_simple(opcode, rd, ra, rb)
+%select((= %amd_reg(rd) %amd_reg(rb)),
+    %amd_rrr_simple_via_scratch(opcode, rd, ra, rb),
+    %amd_rrr_simple_direct(opcode, rd, ra, rb))
+%endm
+
+%macro amd_rrr_simple_direct(opcode, rd, ra, rb)
+%amd_mov_rr(rd, ra)
+%amd_alu_rr(opcode, rd, rb)
+%endm
+
+%macro amd_rrr_simple_via_scratch(opcode, rd, ra, rb)
+%amd_mov_rr(scratch, rb)
+%amd_mov_rr(rd, ra)
+%amd_alu_rr(opcode, rd, scratch)
+%endm
+
+%macro amd_rrr_MUL(rd, ra, rb)
+%select((= %amd_reg(rd) %amd_reg(rb)),
+    %amd_rrr_MUL_via_scratch(rd, ra, rb),
+    %amd_rrr_MUL_direct(rd, ra, rb))
+%endm
+%macro amd_rrr_MUL_direct(rd, ra, rb)
+%amd_mov_rr(rd, ra)
+%amd_imul_rr(rd, rb)
+%endm
+%macro amd_rrr_MUL_via_scratch(rd, ra, rb)
+%amd_mov_rr(scratch, rb)
+%amd_mov_rr(rd, ra)
+%amd_imul_rr(rd, scratch)
+%endm
+
+# DIV / REM clobber rax and rdx natively. rax is not a P1 register, so
+# we clobber it freely; rdx IS P1 a2, so we stash it to rbp (also outside
+# the P1 mapping) for the lifetime of the op.
+#
+# Aliasing-safety plan, same for DIV and REM:
+#   1. rbp = rdx                    -- saved a2, also serves as "original rb
+#                                       if rb == a2" via the scratch copy
+#   2. scratch = rb                 -- read rb while rdx still holds its
+#                                       original value (in case rb == a2)
+#   3. rax = ra                     -- ra == a2 reads original rdx for the
+#                                       same reason; cqo hasn't run yet
+#   4. cqo ; idiv scratch           -- divide
+#   5. rdx = rbp (restore) BEFORE   -- so `mov rd, rax/rdx` below can
+#      writing rd                      legitimately overwrite rdx when
+#                                      rd == a2 without losing the result
+#   6. mov rd, rax                  -- DIV quotient
+#      or capture rdx -> rax first,
+#      then rd = rax                -- REM remainder (capture dodges the
+#                                      restore overwriting the remainder)
+
+%macro amd_rrr_DIV(rd, ra, rb)
+%amd_mov_rr(rbp, rdx)
+%amd_mov_rr(scratch, rb)
+%amd_mov_rr(rax, ra)
+%amd_cqo
+%amd_idiv_r(scratch)
+%amd_mov_rr(rdx, rbp)
+%amd_mov_rr(rd, rax)
+%endm
+
+%macro amd_rrr_REM(rd, ra, rb)
+%amd_mov_rr(rbp, rdx)
+%amd_mov_rr(scratch, rb)
+%amd_mov_rr(rax, ra)
+%amd_cqo
+%amd_idiv_r(scratch)
+%amd_mov_rr(rax, rdx)
+%amd_mov_rr(rdx, rbp)
+%amd_mov_rr(rd, rax)
+%endm
+
+# SHL / SHR / SAR with reg count. x86 reads the count from CL only, so
+# staging goes through rcx — which IS P1 a3. Save rcx to rbp for the
+# duration.
+#
+# Ordering is load-bearing:
+#   1. rbp = rcx                     -- save a3
+#   2. scratch = ra                  -- read ra BEFORE we overwrite rcx;
+#                                      otherwise `ra == a3` reads the count
+#                                      we just staged
+#   3. rcx = rb                      -- count into cl
+#   4. shift scratch, cl             -- do the work
+#   5. rcx = rbp (restore) BEFORE    -- so `mov rd, scratch` below can
+#      writing rd                       legitimately overwrite rcx when
+#                                      rd == a3 without losing the result
+#   6. mov rd, scratch
+
+%macro amd_rrr_SHL(rd, ra, rb)
+%amd_rrr_shift(4, rd, ra, rb)
+%endm
+%macro amd_rrr_SHR(rd, ra, rb)
+%amd_rrr_shift(5, rd, ra, rb)
+%endm
+%macro amd_rrr_SAR(rd, ra, rb)
+%amd_rrr_shift(7, rd, ra, rb)
+%endm
+
+%macro amd_rrr_shift(ext, rd, ra, rb)
+%amd_mov_rr(rbp, rcx)
+%amd_mov_rr(scratch, ra)
+%amd_mov_rr(rcx, rb)
+%amd_shift_cl(ext, scratch)
+%amd_mov_rr(rcx, rbp)
+%amd_mov_rr(rd, scratch)
+%endm
+
+%macro amd_rrr_op(op, rd, ra, rb)
+%amd_rrr_##op(rd, ra, rb)
+%endm
+
+%macro amd_rrr_ADD(rd, ra, rb)
+%amd_rrr_simple_ADD(rd, ra, rb)
+%endm
+%macro amd_rrr_SUB(rd, ra, rb)
+%amd_rrr_simple_SUB(rd, ra, rb)
+%endm
+%macro amd_rrr_AND(rd, ra, rb)
+%amd_rrr_simple_AND(rd, ra, rb)
+%endm
+%macro amd_rrr_OR(rd, ra, rb)
+%amd_rrr_simple_OR(rd, ra, rb)
+%endm
+%macro amd_rrr_XOR(rd, ra, rb)
+%amd_rrr_simple_XOR(rd, ra, rb)
+%endm
+
+# ---- P1 operation lowering ---------------------------------------------
+
+%macro p1_li(rd, imm)
+%amd_mov_imm64_prefix(rd)
+$(imm)
+%endm
+
+%macro p1_la(rd)
+%amd_mov_imm32_prefix(rd)
+%endm
+
+%macro p1_labr()
+%amd_mov_imm32_prefix(br)
+%endm
+
+%macro p1_mov(rd, rs)
+%p1_mov_##rs(rd)
+%endm
+
+# All non-sp sources: plain register copy.
+%macro p1_mov_a0(rd)
+%amd_mov_rr(rd, a0)
+%endm
+%macro p1_mov_a1(rd)
+%amd_mov_rr(rd, a1)
+%endm
+%macro p1_mov_a2(rd)
+%amd_mov_rr(rd, a2)
+%endm
+%macro p1_mov_a3(rd)
+%amd_mov_rr(rd, a3)
+%endm
+%macro p1_mov_t0(rd)
+%amd_mov_rr(rd, t0)
+%endm
+%macro p1_mov_t1(rd)
+%amd_mov_rr(rd, t1)
+%endm
+%macro p1_mov_t2(rd)
+%amd_mov_rr(rd, t2)
+%endm
+%macro p1_mov_s0(rd)
+%amd_mov_rr(rd, s0)
+%endm
+%macro p1_mov_s1(rd)
+%amd_mov_rr(rd, s1)
+%endm
+%macro p1_mov_s2(rd)
+%amd_mov_rr(rd, s2)
+%endm
+%macro p1_mov_s3(rd)
+%amd_mov_rr(rd, s3)
+%endm
+
+# sp-source: portable sp is the frame-local base, which is native rsp + 16
+# (the 16-byte backend-private frame header sits at [rsp+0..rsp+15]).
+# Emit `mov rd, rsp ; add rd, 16`.
+%macro p1_mov_sp(rd)
+%amd_mov_rr(rd, sp)
+%amd_alu_ri8(0, rd, 16)
+%endm
+
+%macro p1_rrr(op, rd, ra, rb)
+%amd_rrr_op(op, rd, ra, rb)
+%endm
+
+%macro p1_addi(rd, ra, imm)
+%amd_mov_rr(rd, ra)
+%select((>= imm -128),
+    %select((<= imm 127),
+        %amd_alu_ri8(0, rd, imm),
+        %select((<= imm 2147483647),
+            %amd_alu_ri32(0, rd, imm),
+            %p1_li(scratch, imm)
+            %amd_rrr_ADD(rd, rd, scratch))),
+    %select((>= imm -2147483648),
+        %amd_alu_ri32(0, rd, imm),
+        %p1_li(scratch, imm)
+        %amd_rrr_ADD(rd, rd, scratch)))
+%endm
+
+# AND/OR with imm. Three windows:
+#   imm in [-128, 127]            -> 83 /ext ib   (imm8 sign-extends)
+#   imm in [INT32_MIN, INT32_MAX] -> 81 /ext id   (imm32 sign-extends)
+#   else                          -> materialise imm in scratch, R-type AND/OR.
+# The third arm covers positive imms above 0x7FFFFFFF (e.g. 0xFFFFFFFF
+# or 0xDEADBEEF) where the imm32 sign-extension would silently flip the
+# upper word to all-ones.
+%macro p1_logi_ANDI(rd, ra, imm)
+%amd_mov_rr(rd, ra)
+%select((>= imm -128),
+    %select((<= imm 127),
+        %amd_alu_ri8(4, rd, imm),
+        %select((<= imm 2147483647),
+            %amd_alu_ri32(4, rd, imm),
+            %p1_li(scratch, imm)
+            %amd_rrr_AND(rd, rd, scratch))),
+    %select((>= imm -2147483648),
+        %amd_alu_ri32(4, rd, imm),
+        %p1_li(scratch, imm)
+        %amd_rrr_AND(rd, rd, scratch)))
+%endm
+%macro p1_logi_ORI(rd, ra, imm)
+%amd_mov_rr(rd, ra)
+%select((>= imm -128),
+    %select((<= imm 127),
+        %amd_alu_ri8(1, rd, imm),
+        %select((<= imm 2147483647),
+            %amd_alu_ri32(1, rd, imm),
+            %p1_li(scratch, imm)
+            %amd_rrr_OR(rd, rd, scratch))),
+    %select((>= imm -2147483648),
+        %amd_alu_ri32(1, rd, imm),
+        %p1_li(scratch, imm)
+        %amd_rrr_OR(rd, rd, scratch)))
+%endm
+%macro p1_logi(op, rd, ra, imm)
+%p1_logi_##op(rd, ra, imm)
+%endm
+
+%macro p1_shifti_SHLI(rd, ra, imm)
+%amd_mov_rr(rd, ra)
+%amd_shift_ri8(4, rd, imm)
+%endm
+%macro p1_shifti_SHRI(rd, ra, imm)
+%amd_mov_rr(rd, ra)
+%amd_shift_ri8(5, rd, imm)
+%endm
+%macro p1_shifti_SARI(rd, ra, imm)
+%amd_mov_rr(rd, ra)
+%amd_shift_ri8(7, rd, imm)
+%endm
+%macro p1_shifti(op, rd, ra, imm)
+%p1_shifti_##op(rd, ra, imm)
+%endm
+
+# p1_mem -- portable-offset memory access. When the base is sp, portable
+# sp is the frame-local base (16 bytes above native rsp), so the physical
+# access needs the supplied offset plus 16. For any other base, portable
+# and native offsets coincide. Internal backend callers that need raw
+# native-rsp access (p1_enter, p1_eret, _start stub, p1_ldarg, p1_syscall)
+# use amd_mem_LD/amd_mem_ST directly and bypass this translation.
+
+%macro p1_mem(op, rt, rn, off)
+%select((= %amd_is_sp(rn) 1),
+    %amd_mem_##op(rt, rn, (+ off 16)),
+    %amd_mem_##op(rt, rn, off))
+%endm
+
+%macro p1_ldarg(rd, slot)
+%amd_mem_LD(scratch, sp, 8)
+%amd_mem_LD(rd, scratch, (+ 16 (* 8 slot)))
+%endm
+
+%macro p1_b()
+%amd_jmp_r(br)
+%endm
+
+%macro p1_br(rs)
+%amd_jmp_r(rs)
+%endm
+
+%macro p1_call()
+%amd_call_r(br)
+%endm
+
+%macro p1_callr(rs)
+%amd_call_r(rs)
+%endm
+
+%macro p1_ret()
+%amd_ret
+%endm
+
+# ERET -- atomic frame epilogue + return from a framed function.
+#   r9 = [rsp + 0]       -- retaddr into scratch (native rsp; backend-private)
+#   rax = [rsp + 8]      -- saved caller sp into rax (an unused native reg)
+#   rsp = rax            -- unwind to caller sp
+#   push r9              -- reinstall retaddr so the trailing ret returns
+#                          correctly
+#   ret                  -- pop reinstated retaddr into rip
+%macro p1_eret()
+%amd_mem_LD(scratch, sp, 0)
+%amd_mem_LD(rax, sp, 8)
+%amd_mov_rr(sp, rax)
+%amd_push(scratch)
+%amd_ret
+%endm
+
+# TAIL / TAILR -- frame epilogue followed by an unconditional jump to the
+# target. The epilogue is the same sequence as the first four steps of
+# p1_eret (we omit the trailing ret because we jmp to a fresh target
+# instead).
+%macro p1_tail()
+%amd_mem_LD(scratch, sp, 0)
+%amd_mem_LD(rax, sp, 8)
+%amd_mov_rr(sp, rax)
+%amd_push(scratch)
+%amd_jmp_r(br)
+%endm
+
+%macro p1_tailr(rs)
+%amd_mem_LD(scratch, sp, 0)
+%amd_mem_LD(rax, sp, 8)
+%amd_mov_rr(sp, rax)
+%amd_push(scratch)
+%amd_jmp_r(rs)
+%endm
+
+# Conditional-branch lowering:
+#   compare / test
+#   Jcc_inverse +3          skip the 3-byte `jmp r15`
+#   jmp r15                 P1 branch-taken path
+#
+# Invert codes: BEQ->JNE(75), BNE->JE(74), BLT->JGE(7D), BLTU->JAE(73),
+# BLTZ->JGE(7D), BEQZ->JNE(75), BNEZ->JE(74).
+
+%macro p1_condb_BEQ(ra, rb)
+%amd_cmp_rr(ra, rb)
+!(0x75)
+!(0x03)
+%amd_jmp_r(br)
+%endm
+%macro p1_condb_BNE(ra, rb)
+%amd_cmp_rr(ra, rb)
+!(0x74)
+!(0x03)
+%amd_jmp_r(br)
+%endm
+%macro p1_condb_BLT(ra, rb)
+%amd_cmp_rr(ra, rb)
+!(0x7D)
+!(0x03)
+%amd_jmp_r(br)
+%endm
+%macro p1_condb_BLTU(ra, rb)
+%amd_cmp_rr(ra, rb)
+!(0x73)
+!(0x03)
+%amd_jmp_r(br)
+%endm
+%macro p1_condb(op, ra, rb)
+%p1_condb_##op(ra, rb)
+%endm
+
+%macro p1_condbz_BEQZ(ra)
+%amd_test_rr(ra, ra)
+!(0x75)
+!(0x03)
+%amd_jmp_r(br)
+%endm
+%macro p1_condbz_BNEZ(ra)
+%amd_test_rr(ra, ra)
+!(0x74)
+!(0x03)
+%amd_jmp_r(br)
+%endm
+%macro p1_condbz_BLTZ(ra)
+%amd_test_rr(ra, ra)
+!(0x7D)
+!(0x03)
+%amd_jmp_r(br)
+%endm
+%macro p1_condbz(op, ra)
+%p1_condbz_##op(ra)
+%endm
+
+# ENTER size
+#
+# CALL on amd64 pushed the retaddr, so on entry:
+#   rsp = caller_sp - 8
+#   [rsp] = retaddr
+#
+# We want the standard frame:
+#   [sp + 0] = retaddr
+#   [sp + 8] = saved caller_sp
+#   [sp + 16 .. 16 + size - 1] = locals
+#   total frame = round_up(16, 16 + size)
+#
+# Pop retaddr into scratch, save caller_sp into rax (unused by P1),
+# allocate frame, restore retaddr at [sp], store caller_sp at [sp+8].
+%macro p1_enter(size)
+%amd_pop(scratch)
+%amd_mov_rr(rax, sp)
+%amd_alu_ri32(5, sp, (& (+ (+ 16 size) 15) -16))
+%amd_mem_ST(scratch, sp, 0)
+%amd_mem_ST(rax, sp, 8)
+%endm
+
+%macro p1_entry()
+# :_start stub per the P1 program-entry model. Linux amd64 puts argc
+# at [rsp] and argv starting at [rsp+8]. Load argc into a0 (rdi),
+# compute &argv[0] into a1 (rsi), call p1_main under the one-word
+# direct-result convention, then issue sys_exit with p1_main's return
+# value in a0.
+:_start
+%amd_mem_LD(a0, sp, 0)
+%amd_mov_rr(a1, sp)
+%amd_alu_ri8(0, a1, 8)
+%amd_mov_imm32_prefix(br)
+&p1_main
+%amd_call_r(br)
+# mov eax, 60  (sys_exit); syscall. P1 a0 (native rdi) already holds
+# p1_main's return value.
+!(0xB8)
+%(60)
+!(0x0F)
+!(0x05)
+%endm
+
+%macro p1_syscall()
+# P1: a0=num, a1..a3,t0,s0,s1 = args 0..5. Linux amd64: rax=num,
+# rdi/rsi/rdx/r10/r8/r9 = args 0..5, return in rax; syscall also
+# clobbers rcx and r11.
+#
+# Plan: push the P1 registers whose native slots get overwritten or
+# syscall-clobbered — rsi (a1), rdx (a2), rcx (a3), r11 (t1), r8 (t2) —
+# then shuffle into the native slots, issue syscall, restore, and move
+# the return value (rax) into a0 (rdi).
+%amd_push(rsi)
+%amd_push(rdx)
+%amd_push(rcx)
+%amd_push(r11)
+%amd_push(r8)
+
+%amd_mov_rr(rax, rdi)
+%amd_mem_LD(rdi, sp, 32)
+%amd_mem_LD(rsi, sp, 24)
+%amd_mem_LD(rdx, sp, 16)
+%amd_mov_rr(r8, rbx)
+%amd_mov_rr(r9, r12)
+
+!(0x0F)
+!(0x05)
+
+%amd_pop(r8)
+%amd_pop(r11)
+%amd_pop(rcx)
+%amd_pop(rdx)
+%amd_pop(rsi)
+
+%amd_mov_rr(rdi, rax)
+%endm
+
+# ---- Linux amd64 syscall numbers ----------------------------------------
+# Each macro returns the syscall number as an integer atom so callers can
+# use it inside expressions (e.g. `%li(a0, %sys_write)`).
+
+%macro p1_sys_read()
+0
+%endm
+%macro p1_sys_write()
+1
+%endm
+%macro p1_sys_close()
+3
+%endm
+%macro p1_sys_openat()
+257
+%endm
+%macro p1_sys_exit()
+60
+%endm
+%macro p1_sys_clone()
+56
+%endm
+%macro p1_sys_execve()
+59
+%endm
+%macro p1_sys_spawn()
+1024
+%endm
+%macro p1_sys_waitid()
+247
+%endm
+%macro p1_sys_lseek()
+8
+%endm
+%macro p1_sys_brk()
+12
+%endm
+%macro p1_sys_unlinkat()
+263
+%endm

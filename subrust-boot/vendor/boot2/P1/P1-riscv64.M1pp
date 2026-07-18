@@ -1,0 +1,654 @@
+# P1-riscv64.M1pp -- P1 riscv64 backend expressed in m1macro.
+#
+# Mirrors p1/P1-aarch64.M1pp; same macro surface, different encodings.
+# Native register picks follow docs/P1.md's 64-bit mapping table.
+#
+# Hidden backend regs:
+#   br      = t6 (x31)  -- dedicated branch-target mechanism
+#   scratch = t5 (x30)  -- per-expansion scratch, never live across ops
+#   save0   = t4 (x29)  -- transient across SYSCALL only
+#   save1   = t3 (x28)
+#   save2   = a6 (x16)
+#   saved_fp = fp (x8)  -- used by ENTER/ERET to capture caller sp
+#   a7      = x17       -- Linux riscv64 syscall-number slot
+#   a4      = x14       -- syscall arg4 slot
+#   a5      = x15       -- syscall arg5 slot
+
+# ---- Native register numbers --------------------------------------------
+
+%macro rv_reg_a0()
+10
+%endm
+%macro rv_reg_a1()
+11
+%endm
+%macro rv_reg_a2()
+12
+%endm
+%macro rv_reg_a3()
+13
+%endm
+%macro rv_reg_a4()
+14
+%endm
+%macro rv_reg_a5()
+15
+%endm
+%macro rv_reg_a6()
+16
+%endm
+%macro rv_reg_a7()
+17
+%endm
+%macro rv_reg_t0()
+5
+%endm
+%macro rv_reg_t1()
+6
+%endm
+%macro rv_reg_t2()
+7
+%endm
+%macro rv_reg_s0()
+9
+%endm
+%macro rv_reg_s1()
+18
+%endm
+%macro rv_reg_s2()
+19
+%endm
+%macro rv_reg_s3()
+20
+%endm
+%macro rv_reg_sp()
+2
+%endm
+%macro rv_reg_zero()
+0
+%endm
+%macro rv_reg_ra()
+1
+%endm
+%macro rv_reg_fp()
+8
+%endm
+%macro rv_reg_br()
+31
+%endm
+%macro rv_reg_scratch()
+30
+%endm
+%macro rv_reg_save0()
+29
+%endm
+%macro rv_reg_save1()
+28
+%endm
+%macro rv_reg_save2()
+16
+%endm
+
+%macro rv_reg(r)
+%rv_reg_##r
+%endm
+
+%macro rv_is_sp_a0()
+0
+%endm
+%macro rv_is_sp_a1()
+0
+%endm
+%macro rv_is_sp_a2()
+0
+%endm
+%macro rv_is_sp_a3()
+0
+%endm
+%macro rv_is_sp_a4()
+0
+%endm
+%macro rv_is_sp_a5()
+0
+%endm
+%macro rv_is_sp_a6()
+0
+%endm
+%macro rv_is_sp_a7()
+0
+%endm
+%macro rv_is_sp_t0()
+0
+%endm
+%macro rv_is_sp_t1()
+0
+%endm
+%macro rv_is_sp_t2()
+0
+%endm
+%macro rv_is_sp_s0()
+0
+%endm
+%macro rv_is_sp_s1()
+0
+%endm
+%macro rv_is_sp_s2()
+0
+%endm
+%macro rv_is_sp_s3()
+0
+%endm
+%macro rv_is_sp_sp()
+1
+%endm
+%macro rv_is_sp_zero()
+0
+%endm
+%macro rv_is_sp_ra()
+0
+%endm
+%macro rv_is_sp_fp()
+0
+%endm
+%macro rv_is_sp_br()
+0
+%endm
+%macro rv_is_sp_scratch()
+0
+%endm
+%macro rv_is_sp_save0()
+0
+%endm
+%macro rv_is_sp_save1()
+0
+%endm
+%macro rv_is_sp_save2()
+0
+%endm
+
+%macro rv_is_sp(r)
+%rv_is_sp_##r
+%endm
+
+# ---- Low-level instruction encoders --------------------------------------
+
+# R-type: funct7[31:25] rs2[24:20] rs1[19:15] funct3[14:12] rd[11:7] opcode[6:0]
+%macro rv_r_type(base, rd, ra, rb)
+%((| base (<< %rv_reg(rb) 20) (<< %rv_reg(ra) 15) (<< %rv_reg(rd) 7)))
+%endm
+
+# I-type: imm[31:20] rs1[19:15] funct3[14:12] rd[11:7] opcode[6:0]
+%macro rv_i_type(base, rd, ra, imm12)
+%((| base (<< (& imm12 0xFFF) 20) (<< %rv_reg(ra) 15) (<< %rv_reg(rd) 7)))
+%endm
+
+# S-type: imm[31:25] rs2[24:20] rs1[19:15] funct3[14:12] imm[11:7] opcode[6:0]
+%macro rv_s_type(base, rs, ra, imm12)
+%((| base (<< (& (>> imm12 5) 0x7F) 25) (<< %rv_reg(rs) 20) (<< %rv_reg(ra) 15) (<< (& imm12 0x1F) 7)))
+%endm
+
+# B-type: imm[12|10:5] rs2 rs1 funct3 imm[4:1|11] opcode. 12-bit signed,
+# imm[0] always 0. For the hardcoded skip-over-jalr we only need a fixed
+# positive offset (8 bytes = 2 insns), so inline the resulting bit pattern.
+%macro rv_b_type_skip8(base, ra, rb)
+# imm value 8 -> imm[11:0] = 0000_0000_0100. Bits of encoded imm:
+#   imm[12]=0, imm[10:5]=0, imm[4:1]=0100 (=4), imm[11]=0.
+#   encoded bits: [31:25]=0, [11:7]= (imm[4:1] << 1) | imm[11] = (4<<1)|0 = 8.
+%((| base (<< %rv_reg(rb) 20) (<< %rv_reg(ra) 15) (<< 8 7)))
+%endm
+
+%macro rv_addi(rd, ra, imm12)
+%rv_i_type(0x00000013, rd, ra, imm12)
+%endm
+
+# rv_addi with arbitrary 64-bit signed immediate. Falls back to a
+# 64-bit literal load into `scratch` followed by an R-type ADD when the
+# immediate doesn't fit in ADDI's 12-bit signed field. `scratch` (t5/x30)
+# is per-expansion and never live across ops, so clobbering it is safe.
+%macro rv_addi_any(rd, ra, imm)
+%select((>= imm -2048),
+    %select((<= imm 2047),
+        %rv_addi(rd, ra, imm),
+        %rv_lit64_prefix(scratch)
+        $(imm)
+        %rv_r_type(0x00000033, rd, ra, scratch)),
+    %rv_lit64_prefix(scratch)
+    $(imm)
+    %rv_r_type(0x00000033, rd, ra, scratch))
+%endm
+
+%macro rv_ld(rd, ra, imm12)
+%rv_i_type(0x00003003, rd, ra, imm12)
+%endm
+
+%macro rv_sd(rs, ra, imm12)
+%rv_s_type(0x00003023, rs, ra, imm12)
+%endm
+
+%macro rv_lbu(rd, ra, imm12)
+%rv_i_type(0x00004003, rd, ra, imm12)
+%endm
+
+%macro rv_sb(rs, ra, imm12)
+%rv_s_type(0x00000023, rs, ra, imm12)
+%endm
+
+%macro rv_lwu(rd, ra, imm12)
+%rv_i_type(0x00006003, rd, ra, imm12)
+%endm
+
+# Load/store with arbitrary signed offset. The native I-type/S-type
+# imm12 covers [-2048, 2047]; past that, materialize the offset in
+# scratch (t5/x30), compute scratch = ra + scratch via R-type ADD, and
+# issue the load/store with offset 0. Callers must not pass scratch as
+# `ra` or `rs` — the materialize would clobber it before the address
+# computation reads it.
+%macro rv_ld_any(rd, ra, off)
+%select((>= off -2048),
+    %select((<= off 2047),
+        %rv_ld(rd, ra, off),
+        %rv_lit64_prefix(scratch)
+        $(off)
+        %rv_r_type(0x00000033, scratch, ra, scratch)
+        %rv_ld(rd, scratch, 0)),
+    %rv_lit64_prefix(scratch)
+    $(off)
+    %rv_r_type(0x00000033, scratch, ra, scratch)
+    %rv_ld(rd, scratch, 0))
+%endm
+
+%macro rv_sd_any(rs, ra, off)
+%select((>= off -2048),
+    %select((<= off 2047),
+        %rv_sd(rs, ra, off),
+        %rv_lit64_prefix(scratch)
+        $(off)
+        %rv_r_type(0x00000033, scratch, ra, scratch)
+        %rv_sd(rs, scratch, 0)),
+    %rv_lit64_prefix(scratch)
+    $(off)
+    %rv_r_type(0x00000033, scratch, ra, scratch)
+    %rv_sd(rs, scratch, 0))
+%endm
+
+%macro rv_lbu_any(rd, ra, off)
+%select((>= off -2048),
+    %select((<= off 2047),
+        %rv_lbu(rd, ra, off),
+        %rv_lit64_prefix(scratch)
+        $(off)
+        %rv_r_type(0x00000033, scratch, ra, scratch)
+        %rv_lbu(rd, scratch, 0)),
+    %rv_lit64_prefix(scratch)
+    $(off)
+    %rv_r_type(0x00000033, scratch, ra, scratch)
+    %rv_lbu(rd, scratch, 0))
+%endm
+
+%macro rv_sb_any(rs, ra, off)
+%select((>= off -2048),
+    %select((<= off 2047),
+        %rv_sb(rs, ra, off),
+        %rv_lit64_prefix(scratch)
+        $(off)
+        %rv_r_type(0x00000033, scratch, ra, scratch)
+        %rv_sb(rs, scratch, 0)),
+    %rv_lit64_prefix(scratch)
+    $(off)
+    %rv_r_type(0x00000033, scratch, ra, scratch)
+    %rv_sb(rs, scratch, 0))
+%endm
+
+%macro rv_mov_rr(dst, src)
+%rv_addi(dst, src, 0)
+%endm
+
+%macro rv_slli(rd, ra, shamt)
+%((| 0x00001013 (<< (& shamt 0x3F) 20) (<< %rv_reg(ra) 15) (<< %rv_reg(rd) 7)))
+%endm
+
+%macro rv_srli(rd, ra, shamt)
+%((| 0x00005013 (<< (& shamt 0x3F) 20) (<< %rv_reg(ra) 15) (<< %rv_reg(rd) 7)))
+%endm
+
+%macro rv_srai(rd, ra, shamt)
+%((| 0x40005013 (<< (& shamt 0x3F) 20) (<< %rv_reg(ra) 15) (<< %rv_reg(rd) 7)))
+%endm
+
+%macro rv_jalr(rd, rs, imm12)
+%((| 0x00000067 (<< (& imm12 0xFFF) 20) (<< %rv_reg(rs) 15) (<< %rv_reg(rd) 7)))
+%endm
+
+%macro rv_ecall()
+%(0x00000073)
+%endm
+
+# 64-bit literal-pool prefix for LI:
+#   auipc rd, 0          pc-relative base
+#   ld    rd, 12(rd)     load 8-byte literal from pc+12
+#   jal   x0, 12         skip 12 bytes (literal + pad, =8 bytes of literal).
+# The 8 bytes that follow in source become the literal.
+%macro rv_lit64_prefix(rd)
+%((| 0x00000017 (<< %rv_reg(rd) 7)))
+%((| 0x00C03003 (<< %rv_reg(rd) 15) (<< %rv_reg(rd) 7)))
+%(0x00C0006F)
+%endm
+
+# 32-bit literal-pool prefix for LA / LA_BR:
+#   auipc rd, 0
+#   lwu   rd, 12(rd)     zero-extend 4-byte literal from pc+12
+#   jal   x0, 8          skip 8 bytes (=4 of insn slot? no, literal + align).
+# lwu zero-extends into the full 64-bit register, so 4 bytes is enough for
+# any address in the stage0 layout. Lets source use `&label` directly
+# without padding to 8 bytes.
+%macro rv_lit32_prefix(rd)
+%((| 0x00000017 (<< %rv_reg(rd) 7)))
+%((| 0x00C06003 (<< %rv_reg(rd) 15) (<< %rv_reg(rd) 7)))
+%(0x0080006F)
+%endm
+
+# Memory op fallback: offset outside signed 12-bit range. Load the
+# offset into `scratch` via LUI+ADDI dance? For stage0 programs the
+# curated offsets stay inside -2048..2047, so fall back is unused;
+# still emit a defensive failure to flag any future overflow.
+# (In practice none of the LD/ST off values in p1_gen.py exceed the
+# signed 12-bit range, so no fallback path is wired in here.)
+
+# ---- P1 register-register op lowering -----------------------------------
+
+%macro rv_rrr_ADD(rd, ra, rb)
+%rv_r_type(0x00000033, rd, ra, rb)
+%endm
+%macro rv_rrr_SUB(rd, ra, rb)
+%rv_r_type(0x40000033, rd, ra, rb)
+%endm
+%macro rv_rrr_AND(rd, ra, rb)
+%rv_r_type(0x00007033, rd, ra, rb)
+%endm
+%macro rv_rrr_OR(rd, ra, rb)
+%rv_r_type(0x00006033, rd, ra, rb)
+%endm
+%macro rv_rrr_XOR(rd, ra, rb)
+%rv_r_type(0x00004033, rd, ra, rb)
+%endm
+%macro rv_rrr_SHL(rd, ra, rb)
+%rv_r_type(0x00001033, rd, ra, rb)
+%endm
+%macro rv_rrr_SHR(rd, ra, rb)
+%rv_r_type(0x00005033, rd, ra, rb)
+%endm
+%macro rv_rrr_SAR(rd, ra, rb)
+%rv_r_type(0x40005033, rd, ra, rb)
+%endm
+%macro rv_rrr_MUL(rd, ra, rb)
+%rv_r_type(0x02000033, rd, ra, rb)
+%endm
+%macro rv_rrr_DIV(rd, ra, rb)
+%rv_r_type(0x02004033, rd, ra, rb)
+%endm
+%macro rv_rrr_REM(rd, ra, rb)
+%rv_r_type(0x02006033, rd, ra, rb)
+%endm
+
+%macro rv_rrr_op(op, rd, ra, rb)
+%rv_rrr_##op(rd, ra, rb)
+%endm
+
+# ---- P1 operation lowering -----------------------------------------------
+
+%macro p1_li(rd, imm)
+%rv_lit64_prefix(rd)
+$(imm)
+%endm
+
+%macro p1_la(rd)
+%rv_lit32_prefix(rd)
+%endm
+
+%macro p1_labr()
+%rv_lit32_prefix(br)
+%endm
+
+%macro p1_mov(rd, rs)
+%select((= %rv_is_sp(rs) 1),
+    %rv_addi(rd, sp, 16),
+    %rv_mov_rr(rd, rs))
+%endm
+
+%macro p1_rrr(op, rd, ra, rb)
+%rv_rrr_op(op, rd, ra, rb)
+%endm
+
+%macro p1_addi(rd, ra, imm)
+%rv_addi_any(rd, ra, imm)
+%endm
+
+# Logical-immediate fallback: when imm fits the I-type's 12-bit signed
+# field, emit the native ANDI/ORI; otherwise materialize the immediate
+# in scratch (t5/x30) and use the R-type AND/OR. funct3=7 (AND) or 6
+# (OR) is shared between the I-type (opcode 0x13) and R-type
+# (opcode 0x33) encodings.
+%macro rv_logi_any(rd, ra, imm, base_i, base_r)
+%select((>= imm -2048),
+    %select((<= imm 2047),
+        %rv_i_type(base_i, rd, ra, imm),
+        %rv_lit64_prefix(scratch)
+        $(imm)
+        %rv_r_type(base_r, rd, ra, scratch)),
+    %rv_lit64_prefix(scratch)
+    $(imm)
+    %rv_r_type(base_r, rd, ra, scratch))
+%endm
+
+%macro p1_logi_ANDI(rd, ra, imm)
+%rv_logi_any(rd, ra, imm, 0x00007013, 0x00007033)
+%endm
+%macro p1_logi_ORI(rd, ra, imm)
+%rv_logi_any(rd, ra, imm, 0x00006013, 0x00006033)
+%endm
+%macro p1_logi(op, rd, ra, imm)
+%p1_logi_##op(rd, ra, imm)
+%endm
+
+%macro p1_shifti_SHLI(rd, ra, imm)
+%rv_slli(rd, ra, imm)
+%endm
+%macro p1_shifti_SHRI(rd, ra, imm)
+%rv_srli(rd, ra, imm)
+%endm
+%macro p1_shifti_SARI(rd, ra, imm)
+%rv_srai(rd, ra, imm)
+%endm
+%macro p1_shifti(op, rd, ra, imm)
+%p1_shifti_##op(rd, ra, imm)
+%endm
+
+%macro p1_mem_LD(rt, rn, off)
+%rv_ld_any(rt, rn, off)
+%endm
+%macro p1_mem_ST(rt, rn, off)
+%rv_sd_any(rt, rn, off)
+%endm
+%macro p1_mem_LB(rt, rn, off)
+%rv_lbu_any(rt, rn, off)
+%endm
+%macro p1_mem_SB(rt, rn, off)
+%rv_sb_any(rt, rn, off)
+%endm
+%macro p1_mem(op, rt, rn, off)
+%select((= %rv_is_sp(rn) 1),
+    %p1_mem_##op(rt, rn, (+ off 16)),
+    %p1_mem_##op(rt, rn, off))
+%endm
+
+%macro p1_ldarg(rd, slot)
+%rv_ld(rd, sp, 8)
+%rv_ld_any(rd, rd, (+ 16 (* 8 slot)))
+%endm
+
+%macro p1_b()
+%rv_jalr(zero, br, 0)
+%endm
+
+%macro p1_br(rs)
+%rv_jalr(zero, rs, 0)
+%endm
+
+%macro p1_call()
+%rv_jalr(ra, br, 0)
+%endm
+
+%macro p1_callr(rs)
+%rv_jalr(ra, rs, 0)
+%endm
+
+%macro p1_ret()
+%rv_jalr(zero, ra, 0)
+%endm
+
+%macro p1_eret()
+%rv_ld(ra, sp, 0)
+%rv_ld(fp, sp, 8)
+%rv_mov_rr(sp, fp)
+%rv_jalr(zero, ra, 0)
+%endm
+
+%macro p1_tail()
+%rv_ld(ra, sp, 0)
+%rv_ld(fp, sp, 8)
+%rv_mov_rr(sp, fp)
+%rv_jalr(zero, br, 0)
+%endm
+
+%macro p1_tailr(rs)
+%rv_ld(ra, sp, 0)
+%rv_ld(fp, sp, 8)
+%rv_mov_rr(sp, fp)
+%rv_jalr(zero, rs, 0)
+%endm
+
+# Conditional branch: emit a skip-taken native branch over the `%p1_b`
+# fall-through, then the jalr(br) that takes the P1 branch. Each native
+# B-type here uses the inverted condition with a +8 offset so the `jalr`
+# two insns below is the taken target.
+%macro p1_condb_BEQ(ra, rb)
+%rv_b_type_skip8(0x00001063, ra, rb)
+%p1_b
+%endm
+%macro p1_condb_BNE(ra, rb)
+%rv_b_type_skip8(0x00000063, ra, rb)
+%p1_b
+%endm
+%macro p1_condb_BLT(ra, rb)
+%rv_b_type_skip8(0x00005063, ra, rb)
+%p1_b
+%endm
+%macro p1_condb_BLTU(ra, rb)
+%rv_b_type_skip8(0x00007063, ra, rb)
+%p1_b
+%endm
+%macro p1_condb(op, ra, rb)
+%p1_condb_##op(ra, rb)
+%endm
+
+%macro p1_condbz_BEQZ(ra)
+%rv_b_type_skip8(0x00001063, ra, zero)
+%p1_b
+%endm
+%macro p1_condbz_BNEZ(ra)
+%rv_b_type_skip8(0x00000063, ra, zero)
+%p1_b
+%endm
+%macro p1_condbz_BLTZ(ra)
+%rv_b_type_skip8(0x00005063, ra, zero)
+%p1_b
+%endm
+%macro p1_condbz(op, ra)
+%p1_condbz_##op(ra)
+%endm
+
+%macro p1_enter(size)
+%rv_addi_any(sp, sp, (- 0 (& (+ (+ 16 size) 15) -16)))
+%rv_sd(ra, sp, 0)
+%rv_addi_any(fp, sp, (& (+ (+ 16 size) 15) -16))
+%rv_sd(fp, sp, 8)
+%endm
+
+%macro p1_entry()
+# :_start stub per the P1 program-entry model. Linux riscv64 puts argc
+# at [sp] and argv starting at [sp+8], matching the generic SysV entry
+# stack. Load argc into a0, compute &argv[0] into a1, call p1_main under
+# the one-word direct-result convention, then issue sys_exit with the
+# returned status.
+:_start
+%rv_ld(a0, sp, 0)
+%rv_addi(a1, sp, 8)
+%rv_lit32_prefix(br)
+&p1_main
+%rv_jalr(ra, br, 0)
+%rv_addi(a7, zero, 93)
+%rv_ecall
+%endm
+
+%macro p1_syscall()
+# P1: a0=number, a1,a2,a3,t0,s0,s1 = args 0..5.
+# Linux riscv64: a7=number, a0..a5 = args 0..5, return in a0.
+# SYSCALL clobbers only P1 a0; restore a1/a2/a3 after ecall.
+# Native a4/a5 (x14/x15) aren't P1-exposed; we use them as syscall arg
+# slots and don't need to save them.
+%rv_mov_rr(save0, a1)
+%rv_mov_rr(save1, a2)
+%rv_mov_rr(save2, a3)
+%rv_mov_rr(a7, a0)
+%rv_mov_rr(a0, save0)
+%rv_mov_rr(a1, save1)
+%rv_mov_rr(a2, save2)
+%rv_mov_rr(a3, t0)
+%rv_mov_rr(a4, s0)
+%rv_mov_rr(a5, s1)
+%rv_ecall
+%rv_mov_rr(a1, save0)
+%rv_mov_rr(a2, save1)
+%rv_mov_rr(a3, save2)
+%endm
+
+# ---- Linux riscv64 syscall numbers ---------------------------------------
+# Each macro returns the syscall number as an integer atom so callers can
+# use it inside expressions (e.g. `%li(a0, %sys_write)`).
+
+%macro p1_sys_read()
+63
+%endm
+%macro p1_sys_write()
+64
+%endm
+%macro p1_sys_close()
+57
+%endm
+%macro p1_sys_openat()
+56
+%endm
+%macro p1_sys_exit()
+93
+%endm
+%macro p1_sys_clone()
+220
+%endm
+%macro p1_sys_execve()
+221
+%endm
+%macro p1_sys_spawn()
+1024
+%endm
+%macro p1_sys_waitid()
+95
+%endm
+%macro p1_sys_lseek()
+62
+%endm
+%macro p1_sys_brk()
+214
+%endm
+%macro p1_sys_unlinkat()
+35
+%endm

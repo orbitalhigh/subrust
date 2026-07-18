@@ -1,0 +1,272 @@
+# P1.M1M -- portable P1 macro front-end.
+#
+# This file assumes an arch-specific backend M1M has already been prepended.
+# The backend must provide the target hooks used below:
+#   %p1_li, %p1_la, %p1_labr, %p1_mov, %p1_rrr, %p1_addi, %p1_logi,
+#   %p1_shifti, %p1_mem, %p1_ldarg, %p1_b, %p1_br, %p1_call, %p1_callr,
+#   %p1_ret, %p1_eret, %p1_tail, %p1_tailr, %p1_condb, %p1_condbz,
+#   %p1_enter, %p1_syscall, and %p1_sys_*.
+
+# ---- Materialization ------------------------------------------------------
+
+%macro li(rd, imm)
+%p1_li(rd, imm)
+%endm
+
+%macro la(rd, target)
+%p1_la(rd)
+target
+%endm
+
+# ---- Moves ----------------------------------------------------------------
+
+%macro mov(rd, rs)
+%p1_mov(rd, rs)
+%endm
+
+# ---- Register arithmetic --------------------------------------------------
+
+%macro add(rd, ra, rb)
+%p1_rrr(ADD, rd, ra, rb)
+%endm
+
+%macro sub(rd, ra, rb)
+%p1_rrr(SUB, rd, ra, rb)
+%endm
+
+%macro and(rd, ra, rb)
+%p1_rrr(AND, rd, ra, rb)
+%endm
+
+%macro or(rd, ra, rb)
+%p1_rrr(OR, rd, ra, rb)
+%endm
+
+%macro xor(rd, ra, rb)
+%p1_rrr(XOR, rd, ra, rb)
+%endm
+
+%macro shl(rd, ra, rb)
+%p1_rrr(SHL, rd, ra, rb)
+%endm
+
+%macro shr(rd, ra, rb)
+%p1_rrr(SHR, rd, ra, rb)
+%endm
+
+%macro sar(rd, ra, rb)
+%p1_rrr(SAR, rd, ra, rb)
+%endm
+
+%macro mul(rd, ra, rb)
+%p1_rrr(MUL, rd, ra, rb)
+%endm
+
+%macro div(rd, ra, rb)
+%p1_rrr(DIV, rd, ra, rb)
+%endm
+
+%macro rem(rd, ra, rb)
+%p1_rrr(REM, rd, ra, rb)
+%endm
+
+# ---- Immediate arithmetic -------------------------------------------------
+
+%macro addi(rd, ra, imm)
+%p1_addi(rd, ra, imm)
+%endm
+
+%macro andi(rd, ra, imm)
+%p1_logi(ANDI, rd, ra, imm)
+%endm
+
+%macro ori(rd, ra, imm)
+%p1_logi(ORI, rd, ra, imm)
+%endm
+
+%macro shli(rd, ra, imm)
+%p1_shifti(SHLI, rd, ra, imm)
+%endm
+
+%macro shri(rd, ra, imm)
+%p1_shifti(SHRI, rd, ra, imm)
+%endm
+
+%macro sari(rd, ra, imm)
+%p1_shifti(SARI, rd, ra, imm)
+%endm
+
+# ---- Memory and ABI access ------------------------------------------------
+
+%macro ld(rt, rn, off)
+%p1_mem(LD, rt, rn, off)
+%endm
+
+%macro st(rt, rn, off)
+%p1_mem(ST, rt, rn, off)
+%endm
+
+%macro lb(rt, rn, off)
+%p1_mem(LB, rt, rn, off)
+%endm
+
+%macro sb(rt, rn, off)
+%p1_mem(SB, rt, rn, off)
+%endm
+
+%macro ldarg(rd, slot)
+%p1_ldarg(rd, slot)
+%endm
+
+# ---- Branching ------------------------------------------------------------
+
+%macro b(target)
+%p1_labr
+target
+%p1_b
+%endm
+
+%macro br(rs)
+%p1_br(rs)
+%endm
+
+%macro beq(ra, rb, target)
+%p1_labr
+target
+%p1_condb(BEQ, ra, rb)
+%endm
+
+%macro bne(ra, rb, target)
+%p1_labr
+target
+%p1_condb(BNE, ra, rb)
+%endm
+
+%macro blt(ra, rb, target)
+%p1_labr
+target
+%p1_condb(BLT, ra, rb)
+%endm
+
+%macro bltu(ra, rb, target)
+%p1_labr
+target
+%p1_condb(BLTU, ra, rb)
+%endm
+
+%macro beqz(ra, target)
+%p1_labr
+target
+%p1_condbz(BEQZ, ra)
+%endm
+
+%macro bnez(ra, target)
+%p1_labr
+target
+%p1_condbz(BNEZ, ra)
+%endm
+
+%macro bltz(ra, target)
+%p1_labr
+target
+%p1_condbz(BLTZ, ra)
+%endm
+
+# ---- Calls, returns, and frames ------------------------------------------
+
+%macro call(target)
+%p1_labr
+target
+%p1_call
+%endm
+
+%macro callr(rs)
+%p1_callr(rs)
+%endm
+
+%macro ret()
+%p1_ret
+%endm
+
+%macro tail(target)
+%p1_labr
+target
+%p1_tail
+%endm
+
+%macro tailr(rs)
+%p1_tailr(rs)
+%endm
+
+%macro enter(size)
+%p1_enter(size)
+%endm
+
+%macro eret()
+%p1_eret
+%endm
+
+# ---- System ---------------------------------------------------------------
+
+%macro syscall()
+%p1_syscall
+%endm
+
+%macro sys_read()
+%p1_sys_read
+%endm
+
+%macro sys_write()
+%p1_sys_write
+%endm
+
+%macro sys_close()
+%p1_sys_close
+%endm
+
+%macro sys_openat()
+%p1_sys_openat
+%endm
+
+%macro sys_exit()
+%p1_sys_exit
+%endm
+
+%macro sys_clone()
+%p1_sys_clone
+%endm
+
+%macro sys_execve()
+%p1_sys_execve
+%endm
+
+%macro sys_spawn()
+%p1_sys_spawn
+%endm
+
+%macro sys_waitid()
+%p1_sys_waitid
+%endm
+
+%macro sys_lseek()
+%p1_sys_lseek
+%endm
+
+%macro sys_brk()
+%p1_sys_brk
+%endm
+
+%macro sys_unlinkat()
+%p1_sys_unlinkat
+%endm
+
+# ---- Program entry --------------------------------------------------------
+#
+# The portable P1 program-entry model emits a backend-specific `:_start`
+# stub that captures argc/argv from the native entry state, calls the
+# portable label `p1_main` under the one-word direct-result convention
+# (a0=argc, a1=argv), and sys_exits p1_main's return value. The stub is
+# emitted unconditionally here so portable sources only need to define
+# `:p1_main` as an ordinary P1 function.
+
+%p1_entry

@@ -1,0 +1,8 @@
+# P1/elf-end.P1pp — terminator for catm-style links.
+#
+# vendor/seed/$ARCH/ELF.hex2 sizes p_filesz from the first :ELF_end
+# label it sees. Exactly one TU in a link must emit it; in exec mode
+# cc.scm appends it for you, but in --lib mode every TU suppresses
+# it so the chain can supply this fragment once at the tail.
+
+:ELF_end

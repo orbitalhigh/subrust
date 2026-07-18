@@ -1,0 +1,101 @@
+# SPDX-FileCopyrightText: © 2019 Jeremiah Orians
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+	# Register usage:
+	# EBP => OUTPUT
+	# EDI => Buffer
+	# ESI => INPUT
+
+DEFINE add_ebx, 81C3
+DEFINE cmp_eax, 3D
+DEFINE int CD
+DEFINE mov_cx, 66B9
+DEFINE mov_dx, 66BA
+DEFINE mov_edx, BA
+DEFINE mov_ebp,eax 89C5
+DEFINE mov_ebx,ebp 89EB
+DEFINE mov_ebx,esi 89F3
+DEFINE mov_ecx,edi 89F9
+DEFINE mov_ebx,edi 89FB
+DEFINE mov_edi,eax 89C7
+DEFINE mov_edx,eax 89C2
+DEFINE mov_esi,eax 89C6
+DEFINE push 6A
+DEFINE pop_eax 58
+DEFINE pop_ebx 5B
+DEFINE push_eax 50
+DEFINE je 74
+DEFINE jmp EB
+DEFINE xor_ebx,ebx 31DB
+DEFINE xor_ecx,ecx 31C9
+DEFINE xor_edx,edx 31D2
+DEFINE test_ebx,ebx 85DB
+
+# Where the ELF Header is going to hit
+# Simply jump to _start
+# Our main function
+
+:_start
+	pop_eax                     # Get the number of arguments
+	pop_ebx                     # Get the program name
+	pop_ebx                     # Get the actual output name
+	mov_cx, @577                # Prepare file as O_WRONLY|O_CREAT|O_TRUNC
+	mov_dx, @384                # Prepare file as RW for owner only (600 in octal)
+	push !5                     # prepare to set eax to 5
+	pop_eax                     # the syscall number for open()
+	int !0x80                   # Now open that file
+	mov_ebp,eax                 # Preserve the file pointer we were given
+
+	push !45
+	pop_eax                     # the Syscall # for SYS_BRK
+	xor_ebx,ebx                 # Get current brk
+	int !0x80                   # Let the kernel do the work
+	mov_edi,eax                 # Set our malloc pointer
+
+	push !45
+	pop_eax                     # the Syscall # for SYS_BRK
+	mov_ebx,edi                 # Using current pointer
+	add_ebx, %0x100000          # Allocate 1MB
+	int !0x80                   # Let the kernel do the work
+
+:core
+	pop_ebx                     # Get the actual input name
+	test_ebx,ebx                # Check for null string
+	je !done                    # Hit null be done
+
+	xor_ecx,ecx                 # prepare read_only
+	xor_edx,edx                 # prevent any interactions
+	push !5
+	pop_eax                     # the syscall number for open()
+	int !0x80                   # Now open that damn file
+	mov_esi,eax                 # Protect INPUT
+:keep
+	mov_edx, %0x100000          # set the size of chars we want
+	mov_ecx,edi                 # Where to put it
+	mov_ebx,esi                 # Where are we reading from
+	push !3
+	pop_eax                     # the syscall number for read
+	int !0x80                   # call the Kernel
+	push_eax                    # Protect the number of bytes read
+
+	mov_edx,eax                 # Number of bytes to write
+	mov_ecx,edi                 # What we are writing
+	mov_ebx,ebp                 # Write to target file
+	push !4
+	pop_eax                     # the syscall number for write
+	int !0x80                   # call the Kernel
+
+	pop_eax                     # Get bytes read
+	cmp_eax, %0x100000          # Check if buffer was fully used
+	je !keep                    # Keep looping if was full
+	jmp !core                   # Otherwise move to next file
+
+:done
+	# program completed Successfully
+	xor_ebx,ebx                 # All is well
+	push !1
+	pop_eax                     # put the exit syscall number in eax
+	int !0x80                   # Call it a good day
+
+:ELF_end

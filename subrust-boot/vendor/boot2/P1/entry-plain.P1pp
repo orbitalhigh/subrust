@@ -1,0 +1,21 @@
+# P1/entry-plain.P1pp — executable entry stub for catm-style links.
+#
+# P1's program-entry contract (docs/P1.md §Program Entry) delivers
+# argc in a0 and argv in a1 at :p1_main. Under cc.scm's standard
+# convention :main has the same shape, so a bare %call(&main) forwards
+# both unchanged (%call doesn't clobber a0/a1). main builds its own
+# frame on top.
+#
+# %fn size = 0: this stub has no locals and no overflow outgoing args
+# (only 2 register-passed args). %enter on every arch independently
+# allocates a 16-byte slot for saved-lr / saved-old-sp on top of the
+# user-requested size, so a 0-size frame still has the saves it needs.
+#
+# Cat this fragment in exactly once at the head of a catm chain to
+# supply :p1_main, and pair with P1/elf-end.P1pp at the tail. Library
+# TUs (built with cc.scm --lib=PFX) suppress the auto-emitted entry
+# stub, which is what makes adding this fragment safe (no collision).
+
+%fn(p1_main, 0, {
+    %call(&main)
+})

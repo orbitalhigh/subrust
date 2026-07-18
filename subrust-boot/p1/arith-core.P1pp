@@ -1,0 +1,215 @@
+# arith-core.P1pp — SR-seed u64 trap-arithmetic in P1pp (boot2's portable
+# pseudo-ISA). The load-bearing semantic core of a P1pp sr0i (the "no C rung"
+# ideal): u64 add/sub/mul/div/rem/shift/compare with
+# rustc debug-profile trap semantics (overflow, div-by-zero, shift>=64 trap).
+#
+# P1-64 has native mul but only SIGNED div/rem, and SR-seed is unsigned, so
+# unsigned division is done in software (binary long division via `bltu`) —
+# the same technique the M2-Planet C prototype used, now in portable P1pp and
+# valid on amd64/aarch64/riscv64 alike.
+#
+# Protocol (so it can be driven differentially against rustc without a P1pp
+# parser): read 24-byte records [op:u64 a:u64 b:u64] little-endian from stdin;
+# for each, emit 16 bytes [flag:u64 result:u64] where flag=1 means the op
+# trapped (result 0). EOF (a short read) ends. op ids match the C sr0i's
+# OP_* (add=1 sub=2 mul=3 div=4 rem=5 band=8 bor=9 bxor=10 shl=11 shr=12
+# eq=13 ne=14 lt=15 le=16 gt=17 ge=18).
+
+# ---- udivmod(a=a0, b=a1) -> (q=a0, r=a1); assumes b != 0 ------------------
+# Binary long division. `carry` handles 2r+bit at full 65-bit width without a
+# wider type (see the C sr0i w_div for the derivation).
+%fn(udivmod, 40, {
+    %st(s0, sp, 0)
+    %st(s1, sp, 8)
+    %st(s2, sp, 16)
+    %st(s3, sp, 24)
+    %mov(s0, a0)          # dividend a
+    %mov(s1, a1)          # divisor b
+    %li(s2, 0)            # q
+    %li(s3, 0)            # r
+    %li(t0, 63)           # i
+:.dloop
+    # carry = r >> 63 ; r = (r<<1) | ((a>>i)&1)
+    %shri(t1, s3, 63)     # t1 = carry (0 or 1)
+    %shli(s3, s3, 1)      # r <<= 1
+    %shr(t2, s0, t0)      # t2 = a >> i (logical)
+    %andi(t2, t2, 1)
+    %or(s3, s3, t2)       # r |= bit
+    # if carry==1 || r >=u b  ->  r -= b ; q |= (1<<i)
+    %bnez(t1, &.dsub)
+    %bltu(s3, s1, &.dskip)
+:.dsub
+    %sub(s3, s3, s1)
+    %li(t2, 1)
+    %shl(t2, t2, t0)      # 1 << i
+    %or(s2, s2, t2)
+:.dskip
+    %addi(t0, t0, -1)
+    %bltz(t0, &.ddone)
+    %b(&.dloop)
+:.ddone
+    %mov(a0, s2)          # q
+    %mov(a1, s3)          # r
+    %ld(s0, sp, 0)
+    %ld(s1, sp, 8)
+    %ld(s2, sp, 16)
+    %ld(s3, sp, 24)
+})
+
+# ---- do_bin(op=a0, a=a1, b=a2) -> (flag=a0, result=a1) --------------------
+%fn(do_bin, 40, {
+    %st(s0, sp, 0)
+    %st(s1, sp, 8)
+    %st(s2, sp, 16)
+    %mov(s0, a0)          # op
+    %mov(s1, a1)          # a
+    %mov(s2, a2)          # b
+
+    %li(t0, 1)  %beq(s0, t0, &.add)
+    %li(t0, 2)  %beq(s0, t0, &.sub)
+    %li(t0, 3)  %beq(s0, t0, &.mul)
+    %li(t0, 4)  %beq(s0, t0, &.divop)
+    %li(t0, 5)  %beq(s0, t0, &.remop)
+    %li(t0, 8)  %beq(s0, t0, &.band)
+    %li(t0, 9)  %beq(s0, t0, &.bor)
+    %li(t0, 10) %beq(s0, t0, &.bxor)
+    %li(t0, 11) %beq(s0, t0, &.shlop)
+    %li(t0, 12) %beq(s0, t0, &.shrop)
+    %li(t0, 13) %beq(s0, t0, &.eq)
+    %li(t0, 14) %beq(s0, t0, &.ne)
+    %li(t0, 15) %beq(s0, t0, &.lt)
+    %li(t0, 16) %beq(s0, t0, &.le)
+    %li(t0, 17) %beq(s0, t0, &.gt)
+    %li(t0, 18) %beq(s0, t0, &.ge)
+    %b(&.trap)
+
+:.add
+    %add(a1, s1, s2)
+    %bltu(a1, s1, &.trap)      # r <u a  => overflow
+    %b(&.ok)
+:.sub
+    %bltu(s1, s2, &.trap)      # a <u b  => underflow
+    %sub(a1, s1, s2)
+    %b(&.ok)
+:.mul
+    %mul(a1, s1, s2)           # low 64 bits (sign-agnostic) = result
+    %beqz(s1, &.ok)            # a==0 => no overflow, result 0
+    %st(a1, sp, 24)            # save r
+    %mov(a0, a1)               # udivmod(r, a)
+    %mov(a1, s1)
+    %call(&udivmod)            # a0 = r/a
+    %bne(a0, s2, &.trap)       # r/a != b  => overflow
+    %ld(a1, sp, 24)            # result = r
+    %b(&.ok)
+:.divop
+    %beqz(s2, &.trap)
+    %mov(a0, s1)
+    %mov(a1, s2)
+    %call(&udivmod)
+    %mov(a1, a0)               # result = quotient
+    %b(&.ok)
+:.remop
+    %beqz(s2, &.trap)
+    %mov(a0, s1)
+    %mov(a1, s2)
+    %call(&udivmod)            # a1 = remainder = result
+    %b(&.ok)
+:.band
+    %and(a1, s1, s2)
+    %b(&.ok)
+:.bor
+    %or(a1, s1, s2)
+    %b(&.ok)
+:.bxor
+    %xor(a1, s1, s2)
+    %b(&.ok)
+:.shlop
+    %li(t0, 64)
+    %bltu(s2, t0, &.shldo)
+    %b(&.trap)
+:.shldo
+    %shl(a1, s1, s2)
+    %b(&.ok)
+:.shrop
+    %li(t0, 64)
+    %bltu(s2, t0, &.shrdo)
+    %b(&.trap)
+:.shrdo
+    %shr(a1, s1, s2)
+    %b(&.ok)
+:.eq
+    %li(a1, 0)
+    %bne(s1, s2, &.ok)
+    %li(a1, 1)
+    %b(&.ok)
+:.ne
+    %li(a1, 0)
+    %beq(s1, s2, &.ok)
+    %li(a1, 1)
+    %b(&.ok)
+:.lt
+    %li(a1, 1)
+    %bltu(s1, s2, &.ok)
+    %li(a1, 0)
+    %b(&.ok)
+:.ge
+    %li(a1, 0)
+    %bltu(s1, s2, &.ok)
+    %li(a1, 1)
+    %b(&.ok)
+:.gt
+    %li(a1, 1)
+    %bltu(s2, s1, &.ok)
+    %li(a1, 0)
+    %b(&.ok)
+:.le
+    %li(a1, 0)
+    %bltu(s2, s1, &.ok)
+    %li(a1, 1)
+    %b(&.ok)
+
+:.trap
+    %li(a0, 1)
+    %li(a1, 0)
+    %b(&.ret)
+:.ok
+    %li(a0, 0)                 # result already in a1
+:.ret
+    %ld(s0, sp, 0)
+    %ld(s1, sp, 8)
+    %ld(s2, sp, 16)
+})
+
+# ---- driver: stream 24-byte records -> 16-byte records --------------------
+%fn(p1_main, 0, {
+:.loop
+    %li(a0, 0)
+    %la(a1, &inbuf)
+    %li(a2, 24)
+    %call(&sys_read)
+    %li(t0, 24)
+    %bne(a0, t0, &.done)       # short read / EOF -> stop
+    %la(t0, &inbuf)
+    %ld(a0, t0, 0)             # op
+    %ld(a1, t0, 8)             # a
+    %ld(a2, t0, 16)            # b
+    %call(&do_bin)             # a0=flag, a1=result
+    %la(t0, &outbuf)
+    %st(a0, t0, 0)
+    %st(a1, t0, 8)
+    %li(a0, 1)
+    %la(a1, &outbuf)
+    %li(a2, 16)
+    %call(&sys_write)
+    %b(&.loop)
+:.done
+    %li(a0, 0)
+})
+
+# zeroed buffers as compile-time 8-byte words ($(0)), the libp1pp idiom.
+:inbuf
+$(0) $(0) $(0)
+:outbuf
+$(0) $(0)
+
+:ELF_end

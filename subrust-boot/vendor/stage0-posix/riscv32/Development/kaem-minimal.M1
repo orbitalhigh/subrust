@@ -1,0 +1,355 @@
+## Copyright (C) 2021 Andrius Štikonas
+## This file is part of stage0.
+##
+## stage0 is free software: you can redistribute it and/or modify
+## it under the terms of the GNU General Public License as published by
+## the Free Software Foundation, either version 3 of the License, or
+## (at your option) any later version.
+##
+## stage0 is distributed in the hope that it will be useful,
+## but WITHOUT ANY WARRANTY; without even the implied warranty of
+## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+## GNU General Public License for more details.
+##
+## You should have received a copy of the GNU General Public License
+## along with stage0.  If not, see <http://www.gnu.org/licenses/>.
+
+; Where the ELF Header is going to hit
+; Simply jump to _start
+; Our main function
+:_start
+
+# Register use:
+# s2: input fd
+# s4: command_done
+# s6: malloc pointer
+
+    rd_a2 rs1_sp !8 lw                # Input file name
+    rd_a4 mv                          # Initialize register (set *rusage = NULL in waitid)
+
+    rs1_a2 @_start_out bnez           # Use input file if specified
+    # Else use kaem.riscv32
+    rd_a2 ~default_file auipc         # load address of default_file
+    rd_a2 rs1_a2 !default_file addi   # into register a2
+
+:_start_out
+
+    # Open input file and store FD in s2
+    rd_a7 !56 addi                    # sys_openat
+    rd_a0 !-100 addi                  # AT_FDCWD
+    rd_a1 rs1_a2 mv                   # file name
+    rd_a2 addi                        # read only
+    ecall                             # syscall
+    rs1_a0 @Fail bltz                 # Error opening file
+    rd_s2 rs1_a0 mv                   # Save fd in for later
+
+    # Prepare heap memory
+    rd_a7 !214 addi                   # sys_brk
+    rd_a0 mv                          # Get current brk
+    ecall                             # syscall
+    rd_s6 rs1_a0 mv                   # Set our malloc pointer
+
+# Using a1 for tokens and a2 for tokens[i]
+:main_loop
+    rd_a0 !1 addi                     # 256 * sizeof(char*)
+    rd_a0 rs1_a0 rs2_x11 slli         # 2048 = 1 << 11
+    rd_ra $malloc jal                 # allocate space
+    rd_a1 rs1_a0 mv                   # set tokens pointer
+    rd_a2 rs1_a0 mv                   # set tokens[i] pointer (i=0)
+
+    rd_s4 mv                          # command_done = 0
+
+:collect_command
+    rd_ra $collect_token jal          # Get another token
+    rs1_a0 @collect_command_comment beqz # if NULL == result then it is a comment, don't store
+
+    rs1_a2 rs2_a0 sw                  # tokens[i] = result
+    rd_a2 rs1_a2 !4 addi              # i = i + 1 (sizeof(char*) = 4)
+
+:collect_command_comment
+    rs1_s4 @collect_command beqz      # keep looping if 0 == command_done
+
+    # Deal with line comments
+    rs1_a1 rs2_a2 @main_loop beq      # keep looping if comment
+
+    rd_ra $print_command jal          # print the command
+    rd_a0 rs1_a1 lw                   # program = tokens[0]
+    rs1_a0 @Fail beqz                 # Error, no program
+
+    rd_sp rs1_sp !-4 addi             # allocate stack
+    rs1_sp rs2_a1 sw                  # protect tokens
+
+    rd_a7 !220 addi                   # sys_clone
+    rd_a0 !17 addi                    # SIGCHLD flag
+    rd_a1 mv                          # Child uses duplicate of parent's stack
+    ecall                             # syscall
+
+    rd_a1 rs1_sp lw                   # restore tokens
+    rd_sp rs1_sp !4 addi              # deallocate stack
+
+    rs1_a0 @Fail bltz                 # if f == -1 no child was created
+    rs1_a0 @collect_command_parent bnez # if f == 0 it is child
+
+    # Deal with child case
+    rd_a7 !221 addi                   # sys_execve
+    rd_a0 rs1_a1 lw                   # program = tokens[0]
+    ecall                             # execve(program, tokens)
+    rd_ra $Fail jal                   # Exit with an error
+
+:collect_command_parent
+    rd_a7 !95 addi                    # sys_waitid
+    rd_a0 mv                          # set idtype = P_ALL
+    rd_a2 ~info auipc                 # a2 = siginfo_t &info
+    rd_a2 rs1_a2 !info addi
+    rd_a3 !4 mv                       # set *options = WEXITED
+    ecall                             # syscall
+
+    # Check if child exited
+    rd_a2 rs1_a2 !20 lw               # status = info->si_status
+    rs1_a2 @main_loop beqz            # Loop if 0 == status
+
+:abort
+    rd_a0 ~hard auipc                 # Get error string
+    rd_a0 rs1_a0 !hard addi           # Get error string
+    rd_ra $File_Print jal             # Print it
+    $Fail jal                         # Exit with failure
+
+
+# print_command function
+# Receives tokens[j] in a1 and tokens[i] in a2
+# Modifies a0
+:print_command
+    rd_sp rs1_sp !-12 addi            # allocate stack
+    rs1_sp rs2_ra sw                  # protect ra
+    rs1_sp rs2_a1 @4 sw               # protect a1
+    rs1_sp rs2_a2 @8 sw               # protect a2
+
+    rd_a0 ~prefix auipc               # Get prefix " +> "
+    rd_a0 rs1_a0 !prefix addi         # Get prefix " +> "
+    rd_ra $File_Print jal             # print it
+
+:print_command_loop
+    rd_a0 rs1_a1 lw                   # get tokens[j]
+    rd_ra $File_Print jal             # print it
+    rd_a1 rs1_a1 !4 addi              # j = j + 1
+    rd_a0 !32 addi                    # a0 = ' '
+    rd_ra $fputc jal                  # print it
+    rs1_a1 rs2_a2 @print_command_loop bne # continue if j < i, otherwise keep looping
+
+    rd_a0 !10 addi                    # a0 = '\n'
+    rd_ra $fputc jal                  # print it
+
+    rd_ra rs1_sp lw                   # restore ra
+    rd_a1 rs1_sp !4 lw                # restore a1
+    rd_a2 rs1_sp !8 lw                # restore a2
+    rd_sp rs1_sp !12 addi             # deallocate stack
+    rs1_ra jalr                       # return
+
+
+# collect_token function
+# Receives nothing
+# Overwrites a0
+# Uses a0 as c, a1 as token and a2 as token[i]
+:collect_token
+    rd_sp rs1_sp !-12 addi            # allocate stack
+    rs1_sp rs2_ra sw                  # protect ra
+    rs1_sp rs2_a1 @4 sw               # protect a1
+    rs1_sp rs2_a2 @8 sw               # protect a2
+
+    rd_a0 ~4096 lui                   # 4096 * sizeof(char)
+    rd_ra $malloc jal                 # allocate space
+    rd_a1 rs1_a0 mv                   # token = malloc(max_string)
+    rd_a2 rs1_a0 mv                   # i = 0; set token[i]
+
+:collect_token_loop
+    rd_ra $fgetc jal                  # read character
+    rd_t0 !-4 addi                    # if character == EOF
+    rs1_a0 rs2_t0 @Done beq           # We are done
+
+    rd_t0 !32 addi                    # if c == ' '
+    rs1_a0 rs2_t0 @collect_token_done beq # Space terminates token
+
+    rd_t0 !9 addi                     # if c == '\t'
+    rs1_a0 rs2_t0 @collect_token_done beq    # Tab terminates token
+
+    rd_t0 !10 addi                    # continue if c == '\n'
+    rs1_a0 rs2_t0 @collect_token_comment bne # otherwise check next
+
+    # newline
+    rd_s4 !1 addi                     # command_done = true
+    $collect_token_done jal           # We are done with current command
+
+:collect_token_comment
+    rd_t0 !35 addi                    # if c == '#'
+    rs1_a0 rs2_t0 @collect_token_escape bne # otherwise check next
+
+    # It is a line comment
+    rd_ra $collect_comment jal        # Read whole comment
+    rd_s4 !1 addi                     # command_done = true
+    rd_ra $collect_token_done jal     # Done
+
+:collect_token_escape
+    rd_t0 !92 addi                    # if c == '\'
+    rs1_a0 rs2_t0 @collect_token_other bne # otherwise just store it
+
+    # Escape character
+    rd_ra $fgetc jal                  # Read the char to drop
+    rd_ra $collect_token_done jal     # We are done
+
+:collect_token_other
+    rs1_a2 rs2_a0 sb                  # token[i] = c
+    rd_a2 rs1_a2 !1 addi              # i = i + 1
+    $collect_token_loop jal           # Read another character
+
+:collect_token_done
+    rs1_a1 rs2_a2 @collect_token_good bne # return the token unless
+    rd_a1 mv                          # i == 0, then token = NULL
+
+:collect_token_good
+    rd_a0 rs1_a1 mv                   # Return token
+    rd_ra rs1_sp lw                   # Restore ra
+    rd_a1 rs1_sp !4 lw                # Restore a1
+    rd_a2 rs1_sp !8 lw                # Restore a2
+    rd_sp rs1_sp !12 addi             # Deallocate stack
+    rs1_ra jalr                       # return
+
+
+# collect_comment function
+# Receives nothing
+# Modifies a0
+# uses a0 as c
+# Just throws away everything it reads
+:collect_comment
+    rd_sp rs1_sp !-4 addi             # allocate stack
+    rs1_sp rs2_ra sw                  # protect ra
+
+    rd_ra $fgetc jal                  # c = fgetc(input)
+    rd_t0 !-4 addi                    # if c == EOF
+    rs1_a0 rs2_t0 @Fail beq           # Abort
+
+    rd_t0 !10 addi                    # if c == '\n'
+    rs1_a0 rs2_t0 @collect_comment bne # loop
+
+    rd_ra rs1_sp lw                   # restore ra
+    rd_sp rs1_sp !4 addi              # deallocate stack
+    rs1_ra jalr                       # return
+
+
+# fgetc function
+# Loads FILE* from s2
+# Returns -4 (EOF) or char in a0
+:fgetc
+    rd_sp rs1_sp !-12 addi            # allocate stack
+    rs1_sp rs2_a1 @4 sw               # protect a1
+    rs1_sp rs2_a2 @8 sw               # protect a2
+
+    rd_a7 !63 addi                    # sys_read
+    rd_a1 rs1_sp mv                   # Get stack address
+    rd_a0 rs1_s2 mv                   # read from input file
+    rd_a2 !1 addi                     # read 1 character
+    ecall                             # syscall
+
+    rs1_a0 @fgetc_done  bnez          # Check if nothing was read
+
+:fgetc_fail
+    rd_t0 !-4 addi                    # Use -4 as EOF
+    rs1_a1 rs2_t0 sb                  # Put EOF in a0
+
+:fgetc_done
+    rd_a0 rs1_a1 lb                   # return char in a0
+    rd_a1 rs1_sp !4 lw                # restore a1
+    rd_a2 rs1_sp !8 lw                # restore a2
+    rd_sp rs1_sp !12 addi             # deallocate stack
+    rs1_ra jalr                       # return
+
+
+# Malloc isn't actually required if the program being built fits in the initial memory
+# However, it doesn't take much to add it.
+# Requires MALLOC pointer to be initialized and a0 to have the number of desired bytes
+
+:malloc
+    rd_sp rs1_sp !-4 addi             # allocate stack
+    rs1_sp rs2_a1 sw                  # protect a1
+
+    rd_a1 rs1_s6 mv                   # Store the current pointer
+    rd_a0 rs1_a0 rs2_s6 add           # Request the number of desired bytes
+    rd_a7 !214 addi                   # sys_brk
+    ecall                             # syscall
+    rd_s6 rs1_a0 mv                   # Set our malloc pointer
+    rd_a0 rs1_a1 mv                   # Return the pointer
+
+    rd_a1 rs1_sp lw                   # restore a1
+    rd_sp rs1_sp !4 addi              # deallocate stack
+    rs1_ra jalr                       # return
+
+
+# File_Print function
+# Receives CHAR* in a0
+# calls fputc for every non-null char
+:File_Print
+    rd_sp rs1_sp !-12 addi            # allocate stack
+    rs1_sp rs2_ra sw                  # protect ra
+    rs1_sp rs2_a1 @4 sw               # protect a1
+    rs1_sp rs2_a2 @8 sw               # protect a2
+    rd_a1 rs1_a0 mv                   # protect a0
+
+    rs1_a0 @File_Print_Done beqz      # Protect against nulls
+
+:File_Print_Loop
+    rd_a0 rs1_a1 lbu                  # Read byte
+    rs1_a0 @File_Print_Done beqz      # Stop at NULL
+
+    rd_ra $fputc jal                  # print it
+    rd_a1 rs1_a1 !1 addi              # S = S + 1
+    $File_Print_Loop jal              # Keep printing
+
+:File_Print_Done
+    rd_ra rs1_sp lw                   # restore ra
+    rd_a1 rs1_sp !4 lw                # restore a1
+    rd_a2 rs1_sp !8 lw                # restore a2
+    rd_sp rs1_sp !12 addi             # deallocate stack
+    rs1_ra jalr                       # return
+
+
+# fputc function
+# receives CHAR in a0 and load FILE* from stdout
+# writes char and returns
+:fputc
+    rd_sp rs1_sp !-12 addi            # allocate stack
+    rs1_sp rs2_a0 sw                  # protect a0
+    rs1_sp rs2_a1 @4 sw               # protect a1
+    rs1_sp rs2_a2 @8 sw               # protect a2
+
+    rd_a7 !64 addi                    # sys_write
+    rd_a0 !1 addi                     # write to stdout
+    rd_a1 rs1_sp mv                   # Get stack address
+    rd_a2 !1 addi                     # write 1 character
+    ecall                             # syscall
+
+    rd_a0 rs1_sp lw                   # restore a0
+    rd_a1 rs1_sp !4 lw                # restore a1
+    rd_a2 rs1_sp !8 lw                # restore a2
+    rd_sp rs1_sp !12 addi             # deallocate stack
+    rs1_ra jalr                       # return
+
+:Done
+    # Terminate program with 0 return code
+    rd_a7 !93 addi                    # sys_exit
+    rd_a0 mv                          # Return code 0
+    ecall                             # syscall
+
+:Fail
+    # Terminate program with 1 return code
+    rd_a7 !93 addi                    # sys_exit
+    rd_a0 !1 addi                     # Return code 1
+    ecall                             # syscall
+# PROGRAM END
+
+:default_file "kaem.riscv32"
+:prefix " +> "
+:hard "Subprocess error
+ABORTING HARD
+"
+:info NULL
+
+:ELF_end

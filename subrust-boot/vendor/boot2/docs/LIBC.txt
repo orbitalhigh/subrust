@@ -1,0 +1,63 @@
+# Unresolved external-linkage symbols required to link tcc-boot2.
+# Sorted set difference of `&ref` vs `:def` lines in the linked.hex2
+# produced by `make tcc-boot2 ARCH=aarch64`. Refresh with:
+#   scripts/boot-undef.sh > /tmp/raw && diff /tmp/raw docs/LIBC.txt
+#
+# Split by whether the implementation can be straight C/asm or needs a
+# Linux syscall — the right column names which one(s).
+#
+# Notes:
+#   - errno is data, not code: a single global int that the syscall
+#     wrappers must set on failure. Listed under syscall-using because
+#     wiring it up is part of the same layer.
+#   - `free`/`realloc` can be pure if the allocator never returns
+#     pages to the kernel (free-list only); listed under syscall-using
+#     because a usable libc allocator usually needs brk or mmap.
+#   - The f-family (fopen/fclose/fread/fwrite/...) wraps an internal
+#     FILE struct over fd-based syscalls. Each entry's syscall column
+#     names the underlying syscall, not the FILE bookkeeping.
+
+# pure code (no syscalls)
+atoi
+memmove
+qsort
+snprintf
+sprintf
+strchr
+strcpy
+strncmp
+strrchr
+strstr
+strtof
+strtol
+strtoul
+strtoull
+vsnprintf
+
+# syscall-using (or runtime data)
+__assert_fail      write + exit_group
+abort              exit_group        (or rt_sigprocmask + kill SIGABRT)
+close              close
+errno              (data — set by syscall wrappers on failure)
+execvp             execve            (+ access / faccessat for PATH lookup)
+exit               exit_group
+fclose             close + write     (write to flush any buffered output)
+fdopen             —                 (allocates FILE; transitively malloc -> brk/mmap)
+fflush             write
+fopen              open              (or openat)
+fprintf            write
+fputc              write
+fputs              write
+fread              read
+free               brk or mmap/munmap (allocator-dependent)
+fseek              lseek
+ftell              lseek             (SEEK_CUR, off=0)
+fwrite             write
+lseek              lseek
+malloc             brk or mmap
+open               open              (or openat)
+printf             write
+read               read
+realloc            brk or mmap       (or pure if grown in place)
+remove             unlink            (or unlinkat)
+unlink             unlink            (or unlinkat)

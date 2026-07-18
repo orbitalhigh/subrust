@@ -1,0 +1,632 @@
+# arith128-core.P1pp — SR-seed 128-bit (two-slot u64) arithmetic in P1pp
+# (boot2's portable pseudo-ISA). The 128-bit analog of arith-core.P1pp: the
+# load-bearing semantic core the checker's ce_bin128 / wrap_prim128 /
+# sat_prim128 / un_op128 need, and that the C prototype punts on (128-bit is
+# KTRAP serialize-only today). Portable amd64/aarch64/riscv64 — one source.
+#
+# Protocol: read 40-byte records [op:u64 a_lo a_hi b_lo b_hi] LE from stdin;
+# emit 24 bytes [flag:u64 r_lo r_hi]. flag=1 => the op trapped (result 0). A
+# value x is two slots: x_lo (low 64), x_hi (high 64); signed => x_hi is i64.
+#
+# op ids: 1 chk_add_u 2 chk_sub_u 3 chk_mul_u 4 chk_add_s 5 chk_sub_s
+#   6 chk_mul_s 7 div_u 8 rem_u 9 div_s 10 rem_s 11 wrap_add 12 wrap_sub
+#   13 wrap_mul 14 wrap_neg 15 chk_neg_s 16 not 17 band 18 bor 19 bxor
+#   20 shl 21 shr_u 22 shr_s 23 wrap_shl 24 rotl 25 rotr 26 sat_add_u
+#   27 sat_mul_u 28 sat_add_s 29 sat_mul_s 30 eq 31 ne 32 lt_u 33 le_u
+#   34 gt_u 35 ge_u 36 lt_s 37 le_s 38 gt_s 39 ge_s
+# Implemented here: the straight-line group (compares, bitwise, add/sub &
+# neg in wrapping/checked/saturating form). Shifts/rotates, multiply, and
+# div/rem land in following steps; unimplemented ids trap.
+
+# ---- shift helpers: 128-bit (lo=a0, hi=a1) by n=a2 in 0..127 -> (a0,a1) ---
+# handle the 64-bit boundary explicitly, since native shifts mask the count to
+# 0..63 on all three arches. shru = logical, shrs = arithmetic.
+%fn(shl128, 16, {
+    %beqz(a2, &.id)
+    %li(t0, 64) %bltu(a2, t0, &.lt64)
+    %sub(t1, a2, t0)               # n-64
+    %shl(a1, a0, t1)               # hi = lo << (n-64)
+    %li(a0, 0)
+    %b(&.id)
+:.lt64
+    %shl(a1, a1, a2)               # hi <<= n
+    %li(t0, 64) %sub(t0, t0, a2)   # 64-n
+    %shr(t1, a0, t0)               # lo >> (64-n)
+    %or(a1, a1, t1)
+    %shl(a0, a0, a2)               # lo <<= n
+:.id
+})
+%fn(shru128, 16, {
+    %beqz(a2, &.id)
+    %li(t0, 64) %bltu(a2, t0, &.lt64)
+    %sub(t1, a2, t0)               # n-64
+    %shr(a0, a1, t1)               # lo = hi >> (n-64)
+    %li(a1, 0)
+    %b(&.id)
+:.lt64
+    %shr(a0, a0, a2)               # lo >>= n
+    %li(t0, 64) %sub(t0, t0, a2)   # 64-n
+    %shl(t1, a1, t0)               # hi << (64-n)
+    %or(a0, a0, t1)
+    %shr(a1, a1, a2)               # hi >>= n
+:.id
+})
+%fn(shrs128, 16, {
+    %beqz(a2, &.id)
+    %li(t0, 64) %bltu(a2, t0, &.lt64)
+    %sub(t1, a2, t0)               # n-64
+    %sar(a0, a1, t1)               # lo = hi >>a (n-64)
+    %sari(a1, a1, 63)              # hi = sign
+    %b(&.id)
+:.lt64
+    %shr(a0, a0, a2)               # lo >>= n (logical: bits come from hi)
+    %li(t0, 64) %sub(t0, t0, a2)   # 64-n
+    %shl(t1, a1, t0)               # hi << (64-n)
+    %or(a0, a0, t1)
+    %sar(a1, a1, a2)               # hi >>a n (arithmetic)
+:.id
+})
+
+# ---- umul64(a=a0, b=a1) -> (lo=a0, hi=a1): full 64x64->128 unsigned -------
+# P1 %mul is low-64 only, so build the high half from 32-bit limbs (the
+# classic mulhu schoolbook). Uses s0-s3 as locals (saved/restored).
+%fn(umul64, 48, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16) %st(s3, sp, 24)
+    %li(t0, -1) %shri(t0, t0, 32)     # mask = 0x00000000FFFFFFFF
+    %and(s0, a0, t0)                  # al
+    %shri(s1, a0, 32)                 # ah
+    %and(s2, a1, t0)                  # bl
+    %shri(s3, a1, 32)                 # bh
+    %mul(t1, s0, s2)                  # t = al*bl
+    %and(t2, t1, t0) %st(t2, sp, 32)  # w0 = t & mask
+    %shri(t1, t1, 32)                 # k  = t >> 32
+    %mul(t2, s1, s2)                  # ah*bl
+    %add(t1, t2, t1)                  # t = ah*bl + k
+    %and(t2, t1, t0) %st(t2, sp, 40)  # w1
+    %shri(t1, t1, 32)                 # w2  (kept in t1)
+    %mul(t2, s0, s3)                  # al*bh
+    %ld(a3, sp, 40) %add(t2, t2, a3)  # t = al*bh + w1
+    %shri(a2, t2, 32)                 # k = t >> 32
+    %mul(a3, s1, s3)                  # ah*bh
+    %add(a3, a3, t1)                  # + w2
+    %add(a3, a3, a2)                  # + k  -> hi
+    %shli(t2, t2, 32)                 # t << 32
+    %ld(a2, sp, 32) %add(t2, t2, a2)  # + w0 -> lo
+    %mov(a0, t2)                      # lo
+    %mov(a1, a3)                      # hi
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16) %ld(s3, sp, 24)
+})
+
+# ---- wmul128(a=[a0,a1], b=[a2,a3]) -> low 128 of a*b = (a0,a1) ------------
+# sign-agnostic (wrapping) 128x128 -> low 128. a=s0:s1, b=s2:s3.
+%fn(wmul128, 48, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16) %st(s3, sp, 24)
+    %mov(s0, a0) %mov(s1, a1) %mov(s2, a2) %mov(s3, a3)
+    %mov(a0, s0) %mov(a1, s2) %call(&umul64)   # a0 = low(a_lo*b_lo), a1 = high
+    %mul(t0, s0, s3)                            # low(a_lo*b_hi)
+    %mul(t1, s1, s2)                           # low(a_hi*b_lo)
+    %add(a1, a1, t0) %add(a1, a1, t1)          # r_hi ; r_lo already in a0
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16) %ld(s3, sp, 24)
+})
+
+# ---- udivmod128(a=[a0,a1], b=[a2,a3]) -> (q=[a0,a1], r=[a2,a3]) -----------
+# unsigned 128/128 binary long division; caller guarantees b != 0. In-place
+# shift-subtract: the dividend register becomes the quotient, r the remainder.
+# (128-bit analog of arith-core's udivmod.) a=s0:s1, b=s2:s3, r=a2:a3, i=t0.
+%fn(udivmod128, 48, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16) %st(s3, sp, 24)
+    %mov(s0, a0) %mov(s1, a1)     # a  (becomes quotient)
+    %mov(s2, a2) %mov(s3, a3)     # b
+    %li(a2, 0) %li(a3, 0)         # r = 0
+    %li(t0, 128)                  # iterations
+:.loop
+    %shri(t1, s1, 63)             # bit leaving a's top
+    %shri(t2, s0, 63)             # a <<= 1
+    %shli(s1, s1, 1) %or(s1, s1, t2)
+    %shli(s0, s0, 1)
+    %shri(t2, a2, 63)             # r = (r<<1) | bit
+    %shli(a3, a3, 1) %or(a3, a3, t2)
+    %shli(a2, a2, 1) %or(a2, a2, t1)
+    %bne(a3, s3, &.cmp_hi)        # r >= b ?
+    %bltu(a2, s2, &.skip)
+    %b(&.dosub)
+:.cmp_hi
+    %bltu(a3, s3, &.skip)
+:.dosub
+    %ifelse_ltu(a2, s2, {%li(t1, 1)}, {%li(t1, 0)})   # r -= b
+    %sub(a2, a2, s2)
+    %sub(a3, a3, s3)
+    %sub(a3, a3, t1)
+    %li(t1, 1) %or(s0, s0, t1)    # set quotient bit
+:.skip
+    %addi(t0, t0, -1)
+    %bnez(t0, &.loop)
+    %mov(a0, s0) %mov(a1, s1)     # q  (a2,a3 already = r)
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16) %ld(s3, sp, 24)
+})
+
+# ---- neg128(a=[a0,a1]) -> -(a0,a1) ----------------------------------------
+%fn(neg128, 16, {
+    %li(t0, 0)
+    %ifelse_ltu(t0, a0, {%li(t1, 1)}, {%li(t1, 0)})   # borrow = (a_lo != 0)
+    %neg(a0, a0, t0)
+    %neg(a1, a1, t0)
+    %sub(a1, a1, t1)
+})
+
+# ---- sdivmod128(a=[a0,a1], b=[a2,a3]) -> (q=[a0,a1], r=[a2,a3]) -----------
+# signed truncating divmod; caller guarantees b != 0 and not (MIN / -1).
+# q sign = sign_a ^ sign_b; r sign = sign_a. sign flags kept in s0,s1.
+%fn(sdivmod128, 64, {
+    %st(s0, sp, 0) %st(s1, sp, 8) %st(s2, sp, 16) %st(s3, sp, 24)
+    %sari(s0, a1, 63)             # sign_a
+    %sari(s1, a3, 63)             # sign_b
+    %beqz(s0, &.uapos)
+    %call(&neg128)                # ua = -a
+:.uapos
+    %st(a0, sp, 32) %st(a1, sp, 40)          # ua
+    %mov(a0, a2) %mov(a1, a3)                 # b -> (a0,a1) for neg128
+    %beqz(s1, &.ubpos)
+    %call(&neg128)                # ub = -b
+:.ubpos
+    %st(a0, sp, 48) %st(a1, sp, 56)          # ub
+    %ld(a0, sp, 32) %ld(a1, sp, 40)
+    %ld(a2, sp, 48) %ld(a3, sp, 56)
+    %call(&udivmod128)            # uq=(a0,a1), ur=(a2,a3)
+    %st(a2, sp, 48) %st(a3, sp, 56)          # stash ur
+    %beq(s0, s1, &.qdone)         # q sign = sign_a ^ sign_b
+    %call(&neg128)
+:.qdone
+    %st(a0, sp, 32) %st(a1, sp, 40)          # final q
+    %ld(a0, sp, 48) %ld(a1, sp, 56)          # ur
+    %beqz(s0, &.rdone)            # r sign = sign_a
+    %call(&neg128)
+:.rdone
+    %mov(a2, a0) %mov(a3, a1)                 # r -> (a2,a3)
+    %ld(a0, sp, 32) %ld(a1, sp, 40)          # q -> (a0,a1)
+    %ld(s0, sp, 0) %ld(s1, sp, 8) %ld(s2, sp, 16) %ld(s3, sp, 24)
+})
+
+# ---- do_bin128(op=a0, rec_ptr=a1) -> (flag=a0, r_lo=a1, r_hi=a2) ----------
+# operands live in s0=a_lo s1=a_hi s2=b_lo s3=b_hi across the dispatch.
+%fn(do_bin128, 48, {
+    %st(s0, sp, 0)
+    %st(s1, sp, 8)
+    %st(s2, sp, 16)
+    %st(s3, sp, 24)
+    %ld(s0, a1, 8)            # a_lo
+    %ld(s1, a1, 16)           # a_hi
+    %ld(s2, a1, 24)           # b_lo
+    %ld(s3, a1, 32)           # b_hi
+
+    %li(t0, 1)  %beq(a0, t0, &.chk_add_u)
+    %li(t0, 2)  %beq(a0, t0, &.chk_sub_u)
+    %li(t0, 4)  %beq(a0, t0, &.chk_add_s)
+    %li(t0, 5)  %beq(a0, t0, &.chk_sub_s)
+    %li(t0, 11) %beq(a0, t0, &.wrap_add)
+    %li(t0, 12) %beq(a0, t0, &.wrap_sub)
+    %li(t0, 13) %beq(a0, t0, &.wrap_mul)
+    %li(t0, 3)  %beq(a0, t0, &.chk_mul_u)
+    %li(t0, 27) %beq(a0, t0, &.sat_mul_u)
+    %li(t0, 6)  %beq(a0, t0, &.chk_mul_s)
+    %li(t0, 29) %beq(a0, t0, &.sat_mul_s)
+    %li(t0, 7)  %beq(a0, t0, &.div_u)
+    %li(t0, 8)  %beq(a0, t0, &.rem_u)
+    %li(t0, 9)  %beq(a0, t0, &.div_s)
+    %li(t0, 10) %beq(a0, t0, &.rem_s)
+    %li(t0, 14) %beq(a0, t0, &.wrap_neg)
+    %li(t0, 15) %beq(a0, t0, &.chk_neg_s)
+    %li(t0, 16) %beq(a0, t0, &.notop)
+    %li(t0, 17) %beq(a0, t0, &.band)
+    %li(t0, 18) %beq(a0, t0, &.bor)
+    %li(t0, 19) %beq(a0, t0, &.bxor)
+    %li(t0, 20) %beq(a0, t0, &.shl)
+    %li(t0, 21) %beq(a0, t0, &.shr_u)
+    %li(t0, 22) %beq(a0, t0, &.shr_s)
+    %li(t0, 23) %beq(a0, t0, &.wrap_shl)
+    %li(t0, 24) %beq(a0, t0, &.rotl)
+    %li(t0, 25) %beq(a0, t0, &.rotr)
+    %li(t0, 26) %beq(a0, t0, &.sat_add_u)
+    %li(t0, 28) %beq(a0, t0, &.sat_add_s)
+    %li(t0, 30) %beq(a0, t0, &.eq)
+    %li(t0, 31) %beq(a0, t0, &.ne)
+    %li(t0, 32) %beq(a0, t0, &.lt_u)
+    %li(t0, 33) %beq(a0, t0, &.le_u)
+    %li(t0, 34) %beq(a0, t0, &.gt_u)
+    %li(t0, 35) %beq(a0, t0, &.ge_u)
+    %li(t0, 36) %beq(a0, t0, &.lt_s)
+    %li(t0, 37) %beq(a0, t0, &.le_s)
+    %li(t0, 38) %beq(a0, t0, &.gt_s)
+    %li(t0, 39) %beq(a0, t0, &.ge_s)
+    %b(&.trap)
+
+# ---- add / sub (wrapping) --------------------------------------------------
+:.wrap_add
+    %add(a1, s0, s2)                                    # r_lo
+    %ifelse_ltu(a1, s0, {%li(t0, 1)}, {%li(t0, 0)})    # carry
+    %add(a2, s1, s3)
+    %add(a2, a2, t0)                                    # r_hi
+    %b(&.ok)
+:.wrap_sub
+    %ifelse_ltu(s0, s2, {%li(t0, 1)}, {%li(t0, 0)})    # borrow
+    %sub(a1, s0, s2)
+    %sub(a2, s1, s3)
+    %sub(a2, a2, t0)
+    %b(&.ok)
+:.wrap_mul
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, s2) %mov(a3, s3)
+    %call(&wmul128)              # a0 = r_lo, a1 = r_hi
+    %mov(a2, a1) %mov(a1, a0)
+    %b(&.ok)
+:.chk_mul_u
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, s2) %mov(a3, s3)
+    %call(&wmul128)              # wrap product
+    %st(a0, sp, 32) %st(a1, sp, 40)
+    %bnez(s0, &.cmu_chk) %bnez(s1, &.cmu_chk)   # a == 0 -> product 0, no overflow
+    %li(a1, 0) %li(a2, 0) %b(&.ok)
+:.cmu_chk
+    %ld(a0, sp, 32) %ld(a1, sp, 40)   # r
+    %mov(a2, s0) %mov(a3, s1)          # a  (!= 0)
+    %call(&udivmod128)                 # q = a0,a1
+    %bne(a0, s2, &.trap) %bne(a1, s3, &.trap)   # r/a != b -> overflow
+    %ld(a1, sp, 32) %ld(a2, sp, 40) %b(&.ok)
+:.sat_mul_u
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, s2) %mov(a3, s3)
+    %call(&wmul128)
+    %st(a0, sp, 32) %st(a1, sp, 40)
+    %bnez(s0, &.smu_chk) %bnez(s1, &.smu_chk)
+    %li(a1, 0) %li(a2, 0) %b(&.ok)
+:.smu_chk
+    %ld(a0, sp, 32) %ld(a1, sp, 40)
+    %mov(a2, s0) %mov(a3, s1)
+    %call(&udivmod128)
+    %bne(a0, s2, &.smu_sat) %bne(a1, s3, &.smu_sat)
+    %ld(a1, sp, 32) %ld(a2, sp, 40) %b(&.ok)   # no overflow
+:.smu_sat
+    %li(a1, -1) %li(a2, -1) %b(&.ok)           # saturate to u128::MAX
+:.chk_mul_s
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, s2) %mov(a3, s3)
+    %call(&wmul128)
+    %st(a0, sp, 32) %st(a1, sp, 40)
+    %bnez(s0, &.cms_chk) %bnez(s1, &.cms_chk)      # a == 0 -> 0
+    %li(a1, 0) %li(a2, 0) %b(&.ok)
+:.cms_chk
+    %li(t0, -1) %bne(s0, t0, &.cms_div) %bne(s1, t0, &.cms_div)   # a == -1 ?
+    %li(t0, 1) %shli(t0, t0, 63) %bnez(s2, &.cms_div) %beq(s3, t0, &.trap)  # -1 * MIN -> ovf
+:.cms_div
+    %ld(a0, sp, 32) %ld(a1, sp, 40)   # r
+    %mov(a2, s0) %mov(a3, s1)          # a
+    %call(&sdivmod128)                 # q = a0,a1  (signed r/a)
+    %bne(a0, s2, &.trap) %bne(a1, s3, &.trap)   # q != b -> overflow
+    %ld(a1, sp, 32) %ld(a2, sp, 40) %b(&.ok)
+:.sat_mul_s
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, s2) %mov(a3, s3)
+    %call(&wmul128)
+    %st(a0, sp, 32) %st(a1, sp, 40)
+    %bnez(s0, &.sms_chk) %bnez(s1, &.sms_chk)
+    %li(a1, 0) %li(a2, 0) %b(&.ok)
+:.sms_chk
+    %li(t0, -1) %bne(s0, t0, &.sms_div) %bne(s1, t0, &.sms_div)
+    %li(t0, 1) %shli(t0, t0, 63) %bnez(s2, &.sms_div) %beq(s3, t0, &.sms_sat)
+:.sms_div
+    %ld(a0, sp, 32) %ld(a1, sp, 40)
+    %mov(a2, s0) %mov(a3, s1)
+    %call(&sdivmod128)
+    %bne(a0, s2, &.sms_sat) %bne(a1, s3, &.sms_sat)
+    %ld(a1, sp, 32) %ld(a2, sp, 40) %b(&.ok)   # no overflow
+:.sms_sat
+    %sari(t0, s1, 63) %sari(t1, s3, 63)        # target = (sign_a==sign_b) ? MAX : MIN
+    %bne(t0, t1, &.sms_min)
+    %li(a2, 1) %shli(a2, a2, 63) %li(t1, 1) %sub(a2, a2, t1)   # i128::MAX
+    %li(a1, -1) %b(&.ok)
+:.sms_min
+    %li(a2, 1) %shli(a2, a2, 63) %li(a1, 0) %b(&.ok)   # i128::MIN
+:.div_u
+    %bnez(s2, &.divu_ok) %bnez(s3, &.divu_ok) %b(&.trap)   # b == 0 -> trap
+:.divu_ok
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, s2) %mov(a3, s3)
+    %call(&udivmod128)           # q=(a0,a1), r=(a2,a3)
+    %mov(a2, a1) %mov(a1, a0)    # result = quotient
+    %b(&.ok)
+:.rem_u
+    %bnez(s2, &.remu_ok) %bnez(s3, &.remu_ok) %b(&.trap)
+:.remu_ok
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, s2) %mov(a3, s3)
+    %call(&udivmod128)
+    %mov(a1, a2) %mov(a2, a3)    # result = remainder
+    %b(&.ok)
+:.div_s
+    %bnez(s2, &.ds_bok) %bnez(s3, &.ds_bok) %b(&.trap)   # b == 0
+:.ds_bok
+    %li(t0, 1) %shli(t0, t0, 63)          # i128::MIN hi
+    %bne(s1, t0, &.ds_go) %bnez(s0, &.ds_go)   # a != MIN -> ok
+    %li(t0, -1) %bne(s2, t0, &.ds_go) %bne(s3, t0, &.ds_go)   # b != -1 -> ok
+    %b(&.trap)                            # MIN / -1
+:.ds_go
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, s2) %mov(a3, s3)
+    %call(&sdivmod128)
+    %mov(a2, a1) %mov(a1, a0)             # result = quotient
+    %b(&.ok)
+:.rem_s
+    %bnez(s2, &.rs_bok) %bnez(s3, &.rs_bok) %b(&.trap)
+:.rs_bok
+    %li(t0, 1) %shli(t0, t0, 63)
+    %bne(s1, t0, &.rs_go) %bnez(s0, &.rs_go)
+    %li(t0, -1) %bne(s2, t0, &.rs_go) %bne(s3, t0, &.rs_go)
+    %b(&.trap)
+:.rs_go
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, s2) %mov(a3, s3)
+    %call(&sdivmod128)
+    %mov(a1, a2) %mov(a2, a3)             # result = remainder
+    %b(&.ok)
+
+# ---- add / sub (checked: trap on overflow) --------------------------------
+:.chk_add_u
+    %add(a1, s0, s2)
+    %ifelse_ltu(a1, s0, {%li(t0, 1)}, {%li(t0, 0)})    # carry_lo
+    %add(t1, s1, s3)                                    # hi1 = a_hi + b_hi
+    %ifelse_ltu(t1, s1, {%li(t2, 1)}, {%li(t2, 0)})    # carry from a_hi+b_hi
+    %add(a2, t1, t0)                                    # r_hi = hi1 + carry_lo
+    %ifelse_ltu(a2, t1, {%li(a3, 1)}, {%li(a3, 0)})    # carry from + carry_lo
+    %or(t2, t2, a3)                                     # carry-out of bit 127
+    %bnez(t2, &.trap)
+    %b(&.ok)
+:.chk_sub_u
+    %ifelse_ltu(s0, s2, {%li(t0, 1)}, {%li(t0, 0)})    # borrow_lo
+    %sub(a1, s0, s2)
+    %sub(a2, s1, s3)
+    %sub(a2, a2, t0)
+    %bne(s1, s3, &.csu_hi)                              # overflow iff a <u b
+    %ifelse_ltu(s0, s2, {%b(&.trap)}, {%b(&.ok)})
+:.csu_hi
+    %ifelse_ltu(s1, s3, {%b(&.trap)}, {%b(&.ok)})
+:.chk_add_s
+    %add(a1, s0, s2)
+    %ifelse_ltu(a1, s0, {%li(t0, 1)}, {%li(t0, 0)})
+    %add(a2, s1, s3)
+    %add(a2, a2, t0)
+    %sari(t0, s1, 63)                                  # sign a
+    %sari(t1, s3, 63)                                  # sign b
+    %sari(t2, a2, 63)                                  # sign r
+    %bne(t0, t1, &.ok)                                 # signs differ -> ok
+    %beq(t2, t0, &.ok)                                 # r sign == a sign -> ok
+    %b(&.trap)
+:.chk_sub_s
+    %ifelse_ltu(s0, s2, {%li(t0, 1)}, {%li(t0, 0)})
+    %sub(a1, s0, s2)
+    %sub(a2, s1, s3)
+    %sub(a2, a2, t0)
+    %sari(t0, s1, 63)
+    %sari(t1, s3, 63)
+    %sari(t2, a2, 63)
+    %beq(t0, t1, &.ok)                                 # same sign -> ok
+    %beq(t2, t0, &.ok)                                 # r sign == a sign -> ok
+    %b(&.trap)
+
+# ---- negate (wrapping / checked) ------------------------------------------
+:.wrap_neg
+    %neg(a1, s0, t1)                                   # -a_lo
+    %li(t1, 0)
+    %ifelse_ltu(t1, s0, {%li(t0, 1)}, {%li(t0, 0)})   # borrow = (a_lo != 0)
+    %neg(a2, s1, t2)
+    %sub(a2, a2, t0)
+    %b(&.ok)
+:.chk_neg_s
+    %bnez(s0, &.cns_do)                                # a_lo != 0 -> not i128::MIN
+    %li(t0, 1) %shli(t0, t0, 63)                       # 0x8000000000000000
+    %beq(s1, t0, &.trap)                               # a == i128::MIN -> trap
+:.cns_do
+    %neg(a1, s0, t1)
+    %li(t1, 0)
+    %ifelse_ltu(t1, s0, {%li(t0, 1)}, {%li(t0, 0)})
+    %neg(a2, s1, t2)
+    %sub(a2, a2, t0)
+    %b(&.ok)
+
+# ---- bitwise ---------------------------------------------------------------
+:.notop
+    %bnot(a1, s0, t0)
+    %bnot(a2, s1, t0)
+    %b(&.ok)
+:.band
+    %and(a1, s0, s2)  %and(a2, s1, s3)  %b(&.ok)
+:.bor
+    %or(a1, s0, s2)   %or(a2, s1, s3)   %b(&.ok)
+:.bxor
+    %xor(a1, s0, s2)  %xor(a2, s1, s3)  %b(&.ok)
+
+# ---- saturating add --------------------------------------------------------
+:.sat_add_u
+    %add(a1, s0, s2)
+    %ifelse_ltu(a1, s0, {%li(t0, 1)}, {%li(t0, 0)})
+    %add(t1, s1, s3)
+    %ifelse_ltu(t1, s1, {%li(t2, 1)}, {%li(t2, 0)})
+    %add(a2, t1, t0)
+    %ifelse_ltu(a2, t1, {%li(a3, 1)}, {%li(a3, 0)})
+    %or(t2, t2, a3)
+    %beqz(t2, &.ok)                                    # no overflow
+    %li(a1, -1)  %li(a2, -1)                           # saturate to u128::MAX
+    %b(&.ok)
+:.sat_add_s
+    %add(a1, s0, s2)
+    %ifelse_ltu(a1, s0, {%li(t0, 1)}, {%li(t0, 0)})
+    %add(a2, s1, s3)
+    %add(a2, a2, t0)
+    %sari(t0, s1, 63)                                  # sign a
+    %sari(t1, s3, 63)                                  # sign b
+    %sari(t2, a2, 63)                                  # sign r
+    %bne(t0, t1, &.ok)
+    %beq(t2, t0, &.ok)
+    %bnez(t0, &.sas_min)                               # a<0 => negative overflow
+    %li(a2, 1) %shli(a2, a2, 63) %li(t1, 1) %sub(a2, a2, t1)   # i128::MAX hi
+    %li(a1, -1)                                        # i128::MAX lo
+    %b(&.ok)
+:.sas_min
+    %li(a2, 1) %shli(a2, a2, 63)                       # i128::MIN hi
+    %li(a1, 0)
+    %b(&.ok)
+
+# ---- compares (result 0/1 in r_lo; low word compared UNSIGNED) ------------
+:.eq
+    %li(a1, 0) %li(a2, 0)
+    %bne(s0, s2, &.ok)  %bne(s1, s3, &.ok)
+    %li(a1, 1) %b(&.ok)
+:.ne
+    %li(a1, 1) %li(a2, 0)
+    %bne(s0, s2, &.ok)  %bne(s1, s3, &.ok)
+    %li(a1, 0) %b(&.ok)
+:.lt_u
+    %li(a2, 0)
+    %bne(s1, s3, &.ltu_hi)
+    %ifelse_ltu(s0, s2, {%li(a1, 1)}, {%li(a1, 0)}) %b(&.ok)
+:.ltu_hi
+    %ifelse_ltu(s1, s3, {%li(a1, 1)}, {%li(a1, 0)}) %b(&.ok)
+:.ge_u
+    %li(a2, 0)
+    %bne(s1, s3, &.geu_hi)
+    %ifelse_ltu(s0, s2, {%li(a1, 0)}, {%li(a1, 1)}) %b(&.ok)
+:.geu_hi
+    %ifelse_ltu(s1, s3, {%li(a1, 0)}, {%li(a1, 1)}) %b(&.ok)
+:.gt_u
+    %li(a2, 0)
+    %bne(s1, s3, &.gtu_hi)
+    %ifelse_ltu(s2, s0, {%li(a1, 1)}, {%li(a1, 0)}) %b(&.ok)
+:.gtu_hi
+    %ifelse_ltu(s3, s1, {%li(a1, 1)}, {%li(a1, 0)}) %b(&.ok)
+:.le_u
+    %li(a2, 0)
+    %bne(s1, s3, &.leu_hi)
+    %ifelse_ltu(s2, s0, {%li(a1, 0)}, {%li(a1, 1)}) %b(&.ok)
+:.leu_hi
+    %ifelse_ltu(s3, s1, {%li(a1, 0)}, {%li(a1, 1)}) %b(&.ok)
+:.lt_s
+    %li(a2, 0)
+    %bne(s1, s3, &.lts_hi)
+    %ifelse_ltu(s0, s2, {%li(a1, 1)}, {%li(a1, 0)}) %b(&.ok)
+:.lts_hi
+    %ifelse_lt(s1, s3, {%li(a1, 1)}, {%li(a1, 0)}) %b(&.ok)
+:.ge_s
+    %li(a2, 0)
+    %bne(s1, s3, &.ges_hi)
+    %ifelse_ltu(s0, s2, {%li(a1, 0)}, {%li(a1, 1)}) %b(&.ok)
+:.ges_hi
+    %ifelse_lt(s1, s3, {%li(a1, 0)}, {%li(a1, 1)}) %b(&.ok)
+:.gt_s
+    %li(a2, 0)
+    %bne(s1, s3, &.gts_hi)
+    %ifelse_ltu(s2, s0, {%li(a1, 1)}, {%li(a1, 0)}) %b(&.ok)
+:.gts_hi
+    %ifelse_lt(s3, s1, {%li(a1, 1)}, {%li(a1, 0)}) %b(&.ok)
+:.le_s
+    %li(a2, 0)
+    %bne(s1, s3, &.les_hi)
+    %ifelse_ltu(s2, s0, {%li(a1, 0)}, {%li(a1, 1)}) %b(&.ok)
+:.les_hi
+    %ifelse_lt(s3, s1, {%li(a1, 0)}, {%li(a1, 1)}) %b(&.ok)
+
+# ---- shifts (checked: amount is the 128-bit b; trap if b >= 128) -----------
+:.shl
+    %bnez(s3, &.trap)
+    %li(t0, 128) %bltu(s2, t0, &.shl_go) %b(&.trap)
+:.shl_go
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, s2)
+    %call(&shl128)
+    %mov(a2, a1) %mov(a1, a0)
+    %b(&.ok)
+:.shr_u
+    %bnez(s3, &.trap)
+    %li(t0, 128) %bltu(s2, t0, &.shru_go) %b(&.trap)
+:.shru_go
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, s2)
+    %call(&shru128)
+    %mov(a2, a1) %mov(a1, a0)
+    %b(&.ok)
+:.shr_s
+    %bnez(s3, &.trap)
+    %li(t0, 128) %bltu(s2, t0, &.shrs_go) %b(&.trap)
+:.shrs_go
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, s2)
+    %call(&shrs128)
+    %mov(a2, a1) %mov(a1, a0)
+    %b(&.ok)
+:.wrap_shl
+    %andi(a2, s2, 127)                # amount = b % 128
+    %mov(a0, s0) %mov(a1, s1)
+    %call(&shl128)
+    %mov(a2, a1) %mov(a1, a0)
+    %b(&.ok)
+
+# ---- rotates: rotl(a,n) = (a<<n)|(a>>(128-n)); n = b % 128 -----------------
+:.rotl
+    %andi(t0, s2, 127)
+    %beqz(t0, &.rot_id)
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, t0)
+    %call(&shl128)                   # part1 = a << n
+    %st(a0, sp, 32) %st(a1, sp, 40)
+    %li(t0, 128) %andi(t1, s2, 127) %sub(t0, t0, t1)   # 128-n
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, t0)
+    %call(&shru128)                  # part2 = a >> (128-n)
+    %ld(t0, sp, 32) %ld(t1, sp, 40)
+    %or(a2, a1, t1)
+    %or(a1, a0, t0)
+    %b(&.ok)
+:.rotr
+    %andi(t0, s2, 127)
+    %beqz(t0, &.rot_id)
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, t0)
+    %call(&shru128)                  # part1 = a >> n
+    %st(a0, sp, 32) %st(a1, sp, 40)
+    %li(t0, 128) %andi(t1, s2, 127) %sub(t0, t0, t1)   # 128-n
+    %mov(a0, s0) %mov(a1, s1) %mov(a2, t0)
+    %call(&shl128)                   # part2 = a << (128-n)
+    %ld(t0, sp, 32) %ld(t1, sp, 40)
+    %or(a2, a1, t1)
+    %or(a1, a0, t0)
+    %b(&.ok)
+:.rot_id
+    %mov(a1, s0) %mov(a2, s1)
+    %b(&.ok)
+
+:.trap
+    %li(a0, 1)  %li(a1, 0)  %li(a2, 0)
+    %b(&.ret)
+:.ok
+    %li(a0, 0)                # r_lo in a1, r_hi in a2 already
+:.ret
+    %ld(s0, sp, 0)
+    %ld(s1, sp, 8)
+    %ld(s2, sp, 16)
+    %ld(s3, sp, 24)
+})
+
+# ---- driver: stream 40-byte records -> 24-byte records --------------------
+%fn(p1_main, 0, {
+:.loop
+    %li(a0, 0)
+    %la(a1, &inbuf)
+    %li(a2, 40)
+    %call(&sys_read)
+    %li(t0, 40)
+    %bne(a0, t0, &.done)      # short read / EOF -> stop
+    %la(a1, &inbuf)
+    %ld(a0, a1, 0)            # op  (a1 still = &inbuf = record ptr)
+    %call(&do_bin128)         # a0=flag, a1=r_lo, a2=r_hi
+    %la(t0, &outbuf)
+    %st(a0, t0, 0)
+    %st(a1, t0, 8)
+    %st(a2, t0, 16)
+    %li(a0, 1)
+    %la(a1, &outbuf)
+    %li(a2, 24)
+    %call(&sys_write)
+    %b(&.loop)
+:.done
+    %li(a0, 0)
+})
+
+:inbuf
+$(0) $(0) $(0) $(0) $(0)
+:outbuf
+$(0) $(0) $(0)
+
+:ELF_end
